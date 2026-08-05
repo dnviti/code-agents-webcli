@@ -1,4 +1,5 @@
 import { shellStore } from '../shell/store';
+import { getControllerSnapshot, parseQualifiedSessionId } from '../controller/transport';
 
 /**
  * The app's own replacement for `window.confirm`.
@@ -21,6 +22,12 @@ export interface ConfirmOptions {
   cancelLabel?: string;
   /** `danger` paints the confirm button destructive, for irreversible actions. */
   tone?: 'default' | 'danger';
+  /** Defaults to the selected server in controller mode; desktop/none suppress it. */
+  scope?: 'server' | 'desktop' | 'none';
+  /** Qualified session whose owning server must be named instead of global selection. */
+  sessionId?: string;
+  /** Exact server for a server-owned action that is not tied to a session. */
+  serverId?: string;
 }
 
 export interface ConfirmRequest extends ConfirmOptions {
@@ -35,7 +42,21 @@ export function showConfirm(options: ConfirmOptions): Promise<boolean> {
   previous?.resolve(false);
 
   return new Promise<boolean>((resolve) => {
-    shellStore.setState({ confirm: { ...options, resolve } });
+    const controller = getControllerSnapshot();
+    const sessionOwner = options.sessionId
+      ? parseQualifiedSessionId(options.sessionId)?.serverId : null;
+    const scopedServerId = options.serverId || sessionOwner || controller.selectedServerId;
+    const target = controller.enabled && (options.scope ?? 'server') === 'server'
+      ? controller.targets.find((item) => item.id === scopedServerId) : null;
+    const scopeText = target ? `Server: ${target.name}.` : '';
+    const description = [options.description, scopeText].filter(Boolean).join(' ');
+    shellStore.setState({
+      confirm: {
+        ...options,
+        ...(description ? { description } : {}),
+        resolve,
+      },
+    });
   });
 }
 

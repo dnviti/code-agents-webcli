@@ -641,5 +641,22 @@ describe('AntigravityChatAdapter (headless mode)', function () {
     it('promises no cost, because nothing anywhere prices a turn', function () {
       assert.strictEqual(advertisedChatCapabilities('antigravity').cost, false);
     });
+
+    it('includes installed commands and skills in advertised commands capabilities', function () {
+      const adapter = createChatAdapter('antigravity', {
+        sessionId: 'chat-1',
+        workingDir: '/work',
+        command: 'agy',
+        installedCommands: [
+          { name: 'antigravity-guide', description: 'Antigravity guide skill' },
+          { name: 'custom-skill', description: 'Custom skill' },
+        ],
+        emit() {},
+      });
+      const names = adapter.capabilities.commands?.map((c) => c.name);
+      assert.ok(names?.includes('clear'));
+      assert.ok(names?.includes('antigravity-guide'));
+      assert.ok(names?.includes('custom-skill'));
+    });
   });
 });

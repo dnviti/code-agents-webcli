@@ -180,6 +180,38 @@ describe('paste-image route', function () {
     assert.strictEqual(response.status, 404);
   });
 
+  it('refuses paste storage while migration is blocked without writing anything', async function () {
+    const reason = 'Workspace migration is blocked by permissions';
+    sessions.get('mine').persistenceUnavailable = reason;
+    sessions.get('mine').rollbackRecoveryPending = true;
+
+    const response = await post('mine', PNG);
+
+    assert.strictEqual(response.status, 409);
+    assert.deepStrictEqual(await response.json(), {
+      error: 'session_persistence_unavailable',
+      message: reason,
+      retryable: true,
+    });
+    assert.strictEqual(validatePathCalls, 0);
+    assert.deepStrictEqual(listFiles(workingDir), []);
+  });
+
+  it('refuses paste storage for a rollback recovery anchor without writing anything', async function () {
+    sessions.get('mine').rollbackRecoveryPending = true;
+
+    const response = await post('mine', PNG);
+
+    assert.strictEqual(response.status, 409);
+    assert.deepStrictEqual(await response.json(), {
+      error: 'session_recovery_pending',
+      message: 'This session is retained only to retry an incomplete rollback',
+      retryable: true,
+    });
+    assert.strictEqual(validatePathCalls, 0);
+    assert.deepStrictEqual(listFiles(workingDir), []);
+  });
+
   it('refuses when the session\'s working directory is no longer allowed', async function () {
     // SessionStore restores working_dir from SQLite with no re-check, so a
     // narrowed base folder has to be caught here.

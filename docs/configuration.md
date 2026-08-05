@@ -63,7 +63,7 @@ cc-web --help
 | --- | --- | --- |
 | `-p, --port <number>` | `32352` | HTTPS port. Validated 1–65535. |
 | `--no-open` | opens | Do not open a browser after starting. |
-| `--data-dir <path>` | `~/.code-agents-webcli` | Where the database, certificates and logs live. |
+| `--data-dir <path>` | `~/.code-agents-webcli` | Where installation-wide state, certificates and logs live. Session records, history and usage live in each workspace's `.cc-web/`. |
 | `--setup` | — | Force the setup wizard even when already configured. |
 | `--dev` | off | Extra diagnostics from the WebSocket layer. |
 | `--https` | — | **Accepted and ignored.** HTTPS is always on; the flag exists so older scripts and units do not break. |
@@ -218,33 +218,189 @@ With per-user environments on, each account also gets
 directory is the user's home inside their container, and it is what a backup
 has to include. See [Per-user environments](user-environments.md#where-the-data-lives).
 
-Everything sits under the data directory — `~/.code-agents-webcli` unless
-`--data-dir` says otherwise. The directory is created `0700`.
+State is split deliberately between the installation and the workspace. The
+data directory — `~/.code-agents-webcli` unless `--data-dir` says otherwise —
+contains only installation-wide state. It is created `0700`.
 
 | Path | What it is |
 | --- | --- |
-| `app.sqlite` (plus `-wal`, `-shm`) | Settings, users, auth sessions, runtime session records, runtime profiles. Created `0600`. |
+| `app.sqlite` (plus `-wal`, `-shm`) | Users and OAuth identities, HTTP auth sessions, account preferences, server configuration, runtime profiles, deploy targets, encrypted credentials, the project catalog, and a path-only catalog used to find authorised workspaces. Created `0600`. It holds no new conversation, terminal, tab, or usage records. |
+| `.cc-web-server.lease/` | Private process lease proving that exactly one server may write this installation directory. It contains only a random ownership token, process-incarnation metadata and a heartbeat; no session content. |
 | `tls/ca.crt`, `tls/ca.key` | The generated local certificate authority, reused across reissues. |
 | `tls/server.crt`, `tls/server.key` | The server certificate, reissued automatically. |
-| `history/<user>/<session>` | Server-side scrollback, as an append-only log plus a fixed-width index. |
-| `transcripts/` | Session transcripts. |
-| `pastes/<user>/<session>.json` | Manifests for [pasted images](terminal.md#pasting-images). The image bytes live in the project directory. |
-| `<user>/<session>.jsonl` | Event log for a [WebUI chat](runtimes.md#the-webui-beta) session. |
 | `runtime-profiles/` | Generated per-runtime tier configuration that cannot be written into a project. |
-| `<target-root>/projects/<project-id>/` | Disposable project worktree on its recorded deploy target. For the legacy target the default root is `<data-dir>/environments`; it can be removed during reclaim and rebuilt from its repository. |
+| `<target-root>/projects/<project-id>/` | Project root on its recorded deploy target. Its repository checkout and ordinary scratch files are disposable during reclaim. The root-level `.cc-web/` archive survives rebuild/reclaim through the verified staging-and-restore sequence described below and is removed only with an explicit project deletion. For the legacy target the default root is `<data-dir>/environments`. |
 
 The database holds OAuth credentials, live auth sessions, and the encryption key
 for deploy-target secrets when no `CODE_AGENTS_WEBCLI_ENCRYPTION_KEY` is supplied.
-Treat it as sensitive, and include it in whatever you back up — losing it loses
-your users, their sessions and your configuration.
+Treat it as sensitive, and include it in an installation backup — losing it
+loses users, sign-ins and configuration, but restoring it alone does **not**
+restore session history.
 
-Some files are written **inside your project directory** rather than the data
-directory, because the agent CLIs have to be able to read them:
+Only one server process may use a data directory at a time. The lease is taken
+before `app.sqlite` is opened or any legacy migration begins; a second process
+fails with `data_dir_in_use` instead of racing the first one. A crashed owner's
+lease is reclaimed only when both its heartbeat is stale and that exact process
+incarnation is gone. Losing ownership while live is fail-stop: the server closes
+network admission and exits rather than risk two writers.
 
-- `.cc-web/pasted/` — [pasted images](terminal.md#pasting-images)
-- `.pi/agents/` — [capability tiers](runtimes.md#capability-tiers) for pi
+Every session is assigned one immutable workspace scope when it is created. A
+normal host session uses the validated folder selected in the launcher. A
+managed project uses its canonical workspace root even when the session runs in
+a subdirectory or a container-only path. A shell opened from a conversation
+inherits that conversation's scope. Later working-directory changes do not move
+the archive.
 
-Both get a generated `.gitignore`, so neither shows up in `git status`.
+The workspace-local layout is versioned and owner-scoped:
+
+```text
+<workspace>/.cc-web/
+  .gitignore
+  session-state.sqlite            # session/tab state, composer drafts and per-turn usage
+  attachments/<owner-key>/<session-id>/  # chat files and images
+  pasted/                         # terminal image bytes, when used
+  sessions/<owner-key>/<session-id>/
+    chat.jsonl                    # conversation event stream
+    chat.idx                      # event index
+    chat.ctx                      # opening/branch context, when present
+    chat.plan                     # current Plan document, when present
+    transcript.md
+    history.log
+    history.idx
+    paste-manifest.json
+```
+
+The owner key is derived from the account's immutable GitHub identity and does
+not expose that identity in clear text. `.cc-web` directories are owner-only
+(`0700`) and created without following symlinks; state files are owner-only
+(`0600`) where the filesystem supports POSIX modes. The app creates
+`.cc-web/.gitignore` only when it is absent and never rewrites the bytes of an
+existing file. An existing marker must be a single-link regular file; symlinks,
+directories and hard links are refused, and its mode is hardened to `0600`.
+The generated ignore covers the whole session archive, so it does not appear
+in `git status`. Project source files such as `.pi/agents/` remain separate
+from this archive.
+
+Mutating an archive also requires a filesystem primitive that can prove the
+opened `.cc-web` directory did not change during the operation. Linux uses a
+verified descriptor-relative path. macOS/BSD use `/dev/fd` only after a live
+create/rename/unlink probe succeeds; Windows requires the volume to prove that
+an open directory handle pins rename/removal. A filesystem or volume that
+cannot provide either guarantee fails closed with `UNSAFE_WORKSPACE_STORAGE`;
+the app never falls back to installation-level session storage.
+
+Electron/Chromium Web Storage contains presentation preferences only. Draft
+text, attachment descriptors, active/closed tab ids, split assignments, child
+terminal ids and other session metadata are not written to the desktop
+`userData` profile. On the one-time desktop upgrade, the app first extracts the
+small presentation-preference allow-list, then clears the old renderer Web
+Storage and HTTP cache before loading the new renderer; cookies and isolated
+remote-server partitions are not part of that cleanup.
+
+Because the archive contains plaintext conversation and terminal history, one
+canonical workspace root is bound to exactly one immutable account identity in
+the installation catalog. A second account receives
+`workspace_persistence_unavailable`; a legacy catalog that lists the same root
+for multiple accounts is quarantined for every claimant until the conflicting
+path entry is corrected. This is application-level ownership. Accounts allowed
+to run unrestricted host commands still share the operating-system user's
+filesystem boundary, as described in [Architecture](architecture.md#security-model).
+
+The installation authenticates the archive's operational controls against the
+same canonical workspace root. A copied, force-tracked, or otherwise
+unrecognised archive can still contribute its conversation and terminal
+history, but approval bypasses, native-runtime resume identifiers, model/runtime
+controls, and project paths are reset and revalidated before the sessions are
+admitted. This prevents repository contents from importing execution authority.
+
+At startup the server opens only workspaces from the authorised folder and
+project catalogs; it never recursively scans the filesystem or follows a
+symlink to find history. Opening another authorised folder lazy-loads its
+`.cc-web/session-state.sqlite`, so its conversations can reappear without a
+server restart.
+
+Managed-project rebuild and reclaim temporarily move the exact pinned
+`.cc-web` directory to the deterministic sibling
+`.<project-id>.ccweb-session-storage-retained`, outside the project root exposed
+to the container. The app synchronises the source and staging parents, removes
+the disposable workspace entries, then restores and verifies the same directory
+inode before reopening its database. A newly-created `.cc-web` name never
+overwrites the staged authority. After a cold crash, boot reconciliation first
+makes every reachable managed runtime non-executable and only then restores the
+staged archive before session discovery. If runtime quiescence or exact-inode
+restoration cannot be proved, the archive remains staged and the workspace is
+reported unavailable; the app does not create an empty replacement. Host
+projects, which have no managed container runtime to quiesce, can be recovered
+directly. See [What survives a rebuild](projects.md#what-survives-a-rebuild).
+
+### Upgrading existing session storage
+
+The first compatible start migrates the old session records and `usage_*` rows
+from `app.sqlite`, together with global chat logs, transcript, terminal history,
+indexes and paste manifests. Referenced attachments and pasted-image bytes from
+the session's prior host working directories are copied into the canonical
+workspace archive, and paste manifests are rewritten to those canonical paths.
+Migration is per session, restartable, and copy-then-verify: file sizes and
+SHA-256 checksums and database row counts are checked before any legacy source
+is removed. A missing, ambiguous or conflicting binary retains all of its
+sources and blocks the unit. Re-running after a crash is safe.
+Each top-level session and all of its child shells form one atomic unit; an
+unrelated unit in the same workspace may still complete when another is
+blocked. Opening a restored folder retries its blocked units immediately, so a
+server restart is not required.
+
+Legacy source roots and their fixed/dynamic namespaces are opened through
+verified directory handles and rechecked around every read and retirement;
+symlinked, non-regular or multiply-linked files are not trusted. A destination
+is copied to a private sibling, flushed, published without clobbering an
+existing name, and followed by a directory sync. After target verification, a
+legacy source is moved into a deterministic private retirement directory,
+identity-checked against the already-open file, retired, and synchronised. A
+restart can therefore recover the bounded publish or retirement states
+deterministically rather than choosing between two names. Migration markers are
+bounded, owner-bound, and accepted only for the immutable owner identity and
+session they name.
+
+The migration applies current binary limits before hashing or copying legacy
+data. A pasted image is limited to 10 MiB and all pasted images referenced by
+one session to 200 MiB. A chat attachment is limited to 20 MiB, with a 400 MiB
+and 500-file per-session attachment namespace. Duplicate legacy layout aliases
+for one logical attachment are inspected but counted once, using the largest
+candidate. Paste manifests are size- and entry-bounded; invalid JSON, an
+unsupported shape, duplicate or out-of-root paths, incorrect byte counts, and
+over-quota manifests all fail closed while retaining their legacy sources.
+
+If the destination workspace is missing, read-only, symlinked, outside the
+authorised area, or conflicts with an already present target, the app keeps the
+legacy copy and marks that workspace migration unavailable. It does not resume
+writing session data to the data directory. The affected conversation remains
+visible as read-only, with its migration reason; rename, branch, upload, runtime
+start and deletion return a conflict instead of mutating either copy. Restore
+access and open the folder again (or restart the server) to retry.
+`GET /api/sessions/persistence` reports
+the workspace-local layout, loaded workspaces, unavailable roots, and whether
+migration is complete; a folder-specific resume request returns
+`workspace_persistence_unavailable` rather than silently falling back.
+
+### Backing up and restoring
+
+For a complete backup, include all three categories:
+
+1. the installation data directory, for accounts, authentication, settings,
+   certificates, credentials and project/folder catalogs;
+2. `.cc-web/` from every workspace, for session state, conversations, terminal
+   history, attachments, paste metadata and usage;
+3. persistent user homes and project storage described in
+   [Projects](projects.md) and [Per-user environments](user-environments.md).
+
+Stop the server before a filesystem copy, or use a snapshot mechanism that
+captures each SQLite database together with its `-wal` and `-shm` sidecars.
+Restore `.cc-web` at the same workspace root and preserve its permissions. Do
+not use `--data-dir` as a session-history backup destination: it no longer
+receives new session artifacts. Restoring both the installation data directory
+and each `.cc-web` tree to their original canonical roots preserves archive
+authentication; restoring only `.cc-web` keeps the recorded history but causes
+the operational controls described above to be reset safely.
 
 ## Examples
 

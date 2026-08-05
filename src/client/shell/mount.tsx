@@ -16,6 +16,13 @@ import {
 } from '../../shared/conversations';
 import { showConfirm } from '../ui/confirm';
 import { onBannerAction, onBannerDismiss, onBannerToggleLog } from '../ui/update-banner';
+import {
+  deferDesktopUpdate,
+  installDesktopUpdate,
+  openDesktopUpdate,
+  retryDesktopUpdate,
+  whenDesktopUpdatesHydrated,
+} from '../ui/desktop-update';
 import { showNotification } from '../ui/notifications';
 import { hideOverlay, showError } from '../ui/overlay';
 import { AppShell, type ShellActions } from './AppShell';
@@ -23,9 +30,28 @@ import { RuntimeLauncher, type ResumableConversation } from './RuntimeLauncher';
 import { readStoredTheme, setThemeMode, watchSystemTheme, type RelayTheme } from './theme';
 import { shellStore } from './store';
 import { relayTerminalTheme } from './terminal-theme';
+import { parseQualifiedSessionId, rememberNewSessionServer } from '../controller/transport';
+import { useAgentMaintenance } from '../agent-maintenance/useAgentMaintenance';
 
 /** The live terminal, so a theme change can reach it. Set once at mount. */
 let themedApp: App | null = null;
+/**
+ * Installer operations may outlive a launcher remount while this renderer is
+ * open, but their target and operation ids are session-related state. Keep the
+ * rejoin handle in process memory so Electron never writes it under userData.
+ */
+const launcherMaintenanceOperations = new Map<string, string>();
+
+function DesktopRendererReady(): null {
+  React.useEffect(() => {
+    let active = true;
+    void whenDesktopUpdatesHydrated().then(() => {
+      if (active) window.dispatchEvent(new Event('cc-web:desktop-renderer-ready'));
+    });
+    return () => { active = false; };
+  }, []);
+  return null;
+}
 
 /**
  * Switch theme from the shell's own toggle: mode plus the Relay terminal
@@ -88,11 +114,14 @@ export function mountShell(app: App): void {
   shellStore.setState({ chatView: loadChatView() });
 
   createRoot(mountPoint).render(
-    <AppShell
-      terminalNode={terminalNode}
-      actions={buildActions(app)}
-      launcher={buildLauncher(app)}
-    />,
+    <>
+      <AppShell
+        terminalNode={terminalNode}
+        actions={buildActions(app)}
+        launcher={buildLauncher(app)}
+      />
+      <DesktopRendererReady />
+    </>,
   );
 }
 
@@ -198,8 +227,8 @@ async function resumeConversation(app: App, conversation: ResumableConversation)
  * grouped, searchable list, and a missing `projects` array would be a TypeError
  * inside a dialog the user opened to find something.
  */
-async function fetchConversations(app: App): Promise<ConversationList> {
-  const response = await app.authFetch('/api/sessions/conversations');
+async function fetchConversations(app: App, serverId?: string): Promise<ConversationList> {
+  const response = await app.authFetch('/api/sessions/conversations', {}, serverId);
   if (!response.ok) {
     // The server is a version behind this page more often than it is broken, and
     // that is worth saying: the endpoint is new, and the process loads its code
@@ -319,6 +348,7 @@ async function removeConversation(
       + 'along with anything still running it. This cannot be undone.',
     confirmLabel: 'Delete',
     tone: 'danger',
+    sessionId: conversation.id,
   });
   if (!confirmed) return false;
 
@@ -433,6 +463,95 @@ function buildLauncher(app: App): React.ReactNode {
   // follow the viewport: `buildLauncher` runs once, but whether the buttons
   // have room for their labels changes every time the window is resized or the
   // phone is rotated.
+  function MaintenanceBoundLauncher({
+    targetId,
+    serverId,
+    targetName,
+    compact,
+    chatBypass,
+    conversations,
+    loading,
+  }: {
+    targetId: string;
+    serverId: string;
+    targetName: string;
+    compact: boolean;
+    chatBypass: boolean;
+    conversations: ResumableConversation[];
+    loading: boolean;
+  }): React.JSX.Element {
+    const operationKey = JSON.stringify([serverId, targetId]);
+    const [operationId, setOperationId] = React.useState<string | null>(() => {
+      return launcherMaintenanceOperations.get(operationKey) ?? null;
+    });
+    const rememberOperation = React.useCallback((id: string): void => {
+      setOperationId(id);
+      launcherMaintenanceOperations.set(operationKey, id);
+    }, [operationKey]);
+    const forgetSettledOperation = React.useCallback((operation: import('../../shared/agent-maintenance').AgentMaintenanceOperation): void => {
+      if (operation.phase !== 'complete' && operation.phase !== 'cancelled') return;
+      setOperationId(null);
+      launcherMaintenanceOperations.delete(operationKey);
+    }, [operationKey]);
+    const maintenance = useAgentMaintenance({
+      targetId,
+      serverId,
+      operationId,
+      onOperationId: rememberOperation,
+      onOperationSettled: forgetSettledOperation,
+    });
+    const beginMaintenance = React.useCallback(async (
+      agentId: import('../../shared/agent-maintenance').AgentMaintenanceId,
+      kind: 'install' | 'update',
+    ): Promise<void> => {
+      const status = maintenance.statuses[agentId];
+      let confirmed = false;
+      if (status?.requiresConfirmation) {
+        confirmed = await showConfirm({
+          title: `${kind === 'update' ? 'Update' : 'Install'} ${agentId} on this shared host?`,
+          description: 'This changes the installer-owned agent copy for every session using this shared host. Running sessions keep their current process until restarted.',
+          confirmLabel: kind === 'update' ? 'Update shared copy' : 'Install shared copy',
+          serverId,
+        });
+        if (!confirmed) return;
+      }
+      if (kind === 'update') await maintenance.update(agentId, confirmed);
+      else await maintenance.install(agentId, confirmed);
+    }, [maintenance, serverId]);
+
+    return (
+      <RuntimeLauncher
+        aliases={app.aliases}
+        onStart={start}
+        onTerminal={onTerminal}
+        onCancel={() => void app.cancelStartPrompt()}
+        compact={compact}
+        chatBypass={chatBypass}
+        conversations={conversations}
+        conversationsLoading={loading}
+        onResume={(conversation) => void resumeConversation(app, conversation)}
+        maintenance={{
+          targetName,
+          statuses: maintenance.statuses,
+          operation: maintenance.operation,
+          operationBusyReason: maintenance.operationBusyReason,
+          checking: maintenance.checking,
+          errors: maintenance.errors,
+          error: maintenance.error,
+          onInstall: (agentId) => beginMaintenance(agentId, 'install'),
+          onRetry: async (agentId) => {
+            if (maintenance.operation?.agentId === agentId && maintenance.operation.retryable) {
+              await beginMaintenance(agentId, maintenance.operation.kind);
+              return;
+            }
+            await maintenance.check(agentId, true);
+          },
+          onCancel: () => maintenance.cancel(),
+        }}
+      />
+    );
+  }
+
   function LauncherHost(): React.JSX.Element {
     const state = React.useSyncExternalStore(
       shellStore.subscribe,
@@ -450,6 +569,8 @@ function buildLauncher(app: App): React.ReactNode {
       : 'host';
     const [conversations, setConversations] = React.useState<ResumableConversation[]>([]);
     const [loading, setLoading] = React.useState(false);
+    const targetId = active?.id || '';
+    const serverId = active?.serverId || parseQualifiedSessionId(targetId)?.serverId || 'local';
 
     // Asked each time the launcher opens on a folder, not cached: an agent may
     // have been running in another tab since the last time, and a stale list
@@ -478,7 +599,7 @@ function buildLauncher(app: App): React.ReactNode {
       };
     }, [workingDir, projectId, workingDirKind]);
 
-    return (
+    const launcher = (
       <RuntimeLauncher
         aliases={app.aliases}
         onStart={start}
@@ -491,19 +612,32 @@ function buildLauncher(app: App): React.ReactNode {
         onResume={(conversation) => void resumeConversation(app, conversation)}
       />
     );
+    if (!targetId) return launcher;
+    return (
+      <MaintenanceBoundLauncher
+        key={JSON.stringify([serverId, targetId])}
+        targetId={targetId}
+        serverId={serverId}
+        targetName={active?.projectName || active?.serverName || 'This server'}
+        compact={state.isMobile}
+        chatBypass={state.chatBypassPermissions}
+        conversations={conversations}
+        loading={loading}
+      />
+    );
   }
 
   return <LauncherHost />;
 }
 
 /** Create and focus a session whose workspace is resolved by the project manager. */
-async function createProjectSession(app: App, projectId: string): Promise<void> {
+async function createProjectSession(app: App, projectId: string, serverId?: string): Promise<void> {
   try {
     const response = await app.authFetch('/api/sessions/create', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ projectId }),
-    });
+      body: JSON.stringify({ projectId, ...(serverId ? { serverId } : {}) }),
+    }, serverId);
     if (!response.ok) throw new Error('Failed to create project session');
     const data = await response.json() as {
       sessionId: string;
@@ -534,6 +668,7 @@ async function createProjectSession(app: App, projectId: string): Promise<void> 
     } else {
       await app.joinSession(data.sessionId);
     }
+    if (serverId) rememberNewSessionServer(serverId);
     app.loadSessions();
     app.isCreatingNewSession = false;
   } catch (error) {
@@ -587,11 +722,11 @@ function buildActions(app: App): ShellActions {
     saveSettings: (next) => saveSettings(app, next),
     openSettings: () => app.showSettings(),
 
-    createSession: (name, workingDir) => void createNewSession(app, name, workingDir),
-    openProjectSession: (projectId) => void createProjectSession(app, projectId),
-    chooseNewTabDirectory: () => {
+    createSession: (name, workingDir, serverId) => void createNewSession(app, name, workingDir, serverId),
+    openProjectSession: (projectId, serverId) => void createProjectSession(app, projectId, serverId),
+    chooseNewTabDirectory: (serverId) => {
       shellStore.patchSlice('dialogs', { workspaceChooser: false });
-      void app.folderBrowser.show({ host: true });
+      void app.folderBrowser.show({ host: true, serverId });
     },
     cancelNewTab: () => {
       app.isCreatingNewSession = false;
@@ -621,12 +756,16 @@ function buildActions(app: App): ShellActions {
         void app.joinSession(id);
       }
     },
-    leaveSession: () => app.leaveSession(),
+    leaveSession: (serverId) => app.leaveSession(serverId),
+    retireServerSessions: (serverId) => {
+      app.sessionTabManager.retireServer(serverId);
+      void app.loadSessions();
+    },
     // The dialog does not confirm; deleting another user's session in a shared
     // deployment is not something to do on a single tap.
     deleteSession: (id) => void app.deleteSession(id),
 
-    loadConversations: () => fetchConversations(app),
+    loadConversations: (serverId) => fetchConversations(app, serverId),
     openStoredConversation: (conversation) => void openStoredConversation(app, conversation),
     deleteConversation: (conversation) => removeConversation(app, conversation),
 
@@ -635,8 +774,15 @@ function buildActions(app: App): ShellActions {
 
     retryConnection: () => app.reconnect(),
 
-    updateAction: () => onBannerAction(),
-    updateToggleLog: () => onBannerToggleLog(),
-    updateDismiss: () => onBannerDismiss(),
+    updateAction: (serverId) => void onBannerAction(serverId),
+    updateToggleLog: (serverId) => onBannerToggleLog(serverId),
+    updateDismiss: (serverId) => onBannerDismiss(serverId),
+    desktopUpdateOpen: openDesktopUpdate,
+    desktopUpdateDefer: () => void deferDesktopUpdate(),
+    desktopUpdateInstall: () => void installDesktopUpdate(),
+    desktopUpdateRetry: () => void retryDesktopUpdate(),
+    restartAgent: (sessionId, automatic, allowFreshContext) => {
+      app.send({ type: 'runtime_restart', sessionId, automatic, allowFreshContext });
+    },
   };
 }

@@ -245,3 +245,8 @@ function parseKeyMaterial(input: string): Buffer {
   }
   return decoded;
 }
+
+/** Validate CLI/environment key material before opening the installation DB. */
+export function validateEncryptionKeyMaterial(input: string): void {
+  parseKeyMaterial(input);
+}

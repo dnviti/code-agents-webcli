@@ -1,3 +1,5 @@
+import { controllerFetch } from '../controller/transport.js';
+
 /**
  * The browser's half of branching a conversation at a turn.
  *
@@ -43,7 +45,7 @@ export async function branchConversation(
   sessionId: string,
   turnId: string,
 ): Promise<BranchedConversation> {
-  const response = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/branch`, {
+  const response = await controllerFetch(`/api/sessions/${encodeURIComponent(sessionId)}/branch`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ turnId }),

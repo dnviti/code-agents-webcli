@@ -13,7 +13,7 @@ function request(url, cookie, headers = {}) {
       let body = '';
       res.setEncoding('utf8');
       res.on('data', (chunk) => { body += chunk; });
-      res.on('end', () => resolve({ status: res.statusCode, body }));
+      res.on('end', () => resolve({ status: res.statusCode, headers: res.headers, body }));
     });
     req.on('error', reject);
   });
@@ -107,6 +107,7 @@ describe('Desktop server seam', function () {
         { Origin: base },
       );
       assert.strictEqual(authenticated.status, 200);
+      assert.strictEqual(authenticated.headers['cache-control'], 'no-store');
       assert.strictEqual(await opensAndCloses(base.replace('http:', 'ws:'), {
         Origin: base,
         Cookie: 'code_agents_webcli_desktop_auth=random-desktop-token',

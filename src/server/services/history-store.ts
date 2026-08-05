@@ -1,6 +1,22 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { SessionRecord } from '../types.js';
+import {
+  ensureWorkspaceSessionDirectory,
+  workspaceSessionAccessDirectory,
+  WorkspaceSessionStorageRef,
+} from './workspace-session-storage.js';
+import {
+  appendSessionFile,
+  openSessionFileForRead,
+  prepareSessionFile,
+  publishPreparedSessionFile,
+  replaceSessionFile,
+  statSessionFile,
+  truncateSessionFile,
+  unlinkSessionEntry,
+  writePreparedSessionFile,
+} from './safe-session-file.js';
 
 /**
  * Append-only store of finalised scrollback lines, addressable by absolute line
@@ -53,7 +69,7 @@ export interface HistoryPage extends HistoryStats {
   lines: string[];
 }
 
-export type HistorySessionRef = Pick<SessionRecord, 'id' | 'ownerUserId'>;
+export type HistorySessionRef = Pick<SessionRecord, 'id' | 'ownerUserId'> & WorkspaceSessionStorageRef;
 
 interface SessionState {
   firstLine: number;
@@ -63,6 +79,7 @@ interface SessionState {
 
 export interface HistoryStoreLike {
   append(session: HistorySessionRef, lines: string[]): void;
+  flush?(session: HistorySessionRef): Promise<void>;
   stat(session: HistorySessionRef): Promise<HistoryStats>;
   read(session: HistorySessionRef, fromLine: number, count: number): Promise<HistoryPage>;
   deleteHistory(session: HistorySessionRef): Promise<void>;
@@ -105,7 +122,8 @@ export class HistoryStore implements HistoryStoreLike {
       throw new Error(`Refusing non-integer owner id for history storage: ${session.ownerUserId}`);
     }
 
-    return path.join(this.historyDir, String(session.ownerUserId), id);
+    const workspaceDir = workspaceSessionAccessDirectory(session);
+    return workspaceDir ? path.join(workspaceDir, 'history') : path.join(this.historyDir, String(session.ownerUserId), id);
   }
 
   /** Serialise every operation per session: reads must not see a half-written index. */
@@ -129,17 +147,17 @@ export class HistoryStore implements HistoryStoreLike {
 
     try {
       const header = Buffer.alloc(HEADER_BYTES);
-      const handle = await fs.promises.open(`${base}.idx`, 'r');
+      const handle = await openSessionFileForRead(`${base}.idx`);
       try {
         const { size } = await handle.stat();
         if (size >= HEADER_BYTES) {
           await handle.read(header, 0, HEADER_BYTES, 0);
           if (header.readUInt32BE(0) === MAGIC && header.readUInt16BE(4) === FORMAT_VERSION) {
-            const logStat = await fs.promises.stat(`${base}.log`).catch(() => ({ size: 0 }));
+            const logStat = await statSessionFile(`${base}.log`);
             state = {
               firstLine: Number(header.readBigUInt64BE(8)),
               count: Math.floor((size - HEADER_BYTES) / ENTRY_BYTES),
-              logSize: logStat.size,
+              logSize: logStat?.size ?? 0,
             };
           }
         }
@@ -147,6 +165,7 @@ export class HistoryStore implements HistoryStoreLike {
         await handle.close();
       }
     } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'UNSAFE_WORKSPACE_SESSION_FILE') throw error;
       if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
         console.error(`Failed to read history index ${base}.idx:`, error);
       }
@@ -173,7 +192,10 @@ export class HistoryStore implements HistoryStoreLike {
     if (state.logSize === 0) {
       if (state.count !== 0) {
         console.warn(`History index for ${base} describes lines an empty log does not have; resetting.`);
-        await fs.promises.writeFile(`${base}.idx`, headerBuffer(state.firstLine)).catch(() => undefined);
+        await replaceSessionFile(
+          `${base}.idx`,
+          headerBuffer(state.firstLine),
+        ).catch(() => undefined);
         state.count = 0;
       }
       return;
@@ -182,7 +204,7 @@ export class HistoryStore implements HistoryStoreLike {
     let scanFrom = 0;
     if (state.count > 0) {
       const entry = Buffer.alloc(ENTRY_BYTES);
-      const handle = await fs.promises.open(`${base}.idx`, 'r');
+      const handle = await openSessionFileForRead(`${base}.idx`);
       try {
         await handle.read(entry, 0, ENTRY_BYTES, HEADER_BYTES + (state.count - 1) * ENTRY_BYTES);
       } finally {
@@ -198,7 +220,7 @@ export class HistoryStore implements HistoryStoreLike {
 
     const tail = Buffer.alloc(state.logSize - scanFrom);
     if (tail.length > 0) {
-      const handle = await fs.promises.open(`${base}.log`, 'r');
+      const handle = await openSessionFileForRead(`${base}.log`);
       try {
         await handle.read(tail, 0, tail.length, scanFrom);
       } finally {
@@ -218,7 +240,7 @@ export class HistoryStore implements HistoryStoreLike {
     const lastNewline = newlines.length > 0 ? newlines[newlines.length - 1] : -1;
     if (lastNewline < tail.length - 1) {
       const keep = scanFrom + lastNewline + 1;
-      await fs.promises.truncate(`${base}.log`, keep);
+      await truncateSessionFile(`${base}.log`, keep);
       state.logSize = keep;
     }
 
@@ -239,13 +261,17 @@ export class HistoryStore implements HistoryStoreLike {
 
     const entries = Buffer.alloc(recovered.length * ENTRY_BYTES);
     recovered.forEach((offset, index) => entries.writeUInt32LE(offset, index * ENTRY_BYTES));
-    await fs.promises.appendFile(`${base}.idx`, entries);
+    await appendSessionFile(`${base}.idx`, entries);
     state.count += recovered.length;
     console.warn(`Recovered ${recovered.length} unindexed history line(s) for ${base}.`);
   }
 
   append(session: HistorySessionRef, lines: string[]): void {
     if (lines.length === 0) {
+      return;
+    }
+    if (session.persistenceUnavailable) {
+      console.error(`Refusing history append for session ${session.id}: ${session.persistenceUnavailable}`);
       return;
     }
 
@@ -262,6 +288,7 @@ export class HistoryStore implements HistoryStoreLike {
 
     void this.enqueue(base, async () => {
       try {
+        await ensureWorkspaceSessionDirectory(session);
         await this.appendNow(base, lines);
       } catch (error) {
         console.error(`Failed to append history for session ${session.id}:`, error);
@@ -273,6 +300,11 @@ export class HistoryStore implements HistoryStoreLike {
     });
   }
 
+  async flush(session: HistorySessionRef): Promise<void> {
+    const base = this.basePath(session);
+    await this.enqueue(base, async () => undefined);
+  }
+
   private async appendNow(base: string, lines: string[]): Promise<void> {
     await fs.promises.mkdir(path.dirname(base), { recursive: true });
 
@@ -281,8 +313,8 @@ export class HistoryStore implements HistoryStoreLike {
 
     if (!existed && state.count === 0 && state.logSize === 0) {
       // Fresh (or unreadable) index: lay down a header we can update in place.
-      await fs.promises.writeFile(`${base}.idx`, headerBuffer(state.firstLine));
-      await fs.promises.writeFile(`${base}.log`, '');
+      await replaceSessionFile(`${base}.idx`, headerBuffer(state.firstLine));
+      await replaceSessionFile(`${base}.log`, '');
     }
 
     const entries = Buffer.alloc(lines.length * ENTRY_BYTES);
@@ -296,8 +328,8 @@ export class HistoryStore implements HistoryStoreLike {
       offset += Buffer.byteLength(record, 'utf8');
     }
 
-    await fs.promises.appendFile(`${base}.log`, payload.join(''), 'utf8');
-    await fs.promises.appendFile(`${base}.idx`, entries);
+    await appendSessionFile(`${base}.log`, payload.join(''), 'utf8');
+    await appendSessionFile(`${base}.idx`, entries);
 
     state.count += lines.length;
     state.logSize = offset;
@@ -322,7 +354,7 @@ export class HistoryStore implements HistoryStoreLike {
       return;
     }
 
-    const idxHandle = await fs.promises.open(`${base}.idx`, 'r');
+    const idxHandle = await openSessionFileForRead(`${base}.idx`);
     let cutOffset = 0;
     let remaining: Buffer;
     try {
@@ -346,12 +378,12 @@ export class HistoryStore implements HistoryStoreLike {
     const keptBytes = Math.max(0, state.logSize - cutOffset);
     await this.copyLogTail(base, cutOffset, keptBytes);
 
-    await fs.promises.writeFile(
+    await writePreparedSessionFile(
       `${base}.idx.tmp`,
       Buffer.concat([headerBuffer(state.firstLine + drop), remaining]),
     );
-    await fs.promises.rename(`${base}.log.tmp`, `${base}.log`);
-    await fs.promises.rename(`${base}.idx.tmp`, `${base}.idx`);
+    await publishPreparedSessionFile(`${base}.log.tmp`, `${base}.log`);
+    await publishPreparedSessionFile(`${base}.idx.tmp`, `${base}.idx`);
 
     state.firstLine += drop;
     state.count -= drop;
@@ -359,9 +391,10 @@ export class HistoryStore implements HistoryStoreLike {
   }
 
   private async copyLogTail(base: string, from: number, length: number): Promise<void> {
-    const source = await fs.promises.open(`${base}.log`, 'r');
-    const target = await fs.promises.open(`${base}.log.tmp`, 'w');
+    const source = await openSessionFileForRead(`${base}.log`);
+    let target: fs.promises.FileHandle | null = null;
     try {
+      target = await prepareSessionFile(`${base}.log.tmp`);
       const chunk = Buffer.alloc(Math.min(length, TRIM_CHUNK_BYTES) || 1);
       let copied = 0;
       while (copied < length) {
@@ -375,7 +408,7 @@ export class HistoryStore implements HistoryStoreLike {
       }
     } finally {
       await source.close();
-      await target.close();
+      await target?.close();
     }
   }
 
@@ -415,7 +448,7 @@ export class HistoryStore implements HistoryStoreLike {
       // is where our slice ends), one read for the bytes.
       const spanEntries = relEnd - relStart + 1;
       const offsets = Buffer.alloc(spanEntries * ENTRY_BYTES);
-      const idxHandle = await fs.promises.open(`${base}.idx`, 'r');
+      const idxHandle = await openSessionFileForRead(`${base}.idx`);
       let read = 0;
       try {
         const result = await idxHandle.read(
@@ -448,7 +481,7 @@ export class HistoryStore implements HistoryStoreLike {
       }
 
       const buffer = Buffer.alloc(length);
-      const logHandle = await fs.promises.open(`${base}.log`, 'r');
+      const logHandle = await openSessionFileForRead(`${base}.log`);
       try {
         await logHandle.read(buffer, 0, length, sliceStart);
       } finally {
@@ -473,7 +506,7 @@ export class HistoryStore implements HistoryStoreLike {
       this.states.delete(base);
       await Promise.all(
         ['.log', '.idx', '.log.tmp', '.idx.tmp'].map((suffix) =>
-          fs.promises.rm(`${base}${suffix}`, { force: true }).catch(() => undefined),
+          unlinkSessionEntry(`${base}${suffix}`).catch(() => undefined),
         ),
       );
     });

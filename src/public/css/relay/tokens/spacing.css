@@ -40,4 +40,6 @@
   --z-modal: 60;
   --z-toast: 70;
   --z-tooltip: 80;
+  /* Consent/install blockers must cover app-owned title bars, toasts and tips. */
+  --z-blocking-modal: 90;
 }

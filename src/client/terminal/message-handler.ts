@@ -14,6 +14,12 @@ import { stripUnsupportedTerminalSequences } from './text';
 import { createFrameScheduler } from './scheduler';
 import { clearChatSurface, setChatSurface } from '../chat/surface';
 import { settleRuntimeStart } from '../sessions/actions';
+import { shellStore } from '../shell/store';
+import {
+  getControllerSnapshot,
+  parseQualifiedSessionId,
+  updateControllerStatus,
+} from '../controller/transport';
 
 export class MessageHandler {
   private app: App;
@@ -39,6 +45,16 @@ export class MessageHandler {
   }
 
   handle(message: WsMessage): void {
+    const routedServerId = 'serverId' in message && typeof message.serverId === 'string'
+      ? message.serverId : null;
+    if (
+      routedServerId
+      && message.type !== 'connected'
+      && 'sessionId' in message
+      && (message.type === 'session_joined' || message.sessionId === this.app.currentClaudeSessionId)
+    ) {
+      this.app.connectionId = this.app.controllerConnectionIds.get(routedServerId) || this.app.connectionId;
+    }
     // A tab can disappear while its join is crossing the socket. In particular,
     // closing active A starts a fallback join to B; an account-wide close for B
     // can then remove it before the server's answer arrives. Nothing below may
@@ -72,6 +88,7 @@ export class MessageHandler {
     if (message.type === 'chat_started') {
       const startedId = message.sessionId || '';
       if (startedId) this.app.sessionTabManager?.setTabSurface(startedId, 'chat');
+      if (startedId) this.app.sessionTabManager?.setTabRuntime(startedId, message.agent || '');
 
       if (!startedId || startedId === this.app.currentClaudeSessionId) {
         // Settled here for the same reason onRuntimeStarted settles the
@@ -91,6 +108,10 @@ export class MessageHandler {
         hideOverlay();
       }
     } else if (message.type === 'session_joined') {
+      this.app.sessionTabManager?.setTabRuntime(
+        message.sessionId,
+        message.agent || message.lastAgent || '',
+      );
       if (message.surface === 'chat') {
         this.app.sessionTabManager?.setTabSurface(message.sessionId, 'chat');
         setChatSurface(this.app, {
@@ -129,11 +150,62 @@ export class MessageHandler {
 
     switch (message.type) {
       case 'connected':
-        this.app.connectionId = message.connectionId;
+        if (message.serverId) {
+          this.app.controllerConnectionIds.set(message.serverId, message.connectionId);
+          this.app.controllerFeatures.set(message.serverId, message.features || []);
+          this.app.chats.setFeatures(message.features || [], message.serverId);
+          const activeOwner = this.app.currentClaudeSessionId
+            ? parseQualifiedSessionId(this.app.currentClaudeSessionId)?.serverId : null;
+          if (message.serverId === (activeOwner || getControllerSnapshot().selectedServerId)) {
+            this.app.connectionId = message.connectionId;
+          }
+        } else {
+          this.app.connectionId = message.connectionId;
+          this.app.chats.setFeatures(message.features);
+        }
         // Before anything can ask for an optional message: the handshake is
         // the first thing the server sends, and the alternative is a client
         // that has to guess what the other end understands.
-        this.app.chats.setFeatures(message.features);
+        break;
+
+      case 'controller_server_status':
+        updateControllerStatus(
+          message.serverId,
+          message.status,
+          message.message,
+          message.insecure,
+          message.lastSuccessfulContact,
+        );
+        {
+          const activeOwner = this.app.currentClaudeSessionId
+            ? parseQualifiedSessionId(this.app.currentClaudeSessionId)?.serverId : null;
+          if (activeOwner === message.serverId) {
+            const connection = shellStore.getSnapshot().connection;
+            shellStore.setState({
+              connection: {
+                ...connection,
+                state: message.status === 'connected' ? 'connected' : 'disconnected',
+              },
+            });
+          }
+          if (message.status === 'connected') this.app.handleChatConnectionRestored?.(message.serverId);
+          else this.app.handleChatConnectionLost?.(message.serverId);
+        }
+        void this.app.loadSessions();
+        break;
+
+      case 'controller_error':
+        console.error('Desktop controller:', message.message);
+        if (!message.serverId) {
+          showError(message.message);
+        } else {
+          const activeOwner = this.app.currentClaudeSessionId
+            ? parseQualifiedSessionId(this.app.currentClaudeSessionId)?.serverId : null;
+          const foreground = activeOwner || getControllerSnapshot().selectedServerId;
+          const target = getControllerSnapshot().targets.find((item) => item.id === message.serverId);
+          if (message.serverId === foreground) showError(message.message);
+          else showNotification(`${target?.name || 'Background server'}: ${message.message}`, 'error');
+        }
         break;
 
       case 'session_created':
@@ -184,6 +256,31 @@ export class MessageHandler {
 
       case 'error':
         this.onError(message);
+        break;
+
+      case 'runtime_restart_result':
+        if (message.ok) {
+          if (typeof window !== 'undefined') {
+            window.dispatchEvent(new window.CustomEvent('cc-agent-maintenance-changed', {
+              detail: { sessionId: message.sessionId },
+            }));
+          }
+          showNotification(message.resumed
+            ? `Agent restarted on ${message.version || 'the managed version'} with its conversation resumed.`
+            : `Agent restarted on ${message.version || 'the managed version'}.`);
+        } else {
+          const reasons: Record<string, string> = {
+            busy: 'The agent became busy before it could restart. Try again when the current turn is idle.',
+            cannot_resume: 'This agent cannot resume its native context automatically. Use Restart… to review the consequence first.',
+            environment_unavailable: 'The agent environment is unavailable. Reconnect the server and try again.',
+            invalid_session: 'The restart request did not identify a valid session.',
+            manual_required: 'This terminal agent needs confirmation before it can restart.',
+            no_managed_update: 'There is no verified managed agent copy to restart onto.',
+            project_managed: 'This agent belongs to the project. Update it through the project rebuild flow.',
+            restart_failed: 'The agent could not be restarted. Try again.',
+          };
+          showError(reasons[message.reason || ''] || message.reason || 'The agent could not be restarted.');
+        }
         break;
 
       case 'info':
@@ -268,38 +365,52 @@ export class MessageHandler {
         break;
 
       case 'update_status':
-        applyUpdateStatus(message.status);
+        applyUpdateStatus(message.status, routedServerId);
         break;
 
       case 'update_output':
-        appendUpdateLog(message.data);
+        appendUpdateLog(message.data, routedServerId);
         break;
 
       case 'update_restarting':
-        onUpdateRestarting();
+        onUpdateRestarting(routedServerId);
         break;
 
       case 'environment_tier_changed':
         // Told once, in passing. The environment panel re-reads itself off the
         // same event, so a dialog that happens to be open is never stale.
-        showNotification(
-          message.outcome === 'deferred'
-            ? `Your workspace will move to ${message.tier} once nothing is running (${message.reason}).`
-            : `Your workspace moved to ${message.tier} (${message.reason}).`,
-          'info',
-        );
-        window.dispatchEvent(new CustomEvent('cc-environment-changed'));
+        {
+          const controller = getControllerSnapshot();
+          const target = routedServerId
+            ? controller.targets.find((item) => item.id === routedServerId) : null;
+          const prefix = target ? `${target.name}: ` : '';
+          showNotification(
+            prefix + (message.outcome === 'deferred'
+              ? `Your workspace will move to ${message.tier} once nothing is running (${message.reason}).`
+              : `Your workspace moved to ${message.tier} (${message.reason}).`),
+            'info',
+          );
+          if (!routedServerId || routedServerId === controller.selectedServerId) {
+            window.dispatchEvent(new CustomEvent('cc-environment-changed', {
+              detail: { serverId: routedServerId },
+            }));
+          }
+        }
         break;
 
       case 'project_updated':
       case 'project_removed':
         // The projects dialog re-reads itself off this event, so an open panel
         // never stays stale. No toast: these are frequent background churn.
-        window.dispatchEvent(new CustomEvent('cc-projects-changed'));
+        if (!routedServerId || routedServerId === getControllerSnapshot().selectedServerId) {
+          window.dispatchEvent(new CustomEvent('cc-projects-changed', {
+            detail: { serverId: routedServerId },
+          }));
+        }
         break;
 
       case 'update_done':
-        onUpdateDone(this.app, message);
+        onUpdateDone(this.app, message, routedServerId);
         break;
 
       default:
@@ -436,6 +547,7 @@ export class MessageHandler {
     workingDir: string;
     active: boolean;
     outputBuffer?: string[];
+    agent?: string;
     lastAgent?: string;
     runtimeLabel?: string;
     history?: { firstLine: number; totalLines: number };
@@ -558,6 +670,10 @@ export class MessageHandler {
     }
 
     if (this.app.sessionTabManager && this.app.currentClaudeSessionId) {
+      this.app.sessionTabManager.setTabRuntime(
+        this.app.currentClaudeSessionId,
+        message.agent || '',
+      );
       this.app.sessionTabManager.updateTabStatus(this.app.currentClaudeSessionId, 'active');
     }
   }

@@ -15,6 +15,7 @@ import { createProjectRoutes, ProjectsRoutesDeps } from './projects.js';
 import { createConnectedHostRoutes, ConnectedHostRoutesDeps } from './connected-hosts.js';
 import { createGitIdentityRoutes, GitIdentityRoutesDeps } from './git-identity.js';
 import { createStorageUsageRoutes, StorageUsageRoutesDeps } from './storage-usage.js';
+import { createAgentMaintenanceRoutes, AgentMaintenanceRoutesDeps } from './agent-maintenance.js';
 
 export type RegisterRoutesDeps = HealthRoutesDeps
   & SessionRoutesDeps
@@ -31,7 +32,8 @@ export type RegisterRoutesDeps = HealthRoutesDeps
   & ProjectsRoutesDeps
   & ConnectedHostRoutesDeps
   & GitIdentityRoutesDeps
-  & StorageUsageRoutesDeps;
+  & StorageUsageRoutesDeps
+  & AgentMaintenanceRoutesDeps;
 
 export function registerRoutes(app: Express, deps: RegisterRoutesDeps): void {
   app.use(createHealthRoutes(deps));
@@ -50,4 +52,5 @@ export function registerRoutes(app: Express, deps: RegisterRoutesDeps): void {
   app.use(createConnectedHostRoutes(deps));
   app.use(createGitIdentityRoutes(deps));
   app.use(createStorageUsageRoutes(deps));
+  app.use(createAgentMaintenanceRoutes(deps));
 }

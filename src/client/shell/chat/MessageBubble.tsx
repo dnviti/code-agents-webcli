@@ -1,5 +1,6 @@
 import * as React from 'react';
 import {
+  AttachmentBlock,
   ChatBlock,
   ChatMessage,
   ChatUsage,
@@ -17,6 +18,7 @@ import {
   isRule,
 } from '../../../shared/chat-visibility.js';
 import { ChatTranscript } from '../../chat/transcript.js';
+import { safeAttachmentDownloadUrl } from '../../chat/attachments-api.js';
 import { compactCount, formatDuration } from '../../chat/tool-meta.js';
 import { Icon } from '../../ui/relay/Icon.js';
 import { PHONE_TEXT, TOUCH_GAP, TOUCH_TARGET, usePhone } from '../../ui/touch.js';
@@ -657,7 +659,10 @@ function BlockView({
     }
 
     case 'image':
-      return <ImageView block={block} />;
+      return <ImageView block={block} sessionId={transcript.sessionId} />;
+
+    case 'attachment':
+      return <AttachmentView block={block} sessionId={transcript.sessionId} />;
 
     case 'notice':
       return <NoticeRule block={block} />;
@@ -777,8 +782,8 @@ function NoticeRule({ block }: { block: NoticeBlock }): React.JSX.Element {
   );
 }
 
-function ImageView({ block }: { block: ImageBlock }) {
-  return (
+function ImageView({ block, sessionId }: { block: ImageBlock; sessionId: string }) {
+  const image = (
     <img
       src={block.url}
       alt={block.alt || 'Attached image'}
@@ -791,6 +796,86 @@ function ImageView({ block }: { block: ImageBlock }) {
       }}
     />
   );
+  const download = safeAttachmentDownloadUrl(block.url, sessionId);
+  if (!download) return image;
+  return (
+    <a
+      href={download}
+      download={block.alt || undefined}
+      aria-label={`Download ${block.alt || 'attached image'}`}
+      style={{ display: 'inline-flex', maxWidth: '100%' }}
+    >
+      {image}
+    </a>
+  );
+}
+
+/** A durable uploaded file: thumbnail where useful, download in every case. */
+function AttachmentView({ block, sessionId }: { block: AttachmentBlock; sessionId: string }) {
+  const download = safeAttachmentDownloadUrl(block.url, sessionId);
+  const isImage = block.mime.startsWith('image/');
+  const body = (
+    <>
+      {isImage && download ? (
+        <img
+          src={download}
+          alt=""
+          loading="lazy"
+          style={{
+            width: 48,
+            height: 48,
+            objectFit: 'cover',
+            flex: '0 0 auto',
+            borderRadius: 'calc(var(--radius) - 2px)',
+          }}
+        />
+      ) : (
+        <span aria-hidden="true" style={{ display: 'inline-flex', flex: '0 0 auto' }}>
+          <Icon name={isImage ? 'image' : 'file-text'} size={16} />
+        </span>
+      )}
+      <span style={{ minWidth: 0 }}>
+        <span style={{ display: 'block', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+          {block.name}
+        </span>
+        <span style={{ display: 'block', color: 'var(--muted-foreground)', fontSize: 'var(--text-2xs)' }}>
+          {formatAttachmentBytes(block.size)} · {block.mime}
+        </span>
+      </span>
+    </>
+  );
+  const style: React.CSSProperties = {
+    display: 'inline-flex',
+    alignItems: 'center',
+    gap: 8,
+    maxWidth: 'min(100%, 420px)',
+    padding: 6,
+    color: 'var(--foreground)',
+    background: 'var(--muted)',
+    border: '1px solid var(--border)',
+    borderRadius: 'var(--radius)',
+    fontFamily: 'var(--font-mono)',
+    textDecoration: 'none',
+  };
+  if (!download) return <span style={style}>{body}</span>;
+  return (
+    <a
+      href={download}
+      download={block.name}
+      aria-label={`Download ${block.name}`}
+      title={`Download ${block.name}`}
+      style={style}
+    >
+      {body}
+    </a>
+  );
+}
+
+function formatAttachmentBytes(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes <= 0) return '0 B';
+  if (bytes < 1024) return `${Math.round(bytes)} B`;
+  if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)} kB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
 function ErrorCallout({ block, onRetry }: { block: ErrorBlock; onRetry?: () => void }) {
@@ -994,6 +1079,9 @@ export function messageText(message: ChatMessage): string {
         break;
       case 'image':
         parts.push(block.alt ? `${block.alt} (${block.url})` : block.url);
+        break;
+      case 'attachment':
+        parts.push(`${block.name} (${block.url})`);
         break;
       case 'question':
         parts.push([

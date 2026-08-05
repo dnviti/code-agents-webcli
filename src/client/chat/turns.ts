@@ -268,7 +268,8 @@ function labelFor(group: ChatMessage[]): string {
   }
   // An attachments-only turn still opened one and still needs a name.
   const attached = group.some(
-    (message) => message.role === 'user' && message.blocks.some((block) => block.kind === 'image'),
+    (message) => message.role === 'user'
+      && message.blocks.some((block) => block.kind === 'image' || block.kind === 'attachment'),
   );
   if (attached) return 'attachment';
 

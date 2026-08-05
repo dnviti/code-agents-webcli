@@ -14,6 +14,10 @@
 /** One conversation, as a list of them describes it. */
 export interface ConversationSummary {
   id: string;
+  /** Durable cleanup authority; it may only be deleted to retry rollback. */
+  rollbackRecoveryPending?: boolean;
+  /** Present while the legacy source is retained and its workspace is unavailable. */
+  persistenceUnavailable?: string;
   /** The label the user chose, or the one the session was created with. */
   name: string;
   /**

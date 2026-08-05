@@ -1,6 +1,19 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { SessionRecord } from '../types.js';
+import {
+  ensureWorkspaceSessionDirectory,
+  workspaceSessionAccessDirectory,
+  workspaceSessionDirectory,
+  WorkspaceSessionStorageRef,
+} from './workspace-session-storage.js';
+import {
+  appendSessionFile,
+  openSessionFileForRead,
+  replaceSessionFile,
+  statSessionFile,
+  unlinkSessionEntry,
+} from './safe-session-file.js';
 
 export interface TranscriptStoreOptions {
   storageDir: string;
@@ -11,11 +24,12 @@ export interface TranscriptStoreOptions {
   maxTranscriptBytes?: number;
 }
 
-export type TranscriptSessionRef = Pick<SessionRecord, 'id' | 'ownerUserId'>;
+export type TranscriptSessionRef = Pick<SessionRecord, 'id' | 'ownerUserId'> & WorkspaceSessionStorageRef;
 
 export interface TranscriptStoreLike {
   ensureTranscript(session: TranscriptSessionRef): Promise<string>;
   appendOutput(session: TranscriptSessionRef, data: string): void;
+  flush?(session: TranscriptSessionRef): Promise<void>;
   readTranscriptChunks(session: TranscriptSessionRef): Promise<string[]>;
   deleteTranscript(session: TranscriptSessionRef): Promise<void>;
 }
@@ -40,6 +54,10 @@ export class TranscriptStore implements TranscriptStoreLike {
   }
 
   getTranscriptPath(session: TranscriptSessionRef): string {
+    const workspaceDir = workspaceSessionDirectory(session);
+    if (workspaceDir) {
+      return path.join(workspaceDir, 'transcript.md');
+    }
     return path.join(
       this.transcriptDir,
       String(session.ownerUserId),
@@ -47,20 +65,32 @@ export class TranscriptStore implements TranscriptStoreLike {
     );
   }
 
+  private getTranscriptAccessPath(session: TranscriptSessionRef): string {
+    const workspaceDir = workspaceSessionAccessDirectory(session);
+    return workspaceDir
+      ? path.join(workspaceDir, 'transcript.md')
+      : this.getTranscriptPath(session);
+  }
+
   async ensureTranscript(session: TranscriptSessionRef): Promise<string> {
-    const transcriptPath = this.getTranscriptPath(session);
+    const visiblePath = this.getTranscriptPath(session);
+    const transcriptPath = this.getTranscriptAccessPath(session);
+    await ensureWorkspaceSessionDirectory(session);
     await fs.promises.mkdir(path.dirname(transcriptPath), { recursive: true });
-    const handle = await fs.promises.open(transcriptPath, 'a');
-    await handle.close();
-    return transcriptPath;
+    await appendSessionFile(transcriptPath, '');
+    return visiblePath;
   }
 
   appendOutput(session: TranscriptSessionRef, data: string): void {
     if (!data) {
       return;
     }
+    if (session.persistenceUnavailable) {
+      console.error(`Refusing transcript append for session ${session.id}: ${session.persistenceUnavailable}`);
+      return;
+    }
 
-    const transcriptPath = this.getTranscriptPath(session);
+    const transcriptPath = this.getTranscriptAccessPath(session);
     const previous = this.pendingWrites.get(transcriptPath) || Promise.resolve();
 
     // Only stat once per ~1MB appended rather than on every PTY chunk.
@@ -70,8 +100,9 @@ export class TranscriptStore implements TranscriptStoreLike {
     this.appendedSinceCheck.set(transcriptPath, shouldCheckSize ? 0 : appended);
 
     const next = previous.then(async () => {
+      await ensureWorkspaceSessionDirectory(session);
       await fs.promises.mkdir(path.dirname(transcriptPath), { recursive: true });
-      await fs.promises.appendFile(transcriptPath, data, 'utf8');
+      await appendSessionFile(transcriptPath, data, 'utf8');
       if (shouldCheckSize) {
         await this.truncateHeadIfOversized(transcriptPath);
       }
@@ -85,14 +116,14 @@ export class TranscriptStore implements TranscriptStoreLike {
   }
 
   async readTranscriptChunks(session: TranscriptSessionRef): Promise<string[]> {
-    const transcriptPath = this.getTranscriptPath(session);
-    await this.flush(transcriptPath);
+    const transcriptPath = this.getTranscriptAccessPath(session);
+    await this.flushPath(transcriptPath);
 
     let contents = '';
     try {
       // Read only the tail: an unbounded transcript would otherwise be
       // materialised in full and shipped in one WebSocket frame on every join.
-      const handle = await fs.promises.open(transcriptPath, 'r');
+      const handle = await openSessionFileForRead(transcriptPath);
       try {
         const { size } = await handle.stat();
         const start = Math.max(0, size - this.replayLimitBytes);
@@ -122,13 +153,15 @@ export class TranscriptStore implements TranscriptStoreLike {
   /** Drop the oldest half once a transcript exceeds the cap. */
   private async truncateHeadIfOversized(transcriptPath: string): Promise<void> {
     try {
-      const { size } = await fs.promises.stat(transcriptPath);
+      const stat = await statSessionFile(transcriptPath);
+      if (!stat) return;
+      const { size } = stat;
       if (size <= this.maxTranscriptBytes) {
         return;
       }
 
       const keep = Math.floor(this.maxTranscriptBytes / 2);
-      const handle = await fs.promises.open(transcriptPath, 'r');
+      const handle = await openSessionFileForRead(transcriptPath);
       let tail: Buffer;
       try {
         tail = Buffer.alloc(keep);
@@ -137,24 +170,22 @@ export class TranscriptStore implements TranscriptStoreLike {
         await handle.close();
       }
 
-      const tmpPath = `${transcriptPath}.${process.pid}.tmp`;
-      await fs.promises.writeFile(
-        tmpPath,
+      await replaceSessionFile(
+        transcriptPath,
         `[... earlier output trimmed ...]\n${tail.toString('utf8')}`,
         'utf8',
       );
-      await fs.promises.rename(tmpPath, transcriptPath);
     } catch (error) {
       console.error(`Failed to trim transcript ${transcriptPath}:`, error);
     }
   }
 
   async deleteTranscript(session: TranscriptSessionRef): Promise<void> {
-    const transcriptPath = this.getTranscriptPath(session);
-    await this.flush(transcriptPath);
+    const transcriptPath = this.getTranscriptAccessPath(session);
+    await this.flushPath(transcriptPath);
 
     try {
-      await fs.promises.rm(transcriptPath, { force: true });
+      await unlinkSessionEntry(transcriptPath);
     } catch (error) {
       console.error(`Failed to delete transcript for session ${session.id}:`, error);
     } finally {
@@ -162,7 +193,11 @@ export class TranscriptStore implements TranscriptStoreLike {
     }
   }
 
-  private async flush(transcriptPath: string): Promise<void> {
+  async flush(session: TranscriptSessionRef): Promise<void> {
+    await this.flushPath(this.getTranscriptAccessPath(session));
+  }
+
+  private async flushPath(transcriptPath: string): Promise<void> {
     const pending = this.pendingWrites.get(transcriptPath);
     if (pending) {
       await pending.catch(() => undefined);

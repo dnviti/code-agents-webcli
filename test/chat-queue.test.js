@@ -112,6 +112,34 @@ describe('typing ahead while the agent works', function () {
     assert.notStrictEqual(s.currentState, 'exited', 'a workflow prompt must never enter the /clear lifecycle path');
   });
 
+  it('records uploaded files as durable downloadable attachment blocks', async function () {
+    const { s, store } = session();
+    const attachments = [
+      {
+        url: '/api/sessions/s1/chat-attachments/0123456789ab-shot.png',
+        mime: 'image/png', name: 'shot.png', size: 123,
+      },
+      {
+        url: '/api/sessions/s1/chat-attachments/0123456789ab-notes.txt',
+        mime: 'text/plain', name: 'notes.txt', size: 45,
+      },
+    ];
+
+    await s.send({ text: 'review these', attachments });
+
+    assert.deepStrictEqual(
+      store.events
+        .filter((event) => event.t === 'block_start' && event.block?.kind === 'attachment')
+        .map((event) => event.block),
+      attachments.map((attachment) => ({ kind: 'attachment', ...attachment })),
+      'the transcript must retain the URL for images and ordinary files alike',
+    );
+    assert.ok(
+      !store.events.some((event) => event.block?.text === 'Attached: notes.txt'),
+      'ordinary files must not degrade to an unclickable text label',
+    );
+  });
+
   it('queues rather than refusing a turn typed mid-run', async function () {
     const { s, adapter, broadcasts } = session();
     await s.send({ text: 'first' });

@@ -16,6 +16,11 @@ import { releaseTerminals } from '../chat/chat-terminal';
 import { shellStore, type ShellTab } from '../shell/store';
 import { playNotificationSound, showNotification } from '../ui/notifications';
 import { takeRequestedConversation } from '../ui/notify';
+import {
+  getControllerSnapshot,
+  parseQualifiedSessionId,
+  selectControllerServer,
+} from '../controller/transport';
 
 /** What the strip needs about a tab that `SessionInfo` does not already say. */
 interface TabRecord {
@@ -40,6 +45,8 @@ interface TabRecord {
    * user is looking at a different one.
    */
   surface: 'terminal' | 'chat';
+  /** Runtime currently or most recently associated with this tab. */
+  kind: string;
   projectId?: string | null;
   projectName?: string | null;
   projectWorkingDirKind?: 'host' | 'container';
@@ -74,48 +81,32 @@ export interface ListedSession {
   workingDir: string | null;
   active?: boolean;
   surface?: 'terminal' | 'chat';
+  agent?: string | null;
+  lastAgent?: string | null;
   customName?: string | null;
   bypassPermissions?: boolean;
   projectId?: string | null;
   projectName?: string | null;
   projectWorkingDirKind?: 'host' | 'container';
+  /** Metadata cached by the desktop controller; never a live tab to join. */
+  offline?: boolean;
 }
 
-/**
- * Where this browser remembers the tab it was last on.
- *
- * In the browser and not on the server, because which tab you are looking at is
- * a property of the window you are looking at it in — a shared answer would have
- * a second window dragging the first one around.
- *
- * Written to both stores and read from sessionStorage first. sessionStorage is
- * per window, which is what lets two windows sit on different sessions and each
- * come back to its own after a reload. localStorage is the fallback for a window
- * that has no session storage to read yet — a newly opened one, or a browser
- * started fresh — which would otherwise always land on the first tab.
- */
+/** Browser key used by older builds for session metadata. */
 const ACTIVE_TAB_KEY = 'cc-web-active-tab';
 
-function rememberActiveTab(sessionId: string): void {
+function forgetStoredActiveTab(): void {
   for (const store of storages()) {
     try {
-      store.setItem(ACTIVE_TAB_KEY, sessionId);
+      store.removeItem(ACTIVE_TAB_KEY);
     } catch {
-      // Private mode, a full quota, storage switched off. Losing the memory of
-      // which tab was open is not a reason to fail a tab switch.
+      // Storage may be disabled. No new session metadata is written there.
     }
   }
 }
 
-function recallActiveTab(): string | null {
-  for (const store of storages()) {
-    try {
-      const stored = store.getItem(ACTIVE_TAB_KEY);
-      if (stored) return stored;
-    } catch {
-      // Same as above, and the next store still gets its turn.
-    }
-  }
+function recallActiveTab(): null {
+  forgetStoredActiveTab();
   return null;
 }
 
@@ -134,23 +125,14 @@ function sameOrder(left: string[], right: string[]): boolean {
  */
 const LEGACY_CLOSED_TABS_KEY = 'cc-web-closed-conversations';
 
-function readLegacyClosedTabs(): Set<string> {
+function takeLegacyClosedTabs(): Set<string> {
   try {
     const raw = localStorage.getItem(LEGACY_CLOSED_TABS_KEY);
+    localStorage.removeItem(LEGACY_CLOSED_TABS_KEY);
     const parsed = raw ? JSON.parse(raw) : [];
     return new Set(Array.isArray(parsed) ? parsed.filter((id) => typeof id === 'string') : []);
   } catch {
     return new Set();
-  }
-}
-
-function writeLegacyClosedTabs(ids: Set<string>): void {
-  try {
-    if (ids.size === 0) localStorage.removeItem(LEGACY_CLOSED_TABS_KEY);
-    else localStorage.setItem(LEGACY_CLOSED_TABS_KEY, JSON.stringify(Array.from(ids)));
-  } catch {
-    // A blocked store cannot be migrated. On an old server the close still
-    // lasts for this page; it simply cannot survive a reload.
   }
 }
 
@@ -202,7 +184,6 @@ export class SessionTabManager {
   activeTabId: string | null;
   tabOrder: string[];
   tabHistory: string[];
-  notificationsEnabled: boolean;
   /** How many tabs this screen has ever opened; see `TabRecord.openedSeq`. */
   private tabsOpened = 0;
   /** Invalidates a session-list photograph when membership changed in flight. */
@@ -231,6 +212,8 @@ export class SessionTabManager {
    * different releases; endpoint behaviour is the capability that matters.
    */
   private usingLegacyTabVisibility = false;
+  /** Compatibility state for an old server, kept only for this live page. */
+  private legacyClosedTabs: Set<string>;
 
   constructor(app: App) {
     this.app = app;
@@ -239,8 +222,17 @@ export class SessionTabManager {
     this.activeTabId = null;
     this.tabOrder = [];
     this.tabHistory = [];
-    this.notificationsEnabled = false;
-    this.requestNotificationPermission();
+    this.legacyClosedTabs = takeLegacyClosedTabs();
+  }
+
+  private readLegacyClosedTabs(): Set<string> {
+    return new Set(this.legacyClosedTabs);
+  }
+
+  private writeLegacyClosedTabs(ids: Set<string>): void {
+    this.legacyClosedTabs = new Set(ids);
+    // Never recreate the old profile-local list, even in rollout fallback.
+    try { localStorage.removeItem(LEGACY_CLOSED_TABS_KEY); } catch { /* blocked */ }
   }
 
   getAlias(kind: string): string {
@@ -251,25 +243,29 @@ export class SessionTabManager {
   // Notifications
   // ---------------------------------------------------------------------------
 
-  requestNotificationPermission(): void {
-    if (!('Notification' in window)) return;
-    if (Notification.permission === 'granted') {
-      this.notificationsEnabled = true;
-    } else if (Notification.permission === 'default') {
-      Notification.requestPermission().then((permission) => {
-        this.notificationsEnabled = permission === 'granted';
-      });
-    }
-  }
-
-  sendNotification(title: string, body: string, sessionId: string): void {
+  sendNotification(
+    title: string,
+    body: string,
+    sessionId: string,
+    kind: 'finished' | 'failed' = 'finished',
+  ): void {
+    const preferences = shellStore.getSnapshot().notifications;
+    if (!preferences.enabled || !preferences[kind]) return;
     if (sessionId === this.activeTabId) return;
     if (document.visibilityState === 'visible') return;
 
+    const owner = parseQualifiedSessionId(sessionId)?.serverId;
+    const serverName = owner
+      ? getControllerSnapshot().targets.find((target) => target.id === owner)?.name
+      : undefined;
+    const visibleTitle = preferences.details ? title : kind === 'failed' ? 'A task failed' : 'A task finished';
+    const visibleBody = preferences.details ? body : '';
+    const targetedTitle = serverName ? `${visibleTitle} · ${serverName}` : visibleTitle;
+
     if ('Notification' in window && Notification.permission === 'granted') {
       try {
-        const notification = new Notification(title, {
-          body,
+        const notification = new Notification(targetedTitle, {
+          body: visibleBody,
           icon: '/favicon.ico',
           tag: sessionId,
           requireInteraction: false,
@@ -291,7 +287,7 @@ export class SessionTabManager {
       }
     }
 
-    this.showInPageNotification(title, body);
+    this.showInPageNotification(targetedTitle, visibleBody);
   }
 
   /**
@@ -317,7 +313,7 @@ export class SessionTabManager {
       try { navigator.vibrate([200, 100, 200]); } catch { /* unsupported */ }
     }
 
-    showNotification(`${title} — ${body}`);
+    showNotification([title, body].filter(Boolean).join(' — '));
     playNotificationSound();
   }
 
@@ -333,6 +329,7 @@ export class SessionTabManager {
    * into one render.
    */
   syncShell(): void {
+    const controller = getControllerSnapshot();
     const tabs: ShellTab[] = this.getOrderedTabIds()
       .map((id): ShellTab | null => {
         const session = this.activeSessions.get(id);
@@ -364,20 +361,25 @@ export class SessionTabManager {
                     ? 'running'
                     : 'idle';
 
+        const owner = parseQualifiedSessionId(id)?.serverId;
+        const target = owner ? controller.targets.find((item) => item.id === owner) : undefined;
         return {
           id,
           title: record.displayName,
           surface: record.surface,
           status,
-          // Not yet tracked per session; the server's SessionRecord.agent would
-          // have to be plumbed through the list endpoint first.
-          kind: '',
+          kind: record.kind,
           workingDir: session.workingDir,
           projectWorkingDirKind: session.projectWorkingDirKind,
           unread: session.unreadOutput,
           attention: session.attention ?? null,
           projectId: record.projectId,
           projectName: record.projectName,
+          ...(target ? {
+            serverId: target.id,
+            serverName: target.name,
+            serverInsecure: target.insecure === true,
+          } : {}),
         };
       })
       .filter((tab): tab is ShellTab => tab !== null);
@@ -413,7 +415,19 @@ export class SessionTabManager {
   applyRemoteOrder(ids: string[]): void {
     this.membershipRevision++;
     if (this.pendingTabOrderMutations > 0) return;
-    this.setTabOrder(this.mergeTabOrder(ids));
+    const controller = getControllerSnapshot();
+    const owner = controller.enabled ? parseQualifiedSessionId(ids[0] || '')?.serverId : null;
+    if (!owner || ids.some((id) => parseQualifiedSessionId(id)?.serverId !== owner)) {
+      this.setTabOrder(this.mergeTabOrder(ids));
+      return;
+    }
+    const ordered = ids.filter((id, index) => this.tabs.has(id) && ids.indexOf(id) === index);
+    const remaining = [...ordered];
+    const next = this.tabOrder.map((id) => (
+      parseQualifiedSessionId(id)?.serverId === owner ? remaining.shift() || id : id
+    ));
+    for (const id of remaining) if (!next.includes(id)) next.push(id);
+    this.setTabOrder(next);
   }
 
   /** Merge an older strip snapshot without losing tabs it did not know yet. */
@@ -439,12 +453,22 @@ export class SessionTabManager {
     const mutation = this.tabOrderMutationTail
       .catch(() => undefined)
       .then(async () => {
-        const response = await this.app.authFetch('/api/sessions/tabs/order', {
-          method: 'PATCH',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ sessionIds }),
-        });
-        if (!response.ok) throw new Error(`Tab order was refused (${response.status})`);
+        const controller = getControllerSnapshot();
+        const groups = new Map<string | null, string[]>();
+        for (const sessionId of sessionIds) {
+          const owner = controller.enabled ? parseQualifiedSessionId(sessionId)?.serverId || null : null;
+          const values = groups.get(owner) || [];
+          values.push(sessionId);
+          groups.set(owner, values);
+        }
+        const responses = await Promise.all([...groups].map(([serverId, ids]) =>
+          this.app.authFetch('/api/sessions/tabs/order', {
+            method: 'PATCH',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ sessionIds: ids }),
+          }, serverId)));
+        const refused = responses.find((response) => !response.ok);
+        if (refused) throw new Error(`Tab order was refused (${refused.status})`);
       });
 
     this.tabOrderMutationTail = mutation;
@@ -568,16 +592,18 @@ export class SessionTabManager {
       // take a new photograph. That second read handles every outcome without
       // guessing: applied closes are absent, ignored stale tombstones remain
       // present, and an old server is filtered by the compatibility set below.
-      if (migrateLegacyClosedTabs && readLegacyClosedTabs().size > 0) {
+      if (migrateLegacyClosedTabs && this.readLegacyClosedTabs().size > 0) {
         await this.migrateLegacyClosedTabs();
         snapshot = await this.stableSessionList();
         if (!snapshot) throw new Error('Failed to reload sessions after tab migration');
       }
 
       const compatibilityClosed = this.usingLegacyTabVisibility
-        ? readLegacyClosedTabs()
+        ? this.readLegacyClosedTabs()
         : new Set<string>();
       const sessions = snapshot.listed.filter((session) => (
+        session.offline !== true
+        &&
         !this.pendingTabCloses.has(session.id)
         && !(session.surface === 'chat' && compatibilityClosed.has(session.id))
       ));
@@ -627,7 +653,7 @@ export class SessionTabManager {
     // supporting server, these writes migrate the temporary browser state and
     // the returned IDs filter the pre-migration list photograph. If it is still
     // the old server, they remain local and are filtered the same way.
-    if (this.usingLegacyTabVisibility && readLegacyClosedTabs().size > 0) {
+    if (this.usingLegacyTabVisibility && this.readLegacyClosedTabs().size > 0) {
       await this.migrateLegacyClosedTabs();
       // Never apply the pre-migration photograph. On a new server the migration
       // changed durable membership; on an old one a session may still have been
@@ -636,9 +662,11 @@ export class SessionTabManager {
       if (!snapshot) return false;
     }
     const compatibilityClosed = this.usingLegacyTabVisibility
-      ? readLegacyClosedTabs()
+      ? this.readLegacyClosedTabs()
       : new Set<string>();
     const visible = snapshot.listed.filter((session) => (
+      session.offline !== true
+      &&
       !this.pendingTabCloses.has(session.id)
       && !(session.surface === 'chat' && compatibilityClosed.has(session.id))
     ));
@@ -661,6 +689,10 @@ export class SessionTabManager {
 
     for (const record of Array.from(this.tabs.values())) {
       if (live.has(record.id) || record.openedSeq > snapshot.asked) continue;
+      const owner = parseQualifiedSessionId(record.id)?.serverId;
+      const target = owner
+        ? getControllerSnapshot().targets.find((item) => item.id === owner) : undefined;
+      if (target && target.connection !== 'connected') continue;
       this.closeSession(record.id, { skipServerRequest: true });
     }
 
@@ -693,6 +725,7 @@ export class SessionTabManager {
       session.projectName,
       session.projectWorkingDirKind,
     );
+    this.setTabRuntime(session.id, session.agent || session.lastAgent || '');
 
     if (session.surface !== 'chat') return;
 
@@ -730,7 +763,7 @@ export class SessionTabManager {
       this.opensDuringPendingClose.add(session.id);
       return;
     }
-    if (this.usingLegacyTabVisibility && readLegacyClosedTabs().has(session.id)) return;
+    if (this.usingLegacyTabVisibility && this.readLegacyClosedTabs().has(session.id)) return;
     this.adopt(session);
   }
 
@@ -825,6 +858,7 @@ export class SessionTabManager {
       displayName,
       customName,
       surface: 'terminal',
+      kind: '',
       projectId,
       projectName,
       projectWorkingDirKind,
@@ -875,6 +909,14 @@ export class SessionTabManager {
     this.syncShell();
   }
 
+  /** Keep maintenance status attached to the tab whose runtime owns it. */
+  setTabRuntime(sessionId: string, kind: string): void {
+    const record = this.tabs.get(sessionId);
+    if (!record || record.kind === kind) return;
+    record.kind = kind;
+    this.syncShell();
+  }
+
   /** Re-establish every chat subscription, e.g. after the socket reconnected. */
   resubscribeChats(): void {
     for (const record of this.tabs.values()) {
@@ -896,7 +938,9 @@ export class SessionTabManager {
     }
 
     this.activeTabId = sessionId;
-    rememberActiveTab(sessionId);
+    const owner = parseQualifiedSessionId(sessionId)?.serverId;
+    if (owner) selectControllerServer(owner);
+    forgetStoredActiveTab();
 
     const session = this.activeSessions.get(sessionId);
     if (session) {
@@ -952,8 +996,8 @@ export class SessionTabManager {
     // A reopen is explicit user intent in both versions. Clear an old local
     // tombstone after either a real account write or the compatibility no-op so
     // it cannot hide the tab again on this page or the next one.
-    const legacyClosed = readLegacyClosedTabs();
-    if (legacyClosed.delete(sessionId)) writeLegacyClosedTabs(legacyClosed);
+    const legacyClosed = this.readLegacyClosedTabs();
+    if (legacyClosed.delete(sessionId)) this.writeLegacyClosedTabs(legacyClosed);
     if (legacyClosed.size === 0) this.usingLegacyTabVisibility = false;
 
     if (result.kind === 'unsupported') return true;
@@ -1068,10 +1112,10 @@ export class SessionTabManager {
         this.pendingTabCloses.add(sessionId);
         void this.mutateTabVisibility(sessionId, false)
           .then((result) => {
-            const legacyClosed = readLegacyClosedTabs();
+            const legacyClosed = this.readLegacyClosedTabs();
             if (result.kind === 'unsupported') legacyClosed.add(sessionId);
             else legacyClosed.delete(sessionId);
-            writeLegacyClosedTabs(legacyClosed);
+            this.writeLegacyClosedTabs(legacyClosed);
             if (legacyClosed.size === 0) this.usingLegacyTabVisibility = false;
             this.pendingTabCloses.delete(sessionId);
             if (this.opensDuringPendingClose.delete(sessionId)) {
@@ -1199,10 +1243,10 @@ export class SessionTabManager {
    * key deliberately retains the pre-sync browser-local behaviour.
    */
   private async migrateLegacyClosedTabs(): Promise<Set<string>> {
-    const remaining = readLegacyClosedTabs();
+    const remaining = this.readLegacyClosedTabs();
     if (remaining.size === 0) {
       // Also clears malformed/non-array legacy values, whose parsed set is empty.
-      writeLegacyClosedTabs(remaining);
+      this.writeLegacyClosedTabs(remaining);
       return new Set();
     }
 
@@ -1254,7 +1298,7 @@ export class SessionTabManager {
       await Promise.all(ids.slice(index, index + 4).map(migrateOne));
     }
 
-    writeLegacyClosedTabs(remaining);
+    this.writeLegacyClosedTabs(remaining);
     if (attempted) {
       // A startup migration that gets an ordinary 5xx still leaves the server
       // authoritative, as before. Once this page has positively identified an
@@ -1307,7 +1351,7 @@ export class SessionTabManager {
     // refuses — a session that has since been deleted, a name it will not take —
     // the old label goes back, so the strip never keeps a name that was not
     // stored.
-    void fetch(`/api/sessions/${sessionId}/name`, {
+    void this.app.authFetch(`/api/sessions/${sessionId}/name`, {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ name }),
@@ -1366,6 +1410,22 @@ export class SessionTabManager {
     this.getOrderedTabIds().forEach((id) => {
       if (id !== sessionId) this.closeSession(id);
     });
+  }
+
+  /** Drop only local visibility for a server whose auth or catalog entry went away. */
+  retireServer(serverId: string): void {
+    for (const sessionId of Array.from(this.tabs.keys())) {
+      if (parseQualifiedSessionId(sessionId)?.serverId !== serverId) continue;
+      this.closeSession(sessionId, { skipServerRequest: true });
+    }
+    if (parseQualifiedSessionId(this.app.currentClaudeSessionId || '')?.serverId === serverId) {
+      this.app.currentClaudeSessionId = null;
+      this.app.currentClaudeSessionName = null;
+      this.app.terminal?.reset();
+      shellStore.setState({
+        connection: { state: 'disconnected', workingDir: null },
+      });
+    }
   }
 
   createNewSession(): void {
@@ -1432,6 +1492,7 @@ export class SessionTabManager {
     }
     if (requested && this.tabs.has(requested)) return requested;
 
+    if (this.activeTabId && this.tabs.has(this.activeTabId)) return this.activeTabId;
     const remembered = recallActiveTab();
     if (remembered && this.tabs.has(remembered)) return remembered;
     return this.getOrderedTabIds()[0] ?? this.tabs.keys().next().value ?? null;
@@ -1587,8 +1648,12 @@ export class SessionTabManager {
    */
   conversationLabel(sessionId: string): string {
     const record = this.tabs.get(sessionId);
-    if (record?.displayName) return record.displayName;
-    return this.activeSessions.get(sessionId)?.name || 'Conversation';
+    const label = record?.displayName || this.activeSessions.get(sessionId)?.name || 'Conversation';
+    const owner = parseQualifiedSessionId(sessionId)?.serverId;
+    const serverName = owner
+      ? getControllerSnapshot().targets.find((target) => target.id === owner)?.name
+      : undefined;
+    return serverName ? `${label} · ${serverName}` : label;
   }
 
   markSessionError(sessionId: string, hasError = true): void {
@@ -1602,6 +1667,7 @@ export class SessionTabManager {
         `Error in ${session.name || 'Session'}`,
         'A command has failed or the session encountered an error',
         sessionId,
+        'failed',
       );
     } else {
       this.syncShell();

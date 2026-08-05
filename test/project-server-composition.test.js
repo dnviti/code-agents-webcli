@@ -81,6 +81,65 @@ async function makeHarness({ featureEnabled = true, containers = false } = {}) {
 describe('project server composition', function () {
   this.timeout(15_000);
 
+  it('reports and clears live workspace write failures through persistence diagnostics', async function () {
+    const harness = await makeHarness();
+    const { appServer, owner, request } = harness;
+    const workspaceRoot = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'workspace-write-diagnostic-'));
+    let boundStore;
+    let originalSave;
+    try {
+      const validatePath = appServer.validatePath.bind(appServer);
+      appServer.validatePath = (target, userId) => (
+        path.resolve(target) === workspaceRoot
+          ? { valid: true, path: workspaceRoot }
+          : validatePath(target, userId)
+      );
+      await appServer.loadWorkspaceSessions(owner.id, workspaceRoot);
+      const session = appServer.createSessionRecord({
+        id: 'write-diagnostic',
+        ownerUserId: owner.id,
+        workingDir: workspaceRoot,
+        storageRoot: workspaceRoot,
+      });
+      appServer.claudeSessions.set(session.id, session);
+      assert.strictEqual(await appServer.saveSessionsToDisk(), true);
+
+      boundStore = appServer.sessionStore.openWorkspace(session.storageScope);
+      originalSave = boundStore.saveSessions.bind(boundStore);
+      boundStore.saveSessions = async () => false;
+      session.customName = 'cannot persist';
+      assert.strictEqual(await appServer.saveSessionsToDisk(), false);
+
+      let diagnostic = await request('GET', '/api/sessions/persistence');
+      assert.strictEqual(diagnostic.status, 200);
+      assert.strictEqual(diagnostic.body.migrationComplete, false);
+      assert.ok(diagnostic.body.unavailable.some((entry) => (
+        entry.root === workspaceRoot && /workspace save failed|rollback failed/.test(entry.error)
+      )));
+      assert.strictEqual(
+        diagnostic.body.workspaces.find((entry) => entry.root === workspaceRoot).available,
+        false,
+      );
+
+      boundStore.saveSessions = originalSave;
+      assert.strictEqual(await appServer.saveSessionsToDisk(), true);
+      diagnostic = await request('GET', '/api/sessions/persistence');
+      assert.strictEqual(diagnostic.body.migrationComplete, true);
+      assert.strictEqual(
+        diagnostic.body.unavailable.some((entry) => entry.root === workspaceRoot),
+        false,
+      );
+      assert.strictEqual(
+        diagnostic.body.workspaces.find((entry) => entry.root === workspaceRoot).available,
+        true,
+      );
+    } finally {
+      if (boundStore && originalSave) boundStore.saveSessions = originalSave;
+      await harness.close();
+      await fs.promises.rm(workspaceRoot, { recursive: true, force: true });
+    }
+  });
+
   it('keeps containerized environments and deploy-target configuration off by default', async function () {
     const harness = await makeHarness({ featureEnabled: false, containers: true });
     const { appServer, request } = harness;
@@ -206,17 +265,26 @@ describe('project server composition', function () {
         ownerUserId: owner.id,
         name: 'Project one',
       });
+      await fs.promises.mkdir(appServer.projectPaths.worktreePath(project, owner), {
+        recursive: true,
+        mode: 0o700,
+      });
       const root = appServer.createSessionRecord({
         id: 'project-root', ownerUserId: owner.id, workingDir: '/workspace', projectId: project.id,
       });
+      assert.strictEqual(
+        root.storageScope.workspaceRoot,
+        path.resolve(appServer.projectPaths.worktreePath(project, owner)),
+        'a container-only cwd still stores session state at the canonical host project root',
+      );
+      appServer.claudeSessions.set(root.id, root);
       const child = appServer.createSessionRecord({
         id: 'project-child', ownerUserId: owner.id, workingDir: '/workspace', ownerSessionId: root.id,
       });
+      appServer.claudeSessions.set(child.id, child);
       const grandchild = appServer.createSessionRecord({
         id: 'project-grandchild', ownerUserId: owner.id, workingDir: '/workspace', ownerSessionId: child.id,
       });
-      appServer.claudeSessions.set(root.id, root);
-      appServer.claudeSessions.set(child.id, child);
       appServer.claudeSessions.set(grandchild.id, grandchild);
 
       assert.strictEqual(appServer.hasLiveProjectWork(project.id), false, 'dormant records do not pin a project');
@@ -252,7 +320,11 @@ describe('project server composition', function () {
       const touches = [];
       appServer.projects.touchActivity = (projectId) => { touches.push(projectId); };
       appServer.chatManager.deps.broadcast(root.id, { type: 'assistant_delta' });
-      assert.deepStrictEqual(touches, [project.id], 'autonomous chat output refreshes project activity');
+      assert.deepStrictEqual(
+        touches,
+        [],
+        'conversation output must not persist activity metadata in the global project catalog',
+      );
 
       const author = appServer.projects.deps.authorFor(owner.id);
       assert.deepStrictEqual(author, { name: 'Composition Owner', email: 'owner@example.test' });
@@ -277,13 +349,13 @@ describe('project server composition', function () {
 
   it('does not close SQLite before the final in-flight project lease releases', async function () {
     const dataDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'project-lease-drain-'));
-    const appServer = new ClaudeCodeWebServer({
+    const appServer = createServer({
       dataDir,
       githubClientId: 'composition-client',
       githubClientSecret: 'composition-secret',
       allowedGitHubIds: 'composition-user',
       encryptionKey: ENCRYPTION_KEY,
-    });
+    }, true);
     const events = [];
     try {
       const owner = appServer.database.upsertGitHubUser({
@@ -337,6 +409,7 @@ describe('project server composition', function () {
     const dataDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'project-shutdown-order-'));
     const appServer = new ClaudeCodeWebServer({
       dataDir,
+      baseFolder: dataDir,
       githubClientId: 'composition-client',
       githubClientSecret: 'composition-secret',
       allowedGitHubIds: 'composition-user',
@@ -344,8 +417,11 @@ describe('project server composition', function () {
     });
     const events = [];
     try {
+      const owner = appServer.database.upsertGitHubUser({
+        githubId: 'composition-user', githubLogin: 'composition-owner',
+      });
       const session = appServer.createSessionRecord({
-        id: 'active-runtime', ownerUserId: 1, workingDir: '/workspace',
+        id: 'active-runtime', ownerUserId: owner.id, workingDir: dataDir,
       });
       session.active = true;
       session.agent = 'terminal';
@@ -379,6 +455,35 @@ describe('project server composition', function () {
       assert.ok(position('database') > position('environments'));
     } finally {
       appServer.saveSessionsToDisk = async () => {};
+      await fs.promises.rm(dataDir, { recursive: true, force: true });
+    }
+  });
+
+  it('surfaces a failed final session flush after closing shutdown resources', async function () {
+    const dataDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'project-shutdown-save-failure-'));
+    const appServer = new ClaudeCodeWebServer({
+      dataDir,
+      baseFolder: dataDir,
+      githubClientId: 'composition-client',
+      githubClientSecret: 'composition-secret',
+      allowedGitHubIds: 'composition-user',
+      encryptionKey: ENCRYPTION_KEY,
+    });
+    let databaseClosed = false;
+    try {
+      appServer.saveSessionsToDisk = async () => false;
+      const closeDatabase = appServer.database.close.bind(appServer.database);
+      appServer.database.close = () => {
+        databaseClosed = true;
+        closeDatabase();
+      };
+
+      await assert.rejects(
+        () => appServer.shutdown(),
+        /Workspace session state could not be flushed during shutdown/,
+      );
+      assert.strictEqual(databaseClosed, true, 'shutdown still releases SQLite before reporting the flush failure');
+    } finally {
       await fs.promises.rm(dataDir, { recursive: true, force: true });
     }
   });

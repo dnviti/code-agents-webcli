@@ -7,7 +7,8 @@ Sessions, scrollback, copy/paste, images, and the parts built for a phone.
 A session is a running agent or shell plus everything recorded about it: its
 working directory, its scrollback, its transcript. Sessions are **per user** —
 you only ever see your own — and they survive a reload, a new tab, or a
-different device.
+different device. The record, transcript and indexed history live under the
+session's immutable workspace scope in `.cc-web/`, not under `--data-dir`.
 
 What they do not survive is the server restarting: the record, the history and
 the transcript all persist, but the live process is gone. A restarted session
@@ -37,7 +38,8 @@ whether the session is a minute or a week old.
 - The server runs a **headless copy of the same terminal emulator** the browser
   runs, and freezes each line as it scrolls off. Those lines go to an
   append-only log with a fixed-width index, so fetching "lines 812,340 to
-  812,390" is two positioned reads.
+  812,390" is two positioned reads. The files are `history.log` and
+  `history.idx` in `.cc-web/sessions/<owner-key>/<session-id>/`.
 - **Scroll to the top** of the live buffer — or keep scrolling up once you are
   there — to enter the history viewer. Scroll to the bottom, press `Escape`, or
   use **Back to live** to come back.
@@ -95,6 +97,9 @@ you can say what you want done with it before pressing Enter.
 - A `.gitignore` is written inside `.cc-web/`, so the images never show up in
   `git status`. Your own `.gitignore` is never touched, and if you edit the
   generated one your version is kept.
+- The cleanup manifest belongs to the session and is stored beside its history
+  under `.cc-web/sessions/<owner-key>/<session-id>/paste-manifest.json`; it is
+  no longer written under the server data directory.
 - Images are deleted when the session is deleted.
 - PNG, JPEG, GIF, WebP and BMP are accepted, decided **by content** rather than
   by filename or the type the browser claims. SVG is refused: it has no magic

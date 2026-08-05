@@ -2,7 +2,6 @@ import * as React from 'react';
 import {
   ChatTerminal,
   closeTerminal,
-  rememberTerminals,
   rememberedTerminals,
   terminalsFor,
 } from '../../chat/chat-terminal.js';
@@ -111,31 +110,39 @@ export function TerminalSplit({
   // same panes every time after — re-pointed at *this* mount's re-render, since
   // the one they were built with unmounted when the split last closed.
   React.useEffect(() => {
+    let live = true;
+    let retry: number | null = null;
     for (const pane of panes) pane.attach(force);
     if (panes.length) {
       if (!panes.some((pane) => pane.id === activeId)) setActiveId(panes[0].id);
-      return;
+      return () => { live = false; };
     }
     // Nothing in memory: either this is the first open, or the page reloaded
     // and the ptys are still running on the server.
-    const remembered = rememberedTerminals(chatSessionId);
-    if (remembered.length) {
-      remembered.forEach((sessionId, i) => {
-        open(i === 0 ? `shell — ${basename(workingDir)}` : `shell ${i + 1}`, sessionId);
-      });
-    } else {
-      open(`shell — ${basename(workingDir)}`);
-    }
+    const restore = async (): Promise<void> => {
+      try {
+        const remembered = await rememberedTerminals(chatSessionId);
+        if (!live || panes.length) return;
+        if (remembered.length) {
+          remembered.forEach((sessionId, i) => {
+            open(i === 0 ? `shell — ${basename(workingDir)}` : `shell ${i + 1}`, sessionId);
+          });
+        } else {
+          open(`shell — ${basename(workingDir)}`);
+        }
+      } catch {
+        // A transient controller outage must not create a duplicate PTY. Retry
+        // discovery once the same target is reachable again.
+        if (live) retry = window.setTimeout(() => { void restore(); }, 1000);
+      }
+    };
+    void restore();
+    return () => {
+      live = false;
+      if (retry !== null) window.clearTimeout(retry);
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [chatSessionId, workingDir]);
-
-  // Whatever is attached right now, so a reload can find its way back.
-  React.useEffect(() => {
-    rememberTerminals(
-      chatSessionId,
-      panes.map((pane) => pane.sessionId).filter((id): id is string => Boolean(id)),
-    );
-  });
 
   // Mount whichever pane is active into the body. The elements are owned by the
   // ChatTerminal instances and are never re-parented across panes — that is the
@@ -387,6 +394,11 @@ export function TerminalSplit({
           style={{
             flex: 1,
             minHeight: 0,
+            // xterm's render canvases retain their last fitted row height
+            // until its resize observer runs. When the phone key strip takes
+            // space from this pane, an old canvas must not remain a hit target
+            // over the controls below it in that interval.
+            overflow: 'hidden',
             padding: 'var(--terminal-padding)',
             background: 'var(--terminal-bg)',
             cursor: 'text',

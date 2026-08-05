@@ -189,6 +189,8 @@ const LOCATIONS: Record<string, Location[]> = {
     ]),
     { base: 'home', dir: '.gemini/config/skills', kind: 'skills', maxDepth: 0 },
     { base: 'home', dir: '.gemini/config/plugins', kind: 'skills', maxDepth: 2 },
+    { base: 'home', dir: '.gemini/antigravity-cli/builtin/skills', kind: 'skills', maxDepth: 0 },
+    { base: 'home', dir: '.gemini/antigravity-cli/skills', kind: 'skills', maxDepth: 0 },
   ],
 };
 

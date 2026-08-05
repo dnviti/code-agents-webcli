@@ -33,6 +33,7 @@ import { ChatSettingsDialog } from '../../src/client/shell/dialogs/ChatSettingsD
 import { SettingsDialog } from '../../src/client/shell/dialogs/SettingsDialog';
 import { DEFAULT_NOTIFICATIONS } from '../../src/client/ui/settings';
 import { EnvironmentDialog } from '../../src/client/shell/dialogs/EnvironmentDialog';
+import { PhoneAccessDialog } from '../../src/client/shell/dialogs/PhoneAccessDialog';
 import { SessionsDialog } from '../../src/client/shell/dialogs/SessionsDialog';
 import { ConversationsDialog } from '../../src/client/shell/dialogs/ConversationsDialog';
 import { UsageDashboardDialog } from '../../src/client/shell/dialogs/UsageDashboardDialog';
@@ -368,11 +369,74 @@ async function run(): Promise<void> {
   await checkEveryConversationCanBeFoundAndReopened();
   await checkAConversationSaysWhichApprovalModeItIsIn();
   await checkTheEnvironmentSizePickerIsUsable();
+  await checkPhoneAccessRequiresACleanTailscaleResult();
 
   const pre = document.createElement('pre');
   pre.id = 'results';
   pre.textContent = results.join('\n');
   document.body.appendChild(pre);
+}
+
+async function checkPhoneAccessRequiresACleanTailscaleResult(): Promise<void> {
+  const host = document.createElement('div');
+  host.style.cssText = 'width:390px;height:820px;position:relative';
+  document.body.appendChild(host);
+  const root = createRoot(host);
+  let confirmations = 0;
+  let refreshes = 0;
+  const base = {
+    state: 'running' as const,
+    available: true,
+    mode: 'tailscale' as const,
+    port: 32354,
+    interfaces: [],
+    origins: {},
+    devices: [],
+  };
+  function Harness(): React.JSX.Element {
+    const [status, setStatus] = React.useState<any>(base);
+    return React.createElement(PhoneAccessDialog, {
+      open: true,
+      status,
+      onClose: () => {},
+      onRefresh: async () => {
+        refreshes += 1;
+        if (refreshes === 2) setStatus((current: any) => ({
+          ...current,
+          devices: [{ id: 'fresh-phone', label: 'Fresh phone' }],
+        }));
+      },
+      onStart: async () => {},
+      onPair: async () => {},
+      onRevoke: async () => {},
+      onStop: async () => {},
+      onExportCa: async () => {},
+      onCheckTailscale: async () => setStatus((current: any) => ({
+        ...current,
+        tailscale: {
+          installed: true, online: true, serve: true, funnel: false,
+          origin: 'https://desk.tailnet.ts.net',
+        },
+      })),
+      onSetTailscaleOrigin: async () => { confirmations += 1; },
+    });
+  }
+  root.render(React.createElement(Harness));
+  await wait(80);
+  const button = (label: string): HTMLButtonElement | undefined => Array.from(
+    host.querySelectorAll<HTMLButtonElement>('button'),
+  ).find((item) => item.textContent?.includes(label));
+  check('Tailscale confirmation is locked before a clean check', button('Confirm checked')?.disabled === true);
+  await wait(2_100);
+  check('an open phone dialog refreshes paired devices', Boolean(button('Revoke')), `refreshes=${refreshes}`);
+  button('Check setup')?.click();
+  await wait(80);
+  check('a clean exact-port Tailscale result unlocks confirmation', button('Confirm checked')?.disabled === false);
+  button('Confirm checked')?.click();
+  await wait(50);
+  check('the checked Tailscale origin can be confirmed', confirmations === 1, `confirmations=${confirmations}`);
+  root.unmount();
+  host.remove();
 }
 
 /**

@@ -174,4 +174,16 @@ describe('HistoryStore', function () {
       assert.strictEqual(page.lines[batch * 2 + 1], `b${batch}-b`);
     }
   });
+
+  it('uses a workspace-local history file and keeps it readable after restart', async function () {
+    const local = { id: 'local', ownerUserId: 7, storageRoot: dir, ownerKey: 'stable-owner' };
+    await appendAndSettle(store, local, ['kept locally']);
+
+    const base = path.join(dir, '.cc-web', 'sessions', 'stable-owner', 'local', 'history');
+    assert.ok(fs.existsSync(`${base}.log`));
+    assert.ok(!fs.existsSync(path.join(dir, 'history', '7', 'local.log')));
+
+    const reopened = new HistoryStore({ storageDir: path.join(dir, 'old-storage') });
+    assert.deepStrictEqual((await reopened.read(local, 0, 10)).lines, ['kept locally']);
+  });
 });

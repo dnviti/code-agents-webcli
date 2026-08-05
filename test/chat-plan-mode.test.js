@@ -6,6 +6,7 @@ const { PassThrough } = require('stream');
 
 const { ChatSession } = require('../dist/server/chat/session.js');
 const { ChatStore } = require('../dist/server/chat/store.js');
+const safeSessionFiles = require('../dist/server/services/safe-session-file.js');
 const registry = require('../dist/server/chat/registry.js');
 const {
   SUBMIT_PLAN_TOOL,
@@ -756,20 +757,20 @@ describe('Web-chat Plan mode', function () {
         options: ['Durable', 'Ephemeral'],
       }), null);
       const [request] = (await first.snapshot()).pendingQuestions;
-      const originalAppendFile = fs.promises.appendFile;
+      const originalAppendFile = safeSessionFiles.appendSessionFile;
       const indexPath = path.join(root, 'store', '7', `${ref.id}.idx`);
       let injectedIndexFailure = false;
-      fs.promises.appendFile = async function (file, ...args) {
+      safeSessionFiles.appendSessionFile = async function (file, ...args) {
         if (!injectedIndexFailure && String(file) === indexPath) {
           injectedIndexFailure = true;
           throw new Error('injected answer index failure');
         }
-        return originalAppendFile.call(fs.promises, file, ...args);
+        return originalAppendFile(file, ...args);
       };
       try {
         assert.strictEqual(await first.answerQuestion(request.requestId, ['opt-0']), true);
       } finally {
-        fs.promises.appendFile = originalAppendFile;
+        safeSessionFiles.appendSessionFile = originalAppendFile;
       }
       assert.strictEqual(injectedIndexFailure, true);
       await first.stop({ preserveHandoffs: true });
@@ -910,9 +911,9 @@ describe('Web-chat Plan mode', function () {
 
     const base = path.join(root, 'store', '7', ref.id);
     const originalStoreAppend = store.append.bind(store);
-    const originalAppendFile = fs.promises.appendFile;
-    const originalOpen = fs.promises.open;
-    const originalTruncate = fs.promises.truncate;
+    const originalAppendFile = safeSessionFiles.appendSessionFile;
+    const originalOpen = safeSessionFiles.openSessionFileForRead;
+    const originalTruncate = safeSessionFiles.truncateSessionFile;
     const terminalRecords = [];
     let faultStarted = false;
     let releaseIndexFailure;
@@ -924,7 +925,7 @@ describe('Web-chat Plan mode', function () {
       if (terminal) terminalRecords.push(JSON.stringify(terminal));
       return originalStoreAppend(sessionRef, batch);
     };
-    fs.promises.appendFile = async function (file, data, ...args) {
+    safeSessionFiles.appendSessionFile = async function (file, data, ...args) {
       const target = String(file);
       if (target === `${base}.jsonl` && String(data).includes('"t":"question_continuation"')) {
         faultStarted = true;
@@ -934,21 +935,21 @@ describe('Web-chat Plan mode', function () {
           releaseIndexFailure = () => reject(new Error('injected terminal index failure'));
         });
       }
-      return originalAppendFile.call(fs.promises, file, data, ...args);
+      return originalAppendFile(file, data, ...args);
     };
-    fs.promises.open = async function (file, ...args) {
+    safeSessionFiles.openSessionFileForRead = async function (file, ...args) {
       if (faultStarted && String(file) === `${base}.jsonl` && openFailures > 0) {
         openFailures -= 1;
         throw new Error('injected terminal verification failure');
       }
-      return originalOpen.call(fs.promises, file, ...args);
+      return originalOpen(file, ...args);
     };
-    fs.promises.truncate = async function (file, ...args) {
+    safeSessionFiles.truncateSessionFile = async function (file, ...args) {
       if (faultStarted && String(file) === `${base}.jsonl` && truncateFailures > 0) {
         truncateFailures -= 1;
         throw new Error('injected terminal rollback failure');
       }
-      return originalTruncate.call(fs.promises, file, ...args);
+      return originalTruncate(file, ...args);
     };
 
     try {
@@ -986,9 +987,9 @@ describe('Web-chat Plan mode', function () {
       await session.stop();
     } finally {
       store.append = originalStoreAppend;
-      fs.promises.appendFile = originalAppendFile;
-      fs.promises.open = originalOpen;
-      fs.promises.truncate = originalTruncate;
+      safeSessionFiles.appendSessionFile = originalAppendFile;
+      safeSessionFiles.openSessionFileForRead = originalOpen;
+      safeSessionFiles.truncateSessionFile = originalTruncate;
       fs.rmSync(root, { recursive: true, force: true });
     }
   });
@@ -1218,15 +1219,15 @@ describe('Web-chat Plan mode', function () {
     const ref = { id: 'uncleared-plan', ownerUserId: 5 };
     const store = new ChatStore({ storageDir });
     await store.setPlanDocument(ref, { markdown: '# Must remain visible', revision: 1, ts: 1 });
-    const remove = fs.promises.rm;
-    fs.promises.rm = async (target, options) => {
+    const remove = safeSessionFiles.unlinkSessionEntry;
+    safeSessionFiles.unlinkSessionEntry = async (target) => {
       if (String(target).endsWith('.plan')) throw new Error('read-only storage');
-      return remove(target, options);
+      return remove(target);
     };
     try {
       await assert.rejects(store.clearPlanDocument(ref), /read-only storage/);
     } finally {
-      fs.promises.rm = remove;
+      safeSessionFiles.unlinkSessionEntry = remove;
     }
     assert.deepStrictEqual(await store.planDocument(ref), {
       markdown: '# Must remain visible', revision: 1, ts: 1,

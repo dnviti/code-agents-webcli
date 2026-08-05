@@ -119,10 +119,16 @@ describe('projects client integration', function () {
     const app = read('src/client/app.ts');
 
     assert.match(tabs, /workspaceChooser: true/);
-    assert.match(chooser, /fetch\('\/api\/projects'/);
+    assert.match(chooser, /controllerFetch\('\/api\/projects'/);
     assert.match(chooser, /listed\.length === 0[\s\S]*onDirectory\(\)/);
     assert.match(chooser, /Choose directory…/);
-    assert.match(chooser, /onProject\(project\.id\)/);
+    assert.match(chooser, /onProject\(project\.id, draftServerId \|\| undefined\)/);
+    assert.match(chooser, /This choice applies only after you confirm a project or directory/);
+    assert.match(chooser, /disabled: Boolean\(unavailable\)/);
+    const mount = read('src/client/shell/mount.tsx');
+    assert.match(mount, /createProjectSession\(app: App, projectId: string, serverId\?: string\)/);
+    assert.match(mount, /app\.authFetch\('\/api\/sessions\/create',[\s\S]*}, serverId\)/);
+    assert.match(mount, /rememberNewSessionServer\(serverId\)/);
     assert.match(chooser, /Show local projects/);
     assert.match(chooser, /project\.executionKind === 'host'/);
     assert.match(app, /this\.sessionTabManager\.createNewSession\(\)/);

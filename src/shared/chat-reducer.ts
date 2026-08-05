@@ -1374,6 +1374,8 @@ function blockText(block: ChatBlock): string {
       return block.items.map((item) => `- [${item.status}] ${item.text}`).join('\n');
     case 'image':
       return block.alt || '';
+    case 'attachment':
+      return `${block.name} (${block.url})`;
     case 'question':
       return [
         block.request.question,

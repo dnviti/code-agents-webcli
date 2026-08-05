@@ -8,31 +8,49 @@ import type { App } from '../app';
 import type { FolderData } from '../types';
 import { shellStore } from '../shell/store';
 import { showError } from './overlay';
+import {
+  getControllerSnapshot,
+  parseQualifiedSessionId,
+  rememberNewSessionServer,
+} from '../controller/transport';
 
 export class FolderBrowser {
   private app: App;
   private projectContext: { projectId: string; sessionId: string } | null = null;
   private currentProjectPath: string | null = null;
+  /** Captured when the picker opens so a later global target change cannot reroute it. */
+  private targetServerId: string | null = null;
 
   constructor(app: App) {
     this.app = app;
   }
 
-  async show(options: { host?: boolean } = {}): Promise<void> {
+  async show(options: { host?: boolean; serverId?: string } = {}): Promise<void> {
     const shell = shellStore.getSnapshot();
     const active = shell.tabs.find((tab) => tab.id === shell.activeId);
     this.projectContext = !options.host && active?.projectId
       ? { projectId: active.projectId, sessionId: active.id }
       : null;
     this.currentProjectPath = null;
+    const activeOwner = active?.id ? parseQualifiedSessionId(active.id)?.serverId : null;
+    this.targetServerId = options.serverId
+      || activeOwner
+      || (getControllerSnapshot().enabled ? getControllerSnapshot().selectedServerId : null);
+    const startingPath = options.host && options.serverId ? null : this.app.currentFolderPath;
+    if (options.host && options.serverId) {
+      // A path is meaningful only on the server that returned it. Start a new
+      // target at its own home instead of sending the previous server's path.
+      this.app.currentFolderPath = null;
+      this.app.selectedWorkingDir = null;
+    }
     shellStore.patchSlice('folder', {
       open: true,
       creating: false,
-      ...(this.projectContext
+      ...(this.projectContext || (options.host && options.serverId)
         ? { path: null, parentPath: null, entries: [], workingDirKind: 'container', lifetime: null }
         : {}),
     });
-    await this.loadFolders(this.projectContext ? null : this.app.currentFolderPath);
+    await this.loadFolders(this.projectContext ? null : startingPath);
   }
 
   close(): void {
@@ -53,7 +71,7 @@ export class FolderBrowser {
     shellStore.patchSlice('folder', { loading: true });
 
     try {
-      const response = await this.app.authFetch(`/api/folders?${params}`);
+      const response = await this.app.authFetch(`/api/folders?${params}`, {}, this.targetServerId);
       if (!response.ok) {
         const error = await response.json();
         throw new Error(error.message || 'Failed to load folders');
@@ -131,7 +149,7 @@ export class FolderBrowser {
           folderName: name,
           ...(this.projectContext ? { projectId: this.projectContext.projectId } : {}),
         }),
-      });
+      }, this.targetServerId);
 
       if (!response.ok) {
         const error = await response.json();
@@ -175,7 +193,7 @@ export class FolderBrowser {
               }
             : {}),
         }),
-      });
+      }, this.targetServerId);
 
       if (!response.ok) {
         const error = await response.json();
@@ -203,12 +221,14 @@ export class FolderBrowser {
     const defaultName = workingDir.split('/').pop() || `Session ${new Date().toLocaleString()}`;
 
     try {
+      const serverId = this.targetServerId;
       const response = await this.app.authFetch('/api/sessions/create', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           name: defaultName,
           workingDir,
+          ...(serverId ? { serverId } : {}),
           ...(this.projectContext
             ? {
                 projectId: this.projectContext.projectId,
@@ -216,7 +236,7 @@ export class FolderBrowser {
               }
             : {}),
         }),
-      });
+      }, serverId);
 
       if (!response.ok) throw new Error('Failed to create session');
 
@@ -241,6 +261,8 @@ export class FolderBrowser {
       } else {
         await this.app.joinSession(data.sessionId);
       }
+
+      if (serverId) rememberNewSessionServer(serverId);
 
       this.app.loadSessions();
     } catch (error: unknown) {

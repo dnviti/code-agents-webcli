@@ -198,6 +198,13 @@ const EVERY_BLOCK = [
     ],
   },
   { kind: 'image', mime: 'image/png', url: '/files/shot.png', alt: 'A screenshot' },
+  {
+    kind: 'attachment',
+    mime: 'application/pdf',
+    url: '/api/sessions/s1/chat-attachments/0123456789ab-report.pdf',
+    name: 'report.pdf',
+    size: 1536,
+  },
   { kind: 'error', text: 'the runtime exited before finishing' },
 ];
 
@@ -211,7 +218,43 @@ describe('MessageBubble', function () {
     assert.ok(/Heading/.test(html), 'text block missing');
     assert.ok(/Run the tests/.test(html), 'plan panel missing');
     assert.ok(/\/files\/shot\.png/.test(html), 'image missing');
+    assert.ok(/aria-label="Download report\.pdf"/.test(html), 'attachment download missing');
+    assert.ok(/download="report\.pdf"/.test(html), 'attachment filename missing');
     assert.ok(/the runtime exited/.test(html), 'error callout missing');
+  });
+
+  it('never makes a hand-edited transcript URL clickable', function () {
+    const html = renderBubble(message({
+      role: 'user',
+      blocks: [{
+        kind: 'attachment',
+        mime: 'text/plain',
+        url: 'javascript:alert(1)',
+        name: 'notes.txt',
+        size: 12,
+      }],
+    }));
+    assert.ok(html.includes('notes.txt'), 'the durable attachment record remains visible');
+    assert.ok(!html.includes('href='), 'an untrusted transcript URL must not become a link');
+  });
+
+  it('does not let a transcript retarget a canonical URL to another session', function () {
+    const url = '/api/sessions/other/chat-attachments/0123456789ab-notes.txt';
+    const html = renderBubble(message({
+      role: 'user',
+      blocks: [{
+        kind: 'attachment',
+        mime: 'text/plain',
+        url,
+        name: 'notes.txt',
+        size: 12,
+      }],
+    }));
+    assert.ok(html.includes('notes.txt'));
+    assert.ok(
+      !html.includes(`href="${url}"`),
+      'a block may only download through its owning transcript session',
+    );
   });
 
   // The core move of the redesign: the machinery leaves the prose and goes to
@@ -551,6 +594,7 @@ describe('MessageBubble', function () {
     assert.ok(text.includes('Heading'));
     assert.ok(text.includes('hello world'));
     assert.ok(text.includes('[x] Read the file'));
+    assert.ok(text.includes('report.pdf (/api/sessions/s1/chat-attachments/0123456789ab-report.pdf)'));
     // Reasoning is working, not answer, and does not belong on the clipboard.
     assert.ok(!text.includes('first thought'));
   });

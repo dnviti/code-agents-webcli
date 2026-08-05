@@ -4,6 +4,7 @@ import https from 'https';
 import net from 'net';
 import fs from 'node:fs';
 import path from 'node:path';
+import { createHash } from 'node:crypto';
 import WebSocket from 'ws';
 import cors from 'cors';
 
@@ -15,6 +16,7 @@ import {
   AgentKind,
   BridgeInterface,
   PathValidation,
+  SessionStorageScope,
 } from './types.js';
 import { createConfig, createUsageAnalyticsOptions } from './config.js';
 import { registerRoutes } from './routes/index.js';
@@ -52,16 +54,35 @@ import { KimiBridge } from './bridges/kimi.js';
 import { OmpBridge } from './bridges/omp.js';
 import { AntigravityBridge } from './bridges/antigravity.js';
 import { TerminalBridge } from './bridges/terminal.js';
-import { AppDatabase } from './services/database.js';
+import { AppDatabase, resolveAppDataDir } from './services/database.js';
+import {
+  DATA_DIR_LEASE_LOST_EXIT_CODE,
+  DataDirLease,
+} from './services/data-dir-lease.js';
 import { SessionStore } from './services/session-store.js';
-import { UsageStore } from './services/usage-store.js';
+import { canonicalExistingRoot, WorkspaceCatalog } from './services/workspace-catalog.js';
+import { WorkspaceSessionArtifactMigrator } from './services/workspace-session-migrator.js';
+import {
+  closeWorkspaceSessionDirectoryLease,
+  closeWorkspaceSessionDirectoryLeases,
+  closeWorkspaceSessionDirectoryLeasesForScope,
+} from './services/workspace-session-storage.js';
+import { WorkspaceUsageCoordinator } from './services/workspace-usage-coordinator.js';
 import { TranscriptStore } from './services/transcript-store.js';
 import { HistoryStore } from './services/history-store.js';
 import { SessionTeardownRegistry } from './services/session-teardown.js';
 import { PasteStore } from './services/paste-store.js';
 import { AttachmentStore, type AttachmentStoreLike } from './services/attachment-store.js';
 import { ProjectAwareAttachmentStore } from './services/project-attachment-store.js';
+import { isChatAttachmentUploadRequest } from './routes/chat-attachments.js';
 import { readBuildInfo } from './services/build-info.js';
+import {
+  createServerIdentity,
+  normalizeDiscoverableAddress,
+  registerServerIdentityRoute,
+  type ServerIdentity,
+} from './services/server-identity.js';
+import { LanDiscoveryResponder } from './services/lan-discovery.js';
 import { UpdateChecker } from './services/update-check.js';
 import { ensureCertificates, createHttpsOnlyPort, caCertificateHandler } from './services/tls.js';
 import {
@@ -84,11 +105,18 @@ import {
 } from './services/environments/index.js';
 import { ContainerConfig, Mount, UserEnvironment } from './services/environments/types.js';
 import { ActiveTargetResolution, EnvironmentEngine } from './services/environments/index.js';
-import { EncryptionKeyRing } from './services/encryption.js';
+import { EncryptionKeyRing, validateEncryptionKeyMaterial } from './services/encryption.js';
 import { DeployTargetStore } from './services/deploy-targets.js';
-import { ProjectStore } from './services/projects/store.js';
-import { ProjectManager } from './services/projects/manager.js';
-import { ProjectEnvironmentManager } from './services/projects/environment.js';
+import { ProjectStore, type Project } from './services/projects/store.js';
+import {
+  ProjectManager,
+  type ProjectWorkspaceReplacementAuthority,
+} from './services/projects/manager.js';
+import {
+  ProjectEnvironmentManager,
+  ProjectWorkspaceSessionStorageError,
+  type WorkspaceSessionStorageIdentity,
+} from './services/projects/environment.js';
 import { RepositoryInspector } from './services/composition/repository-inspector.js';
 import { DefaultCompositionRuntime } from './services/composition/runtime.js';
 import { StorageUsageManager } from './services/storage-usage-manager.js';
@@ -97,6 +125,57 @@ import { UsageReader } from './services/usage-reader.js';
 import { UsageAnalytics } from './services/usage-analytics.js';
 import { readCachedClaudeAccount } from './services/claude-account.js';
 import { UserPreferenceStore } from './services/user-preferences.js';
+import {
+  AgentMaintenanceService,
+  agentMaintenanceExecutionKey,
+  type AgentMaintenanceTarget,
+  managedVersionRoot,
+} from './services/agent-maintenance.js';
+import {
+  EnvironmentAgentRuntime,
+  JsonFileAgentMaintenanceStore,
+  OfficialAgentReleaseSource,
+  OfficialScriptAgentInstaller,
+  childProcessRunner,
+  officialFetch,
+  type AgentCommandRunner,
+} from './services/agent-maintenance-runtime.js';
+import {
+  AGENT_MAINTENANCE_IDS,
+  agentCatalogEntry,
+  type AgentArchitecture,
+  type AgentMaintenanceId,
+  type AgentPlatform,
+} from '../shared/agent-maintenance.js';
+
+/** Probe exactly the launch executable without inheriting server/provider secrets. */
+export async function probeLaunchedAgentVersion(
+  environment: UserEnvironment,
+  agentKind: AgentKind,
+  selectedCommand?: string,
+  runner: AgentCommandRunner = childProcessRunner,
+): Promise<string | null> {
+  if (agentKind === 'terminal') return null;
+  const entry = agentCatalogEntry(agentKind);
+  if (!entry) return null;
+  const command = selectedCommand || entry.binary;
+  try {
+    const wrapped = environment.wrap(command, [...entry.versionArgs], {
+      inheritHostEnv: false,
+    });
+    const result = await runner.run(wrapped.command, wrapped.args, {
+      env: wrapped.env,
+      timeoutMs: 2_000,
+      inheritEnv: false,
+    });
+    const match = `${result.stdout}\n${result.stderr}`
+      .replace(/\x1b\[[0-?]*[ -/]*[@-~]/gu, '')
+      .match(/v?([0-9]+(?:\.[0-9A-Za-z.+-]+)+)/u);
+    return match?.[1] ?? null;
+  } catch {
+    return null;
+  }
+}
 
 /**
  * Fold what a chat session learned about itself into the record that outlives it.
@@ -175,6 +254,8 @@ export class ClaudeCodeWebServer {
   private folderMode: boolean;
   private baseFolder: string;
   private publicBaseUrl: string | null;
+  private readonly serverIdentity: ServerIdentity;
+  private readonly lanDiscovery: LanDiscoveryResponder;
   private sessionDurationHours: number;
   private aliases: Aliases;
 
@@ -185,8 +266,6 @@ export class ClaudeCodeWebServer {
   private claudeSessions: Map<string, SessionRecord>;
   private webSocketConnections: Map<string, WebSocketInfo>;
   private tabCoordinator: AccountTabCoordinator;
-  /** Throttle autonomous chat-event writes to the project activity clock. */
-  private projectActivityTouched: Map<string, number>;
 
   private claudeBridge: BridgeInterface;
   private codexBridge: BridgeInterface;
@@ -200,8 +279,22 @@ export class ClaudeCodeWebServer {
   private terminalBridge: TerminalBridge;
 
   private database: AppDatabase;
-  private usageStore: UsageStore;
+  /** Held before AppDatabase opens and until every data-directory writer closes. */
+  private dataDirLease: DataDirLease | null;
+  private dataDirWritersClosed: boolean;
+  private startAttempted: boolean;
+  private startInProgress: boolean;
+  private shutdownRequested: boolean;
+  private shutdownExecution: Promise<void> | null;
+  private shutdownWaiter: {
+    promise: Promise<void>;
+    resolve: () => void;
+    reject: (error: unknown) => void;
+  } | null;
+  private usageStore: WorkspaceUsageCoordinator;
   private sessionStore: SessionStore;
+  private workspaceCatalog: WorkspaceCatalog;
+  private workspaceArtifactMigrator: WorkspaceSessionArtifactMigrator;
   private transcriptStore: TranscriptStore;
   private chatStore: ChatStore;
   private chatManager: ChatSessionManager;
@@ -219,6 +312,11 @@ export class ClaudeCodeWebServer {
   private selfUpdate: SelfUpdateRunner;
   private updateMode: UpdateModeResult | null;
   private interruptedUpdate: InterruptedUpdate | null;
+  private agentMaintenance: AgentMaintenanceService;
+  private agentMaintenanceRuntime: EnvironmentAgentRuntime;
+  /** Exact environments captured by target resolution; operations outlive requests. */
+  private agentMaintenanceEnvironments: Map<string, UserEnvironment>;
+  private agentMaintenanceArchitectures: Map<string, AgentArchitecture>;
 
   private app: express.Express;
   private server: http.Server | https.Server | null;
@@ -242,6 +340,16 @@ export class ClaudeCodeWebServer {
   private deployTargets: DeployTargetStore;
   private projectStore: ProjectStore;
   private projects: ProjectManager;
+  private projectPaths: ProjectEnvironmentManager;
+  private loadedWorkspaceScopes: Set<string>;
+  /** One targeted legacy retry per owner/workspace; concurrent opens share it. */
+  private legacyWorkspaceMigrationRetries: Map<string, Promise<void>>;
+  private workspacePersistenceErrors: Map<string, string>;
+  private suspendedProjectScopes: Map<string, SessionStorageScope>;
+  /** Project archives whose crash-staging slot could not be restored safely. */
+  private unrestoredProjectScopes: Set<string>;
+  /** Cold-start intents awaiting a database open bound to their exact inode. */
+  private pendingProjectRecoveryAuthorities: Map<string, WorkspaceSessionStorageIdentity>;
   private storageUsage: StorageUsageManager;
   private connectedHostValidator: ConnectedHostValidator;
   /** The startup-flag configuration: the 'legacy' entry in the target maps. */
@@ -269,12 +377,33 @@ export class ClaudeCodeWebServer {
 
   constructor(options: ServerOptions = {}) {
     const config = createConfig(options);
+    if (config.desktop && config.host !== '127.0.0.1') {
+      throw new Error('Desktop mode must bind exactly to 127.0.0.1.');
+    }
+    if (config.certFile && !config.keyFile) {
+      throw new Error('--cert was given without --key; a certificate needs both.');
+    }
+    if (config.keyFile && !config.certFile) {
+      throw new Error('--key was given without --cert; a certificate needs both.');
+    }
+    if (config.encryptionKey) validateEncryptionKeyMaterial(config.encryptionKey);
+    // AppDatabase performs schema migrations in its constructor. The
+    // installation-wide lease must therefore precede even that constructor,
+    // not merely the later workspace-session restoration in start().
+    this.dataDirLease = DataDirLease.acquireSync(resolveAppDataDir(config.dataDir), {
+      onLost: (error) => this.failStopDataDirLease(error),
+    });
+    this.dataDirWritersClosed = false;
+    this.startAttempted = false;
+    this.startInProgress = false;
+    this.shutdownRequested = false;
+    this.shutdownExecution = null;
+    this.shutdownWaiter = null;
+    let dataDirWriterConstructionStarted = false;
+    try {
     this.port = config.port;
     this.host = config.host;
     this.desktop = config.desktop;
-    if (this.desktop && this.host !== '127.0.0.1') {
-      throw new Error('Desktop mode must bind exactly to 127.0.0.1.');
-    }
     this.dev = config.dev;
     this.useHttps = config.useHttps;
     this.certFile = config.certFile;
@@ -283,6 +412,21 @@ export class ClaudeCodeWebServer {
     this.folderMode = config.folderMode;
     this.baseFolder = config.baseFolder;
     this.publicBaseUrl = config.publicBaseUrl;
+    this.serverIdentity = createServerIdentity({
+      serverName: config.serverName,
+      // `publicDiscoverableUrl` is the deliberately explicit contract. The
+      // OAuth base URL remains a compatibility fallback for existing hosted
+      // installations, and localhost is safe but never advertised over LAN.
+      address: config.publicDiscoverableUrl
+        || normalizeDiscoverableAddress(config.publicBaseUrl)
+        || `https://localhost:${config.port}`,
+      version: readBuildInfo().version,
+    });
+    this.lanDiscovery = new LanDiscoveryResponder({
+      enabled: !config.desktop && config.lanDiscoverable && config.publicDiscoverableUrl !== null,
+      identity: this.serverIdentity,
+      onError: (error) => console.warn(`LAN discovery responder error: ${error.message}`),
+    });
     this.sessionDurationHours = config.sessionDurationHours;
     this.aliases = config.aliases;
     this.startTime = config.startTime;
@@ -299,7 +443,12 @@ export class ClaudeCodeWebServer {
     this.claudeSessions = new Map();
     this.webSocketConnections = new Map();
     this.tabCoordinator = new AccountTabCoordinator();
-    this.projectActivityTouched = new Map();
+    this.loadedWorkspaceScopes = new Set();
+    this.legacyWorkspaceMigrationRetries = new Map();
+    this.workspacePersistenceErrors = new Map();
+    this.suspendedProjectScopes = new Map();
+    this.unrestoredProjectScopes = new Set();
+    this.pendingProjectRecoveryAuthorities = new Map();
 
     this.claudeBridge = new ClaudeBridge();
     this.codexBridge = new CodexBridge();
@@ -313,8 +462,20 @@ export class ClaudeCodeWebServer {
     this.terminalBridge = new TerminalBridge();
 
     this.dataDir = config.dataDir;
-    this.database = new AppDatabase({ dataDir: config.dataDir });
-    this.usageStore = new UsageStore(this.database);
+    dataDirWriterConstructionStarted = true;
+    // Legacy session/usage tables are a one-time import source. Historical
+    // schema migrations remain available, but derived metadata is normalised
+    // only in the workspace copy so a blocked migration leaves app.sqlite
+    // byte-for-byte authoritative rather than rewriting it on every boot.
+    this.database = new AppDatabase({
+      dataDir: config.dataDir,
+      legacySessionBackfills: false,
+    });
+    this.workspaceCatalog = new WorkspaceCatalog(this.database);
+    this.workspaceArtifactMigrator = new WorkspaceSessionArtifactMigrator({
+      legacyStorageDir: this.database.storageDir,
+    });
+    this.usageStore = new WorkspaceUsageCoordinator();
 
     // Per-user environments. Off unless an administrator asked for them, in
     // which case every process this server starts on a user's behalf goes into
@@ -408,7 +569,43 @@ export class ClaudeCodeWebServer {
       configs: this.deployTargetMaps.configs,
       activeKey: this.deployTargetMaps.activeKey,
     });
-    this.sessionStore = new SessionStore({ database: this.database });
+    this.agentMaintenanceEnvironments = new Map();
+    this.agentMaintenanceArchitectures = new Map();
+    this.agentMaintenanceRuntime = new EnvironmentAgentRuntime({
+      dataDir: this.database.storageDir,
+      environmentFor: async (target) => {
+        const environment = this.agentMaintenanceEnvironments.get(target.key);
+        if (!environment) throw new Error('The selected execution environment is no longer available.');
+        return environment;
+      },
+    });
+    const maintenanceInstaller = new OfficialScriptAgentInstaller({
+      runtime: this.agentMaintenanceRuntime,
+      fetcher: officialFetch,
+    });
+    this.agentMaintenance = new AgentMaintenanceService({
+      store: new JsonFileAgentMaintenanceStore(
+        path.join(this.database.storageDir, 'agent-maintenance'),
+      ),
+      probe: this.agentMaintenanceRuntime,
+      releases: new OfficialAgentReleaseSource(officialFetch),
+      installer: maintenanceInstaller,
+      rootFor: (target, agent, version) => {
+        const environment = this.agentMaintenanceEnvironments.get(target.key);
+        const base = target.scope === 'private' && environment
+          ? path.join(environment.homeDir, '.code-agents')
+          : this.database.storageDir;
+        return managedVersionRoot(base, target, agent, version);
+      },
+    });
+    this.sessionStore = new SessionStore({
+      database: this.database,
+      workspaceCoordinator: true,
+      archiveTrust: {
+        seal: (value) => this.encryptionKeyRing.encrypt(value),
+        open: (envelope) => this.encryptionKeyRing.decrypt(envelope),
+      },
+    });
     this.transcriptStore = new TranscriptStore({ storageDir: this.database.storageDir });
     this.historyStore = new HistoryStore({ storageDir: this.database.storageDir });
     this.pasteStore = new PasteStore({ storageDir: this.database.storageDir });
@@ -425,24 +622,26 @@ export class ClaudeCodeWebServer {
       // The seam between a conversation and the ledger it is billed to. The
       // chat subsystem knows what a job cost; it does not know SQLite, and the
       // login it files the work under is not something it can look up.
-      usage: {
-        record: (job) => this.usageStore.record(job),
-        consumedFor: (nativeSessionId) => this.usageStore.consumedFor(nativeSessionId),
-        costBaselineFor: (nativeSessionId) => this.usageStore.costBaselineFor(nativeSessionId),
-        loginFor: (userId) => this.database.getUserById(userId)?.githubLogin ?? String(userId),
-        spendByTurn: (sessionId, userId) => this.usageStore.spendByTurn(sessionId, userId),
+      usageFor: (record) => {
+        const scope = record.storageScope;
+        if (!scope) throw new Error('Chat usage requires workspace-local session storage');
+        return {
+          record: (job) => { this.usageStore.record(scope, job); },
+          consumedFor: (nativeSessionId) => this.usageStore.consumedFor(scope, nativeSessionId),
+          costBaselineFor: (nativeSessionId) =>
+            this.usageStore.costBaselineFor(scope, nativeSessionId),
+          loginFor: (userId) => this.database.getUserById(userId)?.githubLogin ?? String(userId),
+          spendByTurn: (sessionId, userId) =>
+            this.usageStore.spendByTurn(scope, sessionId, userId),
+        };
       },
       storageDir: this.database.storageDir,
-      broadcast: (sessionId, message) => {
-        const projectId = this.claudeSessions.get(sessionId)?.projectId;
-        if (projectId) this.touchProjectActivity(projectId);
-        broadcastChat(
-          sessionId,
-          message,
-          this.claudeSessions,
-          this.webSocketConnections,
-        );
-      },
+      broadcast: (sessionId, message) => broadcastChat(
+        sessionId,
+        message,
+        this.claudeSessions,
+        this.webSocketConnections,
+      ),
       // Whose preference decides the mode of a conversation restarted from
       // inside itself. The chat subsystem has no idea who owns anything.
       chatBypassPreference: (userId) =>
@@ -471,7 +670,7 @@ export class ClaudeCodeWebServer {
           applyChatLifecycle(
             record,
             change,
-            (id, active) => this.sessionStore.setActive(id, active),
+            (id, active) => this.sessionStore.setActive(id, active, record.storageScope),
           );
         }
         // Apply the record transition first: exited=false is an in-place chat
@@ -509,6 +708,24 @@ export class ClaudeCodeWebServer {
     // feature that needs teardown does not collide on the same line.
     this.sessionTeardown.register('pasted-images', (session) =>
       this.pasteStore.deletePastes(session));
+    this.sessionTeardown.register('chat-log', (session) =>
+      this.chatStore.deleteChat(session));
+    this.sessionTeardown.register('chat-attachments', (session, context) =>
+      this.attachmentStore.deleteSessionAttachments({
+        id: session.id,
+        ownerUserId: session.ownerUserId,
+        workingDir: session.workingDir,
+        projectId: session.projectId,
+        projectWorkingDirKind: session.projectWorkingDirKind,
+        storageScope: session.storageScope,
+      }, {
+        projectLifecycleExclusive: context?.projectLifecycleExclusive,
+      }));
+    // Registered last and executed in order: artifact stores finish their
+    // final descriptor-relative deletes before the cached directory inode is
+    // released.
+    this.sessionTeardown.register('workspace-directory-lease', (session) =>
+      closeWorkspaceSessionDirectoryLease(session));
     this.authService = new AuthService({
       database: this.database,
       dev: this.dev,
@@ -628,6 +845,23 @@ export class ClaudeCodeWebServer {
       suspendProjectSessions: async (projectId: string) => {
         await suspendProjectSessions(this.sessionRouteDeps(), projectId);
       },
+      beforeWorkspaceReplacement: (project) =>
+        this.beforeProjectWorkspaceReplacement(project),
+      afterWorkspaceRestored: (project, expected) =>
+        this.afterProjectWorkspaceRestored(project, expected),
+      confirmWorkspaceRestored: (project, expected) =>
+        this.confirmProjectWorkspaceRestored(project, expected),
+      rejectWorkspaceRestore: (project, reason) =>
+        this.rejectProjectWorkspaceRestore(project, reason),
+      beforeWorkspaceDeletion: (project) =>
+        this.beforeProjectWorkspaceDeletion(project),
+      hasLegacyProjectSessions: (projectId, ownerUserId) => Boolean(
+        this.database.raw.prepare(
+          'SELECT 1 AS present FROM runtime_sessions WHERE project_id = ? AND owner_user_id = ? LIMIT 1',
+        ).get(projectId, ownerUserId),
+      ),
+      hasIncompleteProjectSessionMigration: (project) =>
+        this.projectHasIncompleteBinaryMigration(project),
       // Durable active flags and atomic admission leases live in ProjectStore.
       // This closes the remaining process-local observation gaps.
       hasLiveProjectWork: (projectId: string) => this.hasLiveProjectWork(projectId),
@@ -641,7 +875,7 @@ export class ClaudeCodeWebServer {
       this.projects,
       () => this.saveSessionsToDisk(),
     );
-    const projectPaths = new ProjectEnvironmentManager(this.environments);
+    this.projectPaths = new ProjectEnvironmentManager(this.environments);
     this.storageUsage = new StorageUsageManager({
       database: this.database,
       store: this.projectStore,
@@ -679,8 +913,8 @@ export class ClaudeCodeWebServer {
           return [...homes];
         },
         projectPaths: (project, user) => ({
-          workspacePath: projectPaths.worktreePath(project, user),
-          overlayPath: projectPaths.overlayPath(project),
+          workspacePath: this.projectPaths.worktreePath(project, user),
+          overlayPath: this.projectPaths.overlayPath(project),
         }),
       },
     });
@@ -700,8 +934,15 @@ export class ClaudeCodeWebServer {
       sessionStore: this.sessionStore,
       getSelectedWorkingDir: (userId: number) => this.getSelectedWorkingDir(userId),
       createSessionRecord: (params) => this.createSessionRecord(params),
+      loadWorkspaceSessions: (userId, storageRoot) =>
+        this.loadWorkspaceSessions(userId, storageRoot),
       tabCoordinator: this.tabCoordinator,
       getRuntimeBridge: (agentKind: AgentKind) => this.getRuntimeBridge(agentKind),
+      resolveAgentLaunch: (session, environment, agentKind) =>
+        this.resolveManagedAgentLaunch(session, environment, agentKind),
+      resolveAgentEnvironment: (session) => this.agentMaintenanceEnvironmentForSession(session),
+      probeAgentLaunchVersion: (environment, agentKind, command) =>
+        this.probeAgentLaunchVersion(environment, agentKind, command),
       saveSessionsToDisk: () => this.saveSessionsToDisk(),
       resolveRuntimeProfile: (agentKind: AgentKind, workingDir: string) =>
         this.resolveRuntimeProfile(agentKind, workingDir),
@@ -729,6 +970,7 @@ export class ClaudeCodeWebServer {
                 workingDir: session.workingDir,
                 projectId: session.projectId,
                 projectWorkingDirKind: session.projectWorkingDirKind,
+                storageScope: session.storageScope,
               },
           attachment,
         ),
@@ -748,8 +990,40 @@ export class ClaudeCodeWebServer {
 
     this.app = express();
     this.setupExpress();
-    this.setupAutoSave();
     this.setupEnvironmentSweep();
+    } catch (error) {
+      // Before the first possible writer, cleanup is provably safe. Once
+      // AppDatabase construction began, a partially-created native handle may
+      // be unreachable; retain the lease and let only dead-process + stale
+      // heartbeat recovery admit a replacement.
+      if (!dataDirWriterConstructionStarted) {
+        const lease = this.dataDirLease;
+        this.dataDirLease = null;
+        lease?.releaseSync();
+      }
+      throw error;
+    }
+  }
+
+  /**
+   * Continuing after the lease inode/token changes would create two writers.
+   * Do not run normal shutdown: its final persistence write is precisely what
+   * is no longer authorised. Stop admission synchronously and terminate this
+   * process so the OS closes every native SQLite/runtime handle.
+   */
+  private failStopDataDirLease(error: Error): never {
+    console.error(`Fatal: lost the installation data-directory lease: ${error.message}`);
+    this.isShuttingDown = true;
+    try { this.projects?.stopSweep(); } catch { /* fail-stop continues */ }
+    if (this.autoSaveInterval) clearInterval(this.autoSaveInterval);
+    if (this.environmentSweep) clearInterval(this.environmentSweep);
+    if (this.environmentScale) clearInterval(this.environmentScale);
+    try { this.listener?.close(); } catch { /* fail-stop continues */ }
+    try { this.server?.closeAllConnections?.(); } catch { /* fail-stop continues */ }
+    for (const socket of this.listenerSockets || []) {
+      try { socket.destroy(); } catch { /* fail-stop continues */ }
+    }
+    process.exit(DATA_DIR_LEASE_LOST_EXIT_CODE);
   }
 
   /**
@@ -832,15 +1106,6 @@ export class ClaudeCodeWebServer {
       }
     }
     return false;
-  }
-
-  /** Keep a long autonomous chat turn active without writing SQLite per token. */
-  private touchProjectActivity(projectId: string): void {
-    const now = Date.now();
-    const last = this.projectActivityTouched.get(projectId) ?? 0;
-    if (now - last < 1000) return;
-    this.projectActivityTouched.set(projectId, now);
-    this.projects?.touchActivity(projectId, new Date(now));
   }
 
   /**
@@ -954,6 +1219,163 @@ export class ClaudeCodeWebServer {
     }
   }
 
+  private agentMaintenanceKey(session: SessionRecord, environment: UserEnvironment): string {
+    if (session.projectId) return `project:${session.ownerUserId}:${session.projectId}`;
+    return agentMaintenanceExecutionKey(session.ownerUserId, environment);
+  }
+
+  private agentMaintenancePlatform(environment: UserEnvironment): AgentPlatform {
+    if (environment.kind === 'container') return 'linux';
+    if (process.platform === 'darwin' || process.platform === 'linux' || process.platform === 'win32') {
+      return process.platform;
+    }
+    return 'unsupported';
+  }
+
+  private async agentMaintenanceArchitecture(
+    key: string,
+    environment: UserEnvironment,
+  ): Promise<AgentArchitecture> {
+    const cached = this.agentMaintenanceArchitectures.get(key);
+    if (cached) return cached;
+    let raw: string = process.arch;
+    if (environment.kind === 'container') {
+      try {
+        const wrapped = environment.wrap('uname', ['-m']);
+        const result = await childProcessRunner.run(wrapped.command, wrapped.args, {
+          env: wrapped.env,
+          timeoutMs: 2_000,
+        });
+        raw = result.stdout.trim();
+      } catch {
+        raw = '';
+      }
+    }
+    const architecture: AgentArchitecture = /^(?:arm64|aarch64)$/iu.test(raw)
+      ? 'arm64'
+      : /^(?:x64|x86_64|amd64)$/iu.test(raw) ? 'x64' : 'unsupported';
+    this.agentMaintenanceArchitectures.set(key, architecture);
+    return architecture;
+  }
+
+  private async agentMaintenanceTarget(
+    session: SessionRecord,
+    environment?: UserEnvironment,
+  ): Promise<AgentMaintenanceTarget> {
+    const resolvedEnvironment = environment || await this.agentMaintenanceEnvironmentForSession(session);
+    const key = this.agentMaintenanceKey(session, resolvedEnvironment);
+    const runningAgentId = session.agent
+      && (AGENT_MAINTENANCE_IDS as readonly string[]).includes(session.agent)
+      ? session.agent as AgentMaintenanceId
+      : null;
+    if (!session.projectId) this.agentMaintenanceEnvironments.set(key, resolvedEnvironment);
+    const resolved: AgentMaintenanceTarget = {
+      key,
+      platform: this.agentMaintenancePlatform(resolvedEnvironment),
+      architecture: await this.agentMaintenanceArchitecture(key, resolvedEnvironment),
+      scope: resolvedEnvironment.kind === 'container' ? 'private' : 'shared',
+      ownerUserId: resolvedEnvironment.kind === 'container' ? session.ownerUserId : null,
+      projectManaged: Boolean(session.projectId),
+      ...(runningAgentId
+        ? {
+            runningAgentId,
+            ...(session.runningAgentVersion !== undefined
+              ? { runningVersion: session.runningAgentVersion }
+              : {}),
+          }
+        : {}),
+    };
+    // A process started before version capture existed cannot be identified by
+    // probing the command now: the active pointer or PATH may have changed in
+    // the meantime. Unknown is the only truthful answer until that process is
+    // restarted and its launch path is verified.
+    if (
+      !session.projectId
+      && session.active
+      && runningAgentId
+      && session.runningAgentVersion === undefined
+    ) {
+      session.runningAgentVersion = null;
+      session.runningManagedAgentVersion = null;
+      resolved.runningAgentId = runningAgentId;
+      resolved.runningVersion = null;
+    }
+    return resolved;
+  }
+
+  private async agentMaintenanceEnvironmentForSession(
+    session: SessionRecord,
+  ): Promise<UserEnvironment> {
+    if (session.active) {
+      if (session.runtimeEnvironmentKey) {
+        const captured = this.agentMaintenanceEnvironments.get(session.runtimeEnvironmentKey);
+        if (!captured) {
+          throw new Error('The original execution environment is no longer available.');
+        }
+        return captured;
+      }
+      const current = await this.ensureEnvironment(session.ownerUserId);
+      if (current.kind === 'container') {
+        throw new Error('The running process has no captured immutable environment identity.');
+      }
+      return current;
+    }
+    return this.ensureEnvironment(session.ownerUserId);
+  }
+
+  private async probeAgentLaunchVersion(
+    environment: UserEnvironment,
+    agentKind: AgentKind,
+    selectedCommand?: string,
+  ): Promise<string | null> {
+    const bridge = this.getRuntimeBridge(agentKind) as BridgeInterface & {
+      command?: string;
+      defaultCommand?: string;
+    };
+    const actualCommand = selectedCommand || (environment.kind === 'container'
+      ? bridge?.defaultCommand
+      : bridge?.command);
+    return probeLaunchedAgentVersion(environment, agentKind, actualCommand);
+  }
+
+  private async resolveAgentMaintenanceTarget(input: {
+    userId: number;
+    targetId: string;
+  }): Promise<AgentMaintenanceTarget | null> {
+    const session = this.claudeSessions.get(input.targetId);
+    if (!session || session.ownerUserId !== input.userId) return null;
+    // Project composition is the authority. Status needs no environment and
+    // must not start a dormant project merely because its picker was opened.
+    if (session.projectId) {
+      const environment = this.environments.host();
+      return this.agentMaintenanceTarget(session, environment);
+    }
+    return this.agentMaintenanceTarget(session);
+  }
+
+  private resolveManagedAgentLaunch(
+    session: SessionRecord,
+    environment: UserEnvironment,
+    agentKind: AgentKind,
+  ): { command: string; version: string } | null {
+    if (session.projectId || agentKind === 'terminal') return null;
+    const entry = agentCatalogEntry(agentKind);
+    if (!entry) return null;
+    const key = this.agentMaintenanceKey(session, environment);
+    this.agentMaintenanceEnvironments.set(key, environment);
+    session.runtimeEnvironmentKey = key;
+    const target: AgentMaintenanceTarget = {
+      key,
+      platform: this.agentMaintenancePlatform(environment),
+      architecture: this.agentMaintenanceArchitectures.get(key)
+        || (process.arch === 'arm64' ? 'arm64' : process.arch === 'x64' ? 'x64' : 'unsupported'),
+      scope: environment.kind === 'container' ? 'private' : 'shared',
+      ownerUserId: environment.kind === 'container' ? session.ownerUserId : null,
+    };
+    const selected = this.agentMaintenanceRuntime.resolveManagedCommand(target, entry, environment);
+    return selected?.version ? { command: selected.command, version: selected.version } : null;
+  }
+
   private isPathWithinBase(targetPath: string, userId?: number): boolean {
     try {
       const resolvedTarget = path.resolve(targetPath);
@@ -992,9 +1414,28 @@ export class ClaudeCodeWebServer {
     ownerSessionId?: string;
     projectId?: string | null;
     projectWorkingDirKind?: 'host' | 'container';
+    /** Trusted canonical workspace root; never accepted from the browser. */
+    storageRoot?: string;
   }): SessionRecord {
+    const parent = params.ownerSessionId
+      ? this.claudeSessions.get(params.ownerSessionId)
+      : undefined;
+    if (params.ownerSessionId && (!parent || parent.ownerUserId !== params.ownerUserId)) {
+      throw new Error('Owner conversation is unavailable for workspace storage');
+    }
+    const project = !parent && params.projectId
+      ? this.projectStore.getProjectForUser(params.projectId, params.ownerUserId)
+      : null;
+    if (!parent && params.projectId && !project) {
+      throw new Error('Project workspace is unavailable for session storage');
+    }
+    const storageScope = parent?.storageScope
+      || (project
+        ? this.projectSessionStorageScope(project)
+        : this.sessionStorageScope(params.ownerUserId, params.storageRoot || params.workingDir));
     return {
       id: params.id,
+      storageScope,
       ownerSessionId: params.ownerSessionId,
       projectId: params.projectId,
       projectWorkingDirKind: params.projectWorkingDirKind,
@@ -1028,6 +1469,684 @@ export class ClaudeCodeWebServer {
         models: {},
       },
       maxBufferSize: 1000,
+    };
+  }
+
+  /** Resolve once; later cwd changes cannot move a session to another archive. */
+  private sessionStorageScope(ownerUserId: number, root: string): SessionStorageScope {
+    const ownerKey = this.sessionOwnerKey(ownerUserId);
+    return {
+      workspaceRoot: this.workspaceCatalog.register(
+        ownerKey,
+        this.authorizeWorkspaceRoot(ownerUserId, root),
+      ),
+      ownerKey,
+    };
+  }
+
+  /** A catalog entry locates a candidate; current policy still authorises it. */
+  private authorizeWorkspaceRoot(ownerUserId: number, root: string): string {
+    const canonical = canonicalExistingRoot(root);
+    const owner = this.getEnvironmentOwner(ownerUserId);
+    if (owner) {
+      for (const project of this.projectStore.listProjectsForUser(ownerUserId)) {
+        const projectRoot = path.resolve(this.projectPaths.worktreePath(project, owner));
+        if (canonical === projectRoot) return canonical;
+      }
+    }
+    const validation = this.validatePath(canonical, ownerUserId);
+    if (validation.valid && validation.path && path.resolve(validation.path) === canonical) {
+      return canonical;
+    }
+    throw new Error('Workspace root is no longer authorised for this account');
+  }
+
+  private sessionOwnerKey(ownerUserId: number): string {
+    const owner = this.database.getUserById(ownerUserId);
+    if (!owner) throw new Error(`session owner ${ownerUserId} is unavailable`);
+    return createHash('sha256')
+      .update(`cc-web-session-owner:v1:${owner.githubId}`)
+      .digest('hex');
+  }
+
+  /** Rebuild runtime/path authority from the global project catalogue, never from a checkout DB. */
+  private revalidateRestoredSession(
+    session: SessionRecord,
+    scope: SessionStorageScope,
+    ownerUserId: number,
+  ): void {
+    if (session.projectId) {
+      const project = this.projectStore.getProjectForUser(session.projectId, ownerUserId);
+      const owner = this.getEnvironmentOwner(ownerUserId);
+      if (!project || !owner) throw new Error(`Session ${session.id} names an unavailable project`);
+      const projectRoot = path.resolve(this.projectPaths.worktreePath(project, owner));
+      if (projectRoot !== scope.workspaceRoot) {
+        throw new Error(`Session ${session.id} project does not own this workspace archive`);
+      }
+      if (project.executionKind === 'host') {
+        session.projectWorkingDirKind = 'host';
+        const candidate = path.resolve(session.workingDir || projectRoot);
+        const relative = path.relative(projectRoot, candidate);
+        if (relative.startsWith('..') || path.isAbsolute(relative)) {
+          session.workingDir = this.projectPaths.checkoutPath(project, owner);
+        } else {
+          session.workingDir = candidate;
+        }
+      } else {
+        session.projectWorkingDirKind = 'container';
+        if (
+          typeof session.workingDir !== 'string'
+          || !session.workingDir
+          || session.workingDir.includes('\0')
+          || !path.posix.isAbsolute(session.workingDir)
+        ) {
+          session.workingDir = this.projectPaths.checkoutContainerPath(project);
+        } else {
+          session.workingDir = path.posix.normalize(session.workingDir);
+        }
+      }
+      return;
+    }
+
+    session.projectWorkingDirKind = undefined;
+    const validation = typeof session.workingDir === 'string'
+      ? this.validatePath(session.workingDir, ownerUserId)
+      : { valid: false };
+    if (!validation.valid || !validation.path) session.workingDir = scope.workspaceRoot;
+    else session.workingDir = validation.path;
+  }
+
+  /** Open one authorised archive and merge it without last-wins collisions. */
+  private async loadWorkspaceSessions(
+    ownerUserId: number,
+    storageRoot: string,
+    options: {
+      refresh?: boolean;
+      publishForPruning?: boolean;
+      skipLegacyRetry?: boolean;
+    } = {},
+  ): Promise<void> {
+    let scope: SessionStorageScope;
+    try {
+      scope = this.sessionStorageScope(ownerUserId, storageRoot);
+    } catch (error) {
+      // Scope admission can fail before there is a database to describe (for
+      // example when a plaintext root is already owned by another account).
+      // Keep that failure visible in the persistence diagnostic instead of
+      // reporting it only to the one create/resume request that discovered it.
+      const ownerKey = this.sessionOwnerKey(ownerUserId);
+      this.workspacePersistenceErrors.set(
+        `${ownerKey}\u0000${path.resolve(storageRoot)}`,
+        error instanceof Error ? error.message : String(error),
+      );
+      throw error;
+    }
+    const key = `${scope.ownerKey}\u0000${scope.workspaceRoot}`;
+    if (options.skipLegacyRetry !== true) {
+      let retry = this.legacyWorkspaceMigrationRetries.get(key);
+      if (!retry) {
+        retry = (async () => {
+          const legacy = await this.sessionStore.loadLegacySessions(ownerUserId);
+          await this.migrateLegacySessions(legacy, {
+            onlyScope: scope,
+            migrateOrphanUsage: false,
+          });
+        })();
+        this.legacyWorkspaceMigrationRetries.set(key, retry);
+      }
+      try {
+        await retry;
+      } finally {
+        if (this.legacyWorkspaceMigrationRetries.get(key) === retry) {
+          this.legacyWorkspaceMigrationRetries.delete(key);
+        }
+      }
+    }
+    const alreadyLoaded = this.loadedWorkspaceScopes.has(key);
+    if (options.publishForPruning === false) {
+      this.sessionStore.holdWorkspacePublication(scope);
+    }
+    if (alreadyLoaded && options.refresh !== true) {
+      // Only the migration coordinator may deliberately release a partial
+      // archive. Ordinary create/join calls must not turn a prior prefix load
+      // into permission to prune it.
+      if (options.publishForPruning === true) {
+        this.sessionStore.markWorkspacePublished(scope);
+      }
+      return;
+    }
+    const publishForPruning = options.publishForPruning === true
+      || (
+        options.publishForPruning !== false
+        && !this.sessionStore.isWorkspacePublicationHeld(scope)
+      );
+
+    try {
+      const store = this.sessionStore.openWorkspace(scope);
+      const owner = this.database.getUserById(ownerUserId);
+      if (!owner) throw new Error('Workspace owner account is unavailable');
+      store.rebindWorkspaceOwner(ownerUserId, owner.githubLogin);
+      this.usageStore.register(scope, store.database);
+      if (!alreadyLoaded) await store.resetActiveFlags();
+      const loaded = await store.loadSessions();
+      const accepted: SessionRecord[] = [];
+      for (const [id, session] of loaded) {
+        this.revalidateRestoredSession(session, scope, ownerUserId);
+        const existing = this.claudeSessions.get(id);
+        const sameScope = existing
+          && existing.storageScope?.ownerKey === scope.ownerKey
+          && existing.storageScope?.workspaceRoot === scope.workspaceRoot;
+        const replaceableUnscopedLegacy = existing?.persistenceUnavailable
+          && existing.ownerUserId === ownerUserId
+          && !existing.storageScope;
+        if (existing && !sameScope && !replaceableUnscopedLegacy && (
+          existing.storageScope?.ownerKey !== scope.ownerKey
+          || existing.storageScope?.workspaceRoot !== scope.workspaceRoot
+        )) {
+          throw new Error(`Session id collision for ${id} across workspace archives`);
+        }
+        accepted.push(session);
+      }
+      // Validate the complete archive before publishing any of it. A late id
+      // collision must not leave an earlier prefix partially loaded.
+      const confirmationErrors: string[] = [];
+      const legacyDuplicates: string[] = [];
+      const published: SessionRecord[] = [];
+      for (const session of accepted) {
+        // The opaque owner key survives a re-created installation database;
+        // the local numeric id does not and is refreshed on an authorised load.
+        session.ownerUserId = ownerUserId;
+        const legacyStillAuthoritative = this.database.raw.prepare(`
+          SELECT 1 AS present
+          FROM runtime_sessions
+          WHERE owner_user_id = ? AND id = ?
+          LIMIT 1
+        `).get(ownerUserId, session.id);
+        // A destination transaction can commit before the legacy transaction
+        // fails. In that recoverable duplicate state the source row and file
+        // rollback copies remain authoritative, so discovery must not confirm
+        // (and delete) those files merely because it can see the local row.
+        if (legacyStillAuthoritative) {
+          legacyDuplicates.push(session.id);
+          // Keep the read-only legacy placeholder (if already published) and
+          // do not let an unconfirmed duplicate destination row replace it.
+          continue;
+        } else {
+          try {
+            await this.workspaceArtifactMigrator.confirm(session);
+          } catch (error) {
+            confirmationErrors.push(
+              `${session.id}: ${error instanceof Error ? error.message : String(error)}`,
+            );
+          }
+        }
+        // Child shells are durable sessions too. Their process cannot survive
+        // a server restart, but their record, transcript, history and paste
+        // artefacts must: reopening the conversation starts a terminal again in
+        // the same child record and retains its prior scrollback.
+        const existing = this.claudeSessions.get(session.id);
+        if (alreadyLoaded && existing && !existing.persistenceUnavailable) {
+          // A retry may add another completed unit while an already restored
+          // sibling is running. Keep that sibling's live runtime state and
+          // merge only newly authoritative rows/read-only placeholders.
+          continue;
+        }
+        published.push(session);
+      }
+      // No await is allowed between publishing the complete archive and
+      // admitting it for pruning.  Autosave can therefore see either the old
+      // non-authoritative state or the complete restored state, never a prefix.
+      for (const session of published) this.claudeSessions.set(session.id, session);
+      const archiveCanPrune = publishForPruning && legacyDuplicates.length === 0;
+      if (archiveCanPrune) {
+        this.sessionStore.markWorkspacePublished(scope);
+      } else {
+        this.sessionStore.holdWorkspacePublication(scope);
+      }
+      this.loadedWorkspaceScopes.add(key);
+      const diagnostics: string[] = [];
+      if (!archiveCanPrune) {
+        const existingDiagnostic = this.workspacePersistenceErrors.get(key);
+        if (existingDiagnostic) diagnostics.push(existingDiagnostic);
+      }
+      if (legacyDuplicates.length > 0) {
+        diagnostics.push(
+          `Legacy authority remains for local duplicate rows: ${legacyDuplicates.join(', ')}`,
+        );
+      }
+      if (confirmationErrors.length > 0) {
+        diagnostics.push(
+          `Legacy artifact cleanup is incomplete (${confirmationErrors.join(', ')})`,
+        );
+      }
+      if (diagnostics.length > 0) {
+        this.workspacePersistenceErrors.set(key, diagnostics.join('; '));
+      } else if (archiveCanPrune) {
+        this.workspacePersistenceErrors.delete(key);
+      }
+    } catch (error) {
+      if (!alreadyLoaded) {
+        this.usageStore.unregister(scope);
+        this.sessionStore.closeWorkspace(scope);
+      }
+      const message = error instanceof Error ? error.message : String(error);
+      this.workspacePersistenceErrors.set(key, message);
+      throw error;
+    }
+  }
+
+  private async loadProjectWorkspaceSessions(ownerUserId: number, projectId: string): Promise<void> {
+    const project = this.projectStore.getProjectForUser(projectId, ownerUserId);
+    const owner = this.getEnvironmentOwner(ownerUserId);
+    if (!project || !owner) throw new Error('Project workspace is unavailable');
+    await this.loadWorkspaceSessions(
+      ownerUserId,
+      this.projectPaths.worktreePath(project, owner),
+    );
+  }
+
+  private projectSessionStorageScope(project: Project): SessionStorageScope {
+    const owner = this.getEnvironmentOwner(project.ownerUserId);
+    if (!owner) throw new Error('Project workspace owner is unavailable');
+    return {
+      workspaceRoot: path.resolve(this.projectPaths.worktreePath(project, owner)),
+      ownerKey: this.sessionOwnerKey(project.ownerUserId),
+    };
+  }
+
+  /**
+   * Recover archives left in the deterministic project staging slot by a
+   * process crash.
+   *
+   * This runs only after boot reconciliation has made every reachable managed
+   * runtime non-executable. Restoring sooner would put plaintext session data
+   * back into a bind-mounted workspace while an old container could still
+   * mutate it. A failed restore remains an explicit unavailable scope and is
+   * excluded from discovery; startup never creates a replacement database.
+   */
+  private async restoreStagedProjectSessionArchives(): Promise<void> {
+    for (const user of this.database.listUsers()) {
+      const owner = this.getEnvironmentOwner(user.id);
+      if (!owner) continue;
+      for (const project of this.projectStore.listProjectsForUser(user.id)) {
+        const scope = this.projectSessionStorageScope(project);
+        const key = `${scope.ownerKey}\u0000${scope.workspaceRoot}`;
+        // With project environments disabled we deliberately do not contact or
+        // make assumptions about old container runtimes. Host projects have no
+        // such runtime and are safe to recover locally; a staged container
+        // archive remains outside its mount and is reported unavailable.
+        if (!this.containerizedEnvironmentsEnabled && project.executionKind !== 'host') {
+          try {
+            if (await this.projectPaths.hasStagedWorkspaceSessionStorage(project, owner)) {
+              this.unrestoredProjectScopes.add(key);
+              this.workspacePersistenceErrors.set(
+                key,
+                'Project session archive is crash-staged; enable project environments to quiesce its runtime and recover it safely',
+              );
+            }
+          } catch (error) {
+            this.unrestoredProjectScopes.add(key);
+            this.workspacePersistenceErrors.set(
+              key,
+              `Project session archive staging state is unsafe: ${error instanceof Error ? error.message : String(error)}`,
+            );
+          }
+          continue;
+        }
+        try {
+          await this.projectPaths.restoreWorkspaceSessionStorage(project, owner);
+          const recoveryIdentity = await this.projectPaths.workspaceSessionStorageRecoveryIdentity(
+            project,
+            owner,
+          );
+          if (recoveryIdentity) {
+            this.sessionStore.resumeWorkspace(scope, recoveryIdentity);
+            this.pendingProjectRecoveryAuthorities.set(project.id, recoveryIdentity);
+          } else {
+            this.pendingProjectRecoveryAuthorities.delete(project.id);
+          }
+          this.unrestoredProjectScopes.delete(key);
+          const diagnostic = this.workspacePersistenceErrors.get(key);
+          if (diagnostic?.startsWith('Project session archive crash recovery failed:')) {
+            this.workspacePersistenceErrors.delete(key);
+          }
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          this.unrestoredProjectScopes.add(key);
+          this.workspacePersistenceErrors.set(
+            key,
+            `Project session archive crash recovery failed: ${message}`,
+          );
+        }
+      }
+    }
+  }
+
+  /** Finalise cold recovery only after discovery opened SQLite on the expected inode. */
+  private async completeRestoredProjectSessionArchives(): Promise<void> {
+    for (const [projectId, expected] of [...this.pendingProjectRecoveryAuthorities]) {
+      const project = this.projectStore.getProject(projectId);
+      const owner = project ? this.getEnvironmentOwner(project.ownerUserId) : null;
+      if (!project || !owner) continue;
+      const scope = this.projectSessionStorageScope(project);
+      const key = `${scope.ownerKey}\u0000${scope.workspaceRoot}`;
+      if (!this.loadedWorkspaceScopes.has(key)) continue;
+      try {
+        const reopened = this.sessionStore.workspaceStorageIdentity(scope);
+        if (!reopened || reopened.dev !== expected.dev || reopened.ino !== expected.ino) {
+          throw new ProjectWorkspaceSessionStorageError(
+            'Cold-restored project database did not open the retained archive inode',
+          );
+        }
+        await this.projectPaths.completeWorkspaceSessionStorageRestore(project, owner, reopened);
+        this.sessionStore.completeWorkspaceResume(scope, expected);
+        this.pendingProjectRecoveryAuthorities.delete(projectId);
+      } catch (error) {
+        await this.projectPaths.recordWorkspaceSessionStorageIntent(
+          project,
+          owner,
+          expected,
+        ).catch(() => undefined);
+        this.rejectProjectWorkspaceRestore(
+          project,
+          error instanceof Error ? error.message : String(error),
+        );
+        this.unrestoredProjectScopes.add(key);
+      }
+    }
+  }
+
+  private async projectHasIncompleteBinaryMigration(project: Project): Promise<boolean> {
+    const scope = this.projectSessionStorageScope(project);
+    const key = `${scope.ownerKey}\u0000${scope.workspaceRoot}`;
+    const databasePath = path.join(scope.workspaceRoot, '.cc-web', 'session-state.sqlite');
+
+    // A project may reach a lifecycle operation before startup discovery has
+    // opened its archive (or after a process died while the archive occupied
+    // the crash-recovery staging slot).  Recover and inspect an existing DB
+    // before deciding that there is no migration state to protect.  Never call
+    // the loader for an absent DB: opening it would create an empty archive and
+    // hide the unavailable authoritative one.
+    if (!this.loadedWorkspaceScopes.has(key)) {
+      const owner = this.getEnvironmentOwner(project.ownerUserId);
+      if (!owner) throw new Error('Project workspace owner is unavailable');
+      await this.projectPaths.restoreWorkspaceSessionStorage(project, owner);
+      const recoveryIdentity = await this.projectPaths.workspaceSessionStorageRecoveryIdentity(
+        project,
+        owner,
+      );
+      if (recoveryIdentity) this.sessionStore.resumeWorkspace(scope, recoveryIdentity);
+      this.unrestoredProjectScopes.delete(key);
+      const recoveryDiagnostic = this.workspacePersistenceErrors.get(key);
+      if (recoveryDiagnostic?.startsWith('Project session archive crash recovery failed:')) {
+        this.workspacePersistenceErrors.delete(key);
+      }
+      if (fs.existsSync(databasePath)) {
+        try {
+          if (this.suspendedProjectScopes.has(project.id)) {
+            const reopened = await this.afterProjectWorkspaceRestored(project, recoveryIdentity || undefined);
+            if (recoveryIdentity) {
+              if (!reopened) {
+                throw new ProjectWorkspaceSessionStorageError(
+                  'Restored project database did not prove the retained archive inode',
+                );
+              }
+              await this.projectPaths.completeWorkspaceSessionStorageRestore(project, owner, reopened);
+              this.confirmProjectWorkspaceRestored(project, recoveryIdentity);
+            }
+          } else {
+            await this.loadWorkspaceSessions(project.ownerUserId, scope.workspaceRoot);
+            if (recoveryIdentity) {
+              const reopened = this.sessionStore.workspaceStorageIdentity(scope);
+              if (!reopened) {
+                throw new ProjectWorkspaceSessionStorageError(
+                  'Restored project database did not retain its storage lease',
+                );
+              }
+              await this.projectPaths.completeWorkspaceSessionStorageRestore(project, owner, reopened);
+              this.sessionStore.completeWorkspaceResume(scope, recoveryIdentity);
+            }
+          }
+        } catch (error) {
+          if (recoveryIdentity) {
+            await this.projectPaths.recordWorkspaceSessionStorageIntent(
+              project,
+              owner,
+              recoveryIdentity,
+            ).catch(() => undefined);
+          }
+          this.rejectProjectWorkspaceRestore(
+            project,
+            error instanceof Error ? error.message : String(error),
+          );
+          throw error;
+        }
+      }
+    }
+
+    // Persistence diagnostics are deliberately fail-closed. Trust failures,
+    // owner collisions and unavailable/corrupt archives are just as unsafe to
+    // rebuild over as a recognised legacy-cleanup marker.
+    if (this.workspacePersistenceErrors.has(key)) return true;
+    if (fs.existsSync(databasePath) && !this.loadedWorkspaceScopes.has(key)) return true;
+    for (const session of this.claudeSessions.values()) {
+      if (
+        session.ownerUserId !== project.ownerUserId
+        || session.storageScope?.ownerKey !== scope.ownerKey
+        || session.storageScope?.workspaceRoot !== scope.workspaceRoot
+      ) continue;
+      if (await this.workspaceArtifactMigrator.hasPendingBinaryCleanup(session)) return true;
+    }
+    return false;
+  }
+
+  private async beforeProjectWorkspaceReplacement(
+    project: Project,
+  ): Promise<boolean | ProjectWorkspaceReplacementAuthority> {
+    if (await this.projectHasIncompleteBinaryMigration(project)) {
+      throw new ProjectWorkspaceSessionStorageError(
+        'Project session binary migration is incomplete; retry migration before replacing the workspace',
+      );
+    }
+    const scope = this.projectSessionStorageScope(project);
+    const key = `${scope.ownerKey}\u0000${scope.workspaceRoot}`;
+    if (!this.loadedWorkspaceScopes.has(key)) return false;
+    // From this point until the exact archive has been restored and reloaded,
+    // the in-memory records are only read-only signposts.  A lifecycle failure
+    // can leave the authoritative `.cc-web` inode in its deterministic sibling
+    // staging slot; allowing an upload, branch, rename, or runtime turn through
+    // one of these records would recreate the canonical name and permanently
+    // obstruct recovery.  The verified reload below replaces these objects
+    // with the clean rows from the restored database.
+    const suspendedReason = 'Project workspace session storage is temporarily unavailable during project replacement';
+    const affected: Array<{ session: SessionRecord; previous: string | undefined }> = [];
+    for (const session of this.claudeSessions.values()) {
+      if (
+        session.ownerUserId === project.ownerUserId
+        && session.storageScope?.ownerKey === scope.ownerKey
+        && session.storageScope?.workspaceRoot === scope.workspaceRoot
+      ) {
+        affected.push({ session, previous: session.persistenceUnavailable });
+        session.persistenceUnavailable = suspendedReason;
+      }
+    }
+    const previousDiagnostic = this.workspacePersistenceErrors.get(key);
+    this.workspacePersistenceErrors.set(key, suspendedReason);
+    let intentCommitted = false;
+    try {
+      // Store-level no-op queue entries form a per-session barrier. Calls
+      // admitted before the synchronous gate finish first; later calls reject
+      // from `persistenceUnavailable` and cannot queue behind the barrier.
+      await Promise.all(affected.flatMap(({ session }) => [
+        this.chatStore.flush?.(session),
+        this.transcriptStore.flush?.(session),
+        this.historyStore.flush?.(session),
+        this.pasteStore.flush?.(session),
+        this.attachmentStore.flush?.({
+          ...session,
+          projectId: session.projectId,
+          projectWorkingDirKind: session.projectWorkingDirKind,
+        }),
+      ].filter((pending): pending is Promise<void> => Boolean(pending))));
+      // Keep the live records gated, but persist their current state as it was
+      // immediately before this lifecycle suspension. This is deliberately an
+      // explicit snapshot: the general coordinator must continue to ignore
+      // migration-blocked/read-only records during unrelated autosaves.
+      const persistenceSnapshot = new Map(this.claudeSessions);
+      for (const { session, previous } of affected) {
+        persistenceSnapshot.set(session.id, {
+          ...session,
+          persistenceUnavailable: previous,
+        });
+      }
+      if (!(await this.saveSessionsToDisk(persistenceSnapshot))) {
+        throw new Error('Workspace session state could not be flushed before project replacement');
+      }
+      const identity = this.sessionStore.workspaceStorageIdentity(scope);
+      if (!identity) {
+        throw new ProjectWorkspaceSessionStorageError(
+          'Loaded project workspace has no open session storage authority',
+        );
+      }
+      const owner = this.getEnvironmentOwner(project.ownerUserId);
+      if (!owner) throw new Error('Project workspace owner is unavailable');
+      // The sibling intent is durable before the live database handle closes.
+      // A crash in the following suspension gap therefore cannot make a
+      // same-name replacement look like the authoritative archive at boot.
+      await this.projectPaths.recordWorkspaceSessionStorageIntent(project, owner, identity);
+      intentCommitted = true;
+      this.usageStore.unregister(scope);
+      this.sessionStore.suspendWorkspace(scope);
+      closeWorkspaceSessionDirectoryLeasesForScope(scope);
+      this.loadedWorkspaceScopes.delete(key);
+      this.suspendedProjectScopes.set(project.id, scope);
+      return { required: true, identity };
+    } catch (error) {
+      if (!intentCommitted) {
+        for (const { session, previous } of affected) {
+          session.persistenceUnavailable = previous;
+        }
+        if (previousDiagnostic === undefined) this.workspacePersistenceErrors.delete(key);
+        else this.workspacePersistenceErrors.set(key, previousDiagnostic);
+      }
+      throw error;
+    }
+  }
+
+  private async afterProjectWorkspaceRestored(
+    project: Project,
+    expected?: WorkspaceSessionStorageIdentity,
+  ): Promise<WorkspaceSessionStorageIdentity | void> {
+    const scope = this.suspendedProjectScopes.get(project.id);
+    if (!scope) return;
+    this.sessionStore.resumeWorkspace(scope, expected);
+    try {
+      await this.loadWorkspaceSessions(project.ownerUserId, scope.workspaceRoot);
+      const reopened = this.sessionStore.workspaceStorageIdentity(scope);
+      if (!reopened) throw new Error('Restored project workspace database did not retain a storage lease');
+      return reopened;
+    } catch (error) {
+      // A failed load must not leave the scope writable. Otherwise the next
+      // autosave could recreate an empty DB at the canonical path and publish
+      // partial in-memory rows without their retained binary artefacts.
+      this.sessionStore.suspendWorkspace(scope);
+      this.workspacePersistenceErrors.set(
+        `${scope.ownerKey}\u0000${scope.workspaceRoot}`,
+        error instanceof Error ? error.message : String(error),
+      );
+      throw error;
+    }
+  }
+
+  private confirmProjectWorkspaceRestored(
+    project: Project,
+    expected: WorkspaceSessionStorageIdentity,
+  ): WorkspaceSessionStorageIdentity {
+    const scope = this.suspendedProjectScopes.get(project.id);
+    if (!scope) throw new Error('Project workspace restore is not awaiting confirmation');
+    const confirmed = this.sessionStore.completeWorkspaceResume(scope, expected);
+    this.suspendedProjectScopes.delete(project.id);
+    return confirmed;
+  }
+
+  private rejectProjectWorkspaceRestore(project: Project, reason: string): void {
+    const scope = this.suspendedProjectScopes.get(project.id)
+      || this.projectSessionStorageScope(project);
+    const key = `${scope.ownerKey}\u0000${scope.workspaceRoot}`;
+    const suspendedReason = `Project workspace session storage restore was rejected: ${reason}`;
+    for (const session of this.claudeSessions.values()) {
+      if (
+        session.ownerUserId === project.ownerUserId
+        && session.storageScope?.ownerKey === scope.ownerKey
+        && session.storageScope?.workspaceRoot === scope.workspaceRoot
+      ) {
+        session.persistenceUnavailable = suspendedReason;
+      }
+    }
+    this.usageStore.unregister(scope);
+    this.sessionStore.suspendWorkspace(scope);
+    this.loadedWorkspaceScopes.delete(key);
+    this.suspendedProjectScopes.set(project.id, scope);
+    this.workspacePersistenceErrors.set(key, suspendedReason);
+  }
+
+  private async beforeProjectWorkspaceDeletion(project: Project): Promise<void> {
+    const scope = this.projectSessionStorageScope(project);
+    const key = `${scope.ownerKey}\u0000${scope.workspaceRoot}`;
+    this.usageStore.unregister(scope);
+    this.sessionStore.resumeWorkspace(scope);
+    this.sessionStore.closeWorkspace(scope);
+    closeWorkspaceSessionDirectoryLeasesForScope(scope);
+    this.loadedWorkspaceScopes.delete(key);
+    this.suspendedProjectScopes.delete(project.id);
+    this.workspaceCatalog.unregister(scope.ownerKey, scope.workspaceRoot);
+  }
+
+  private async workspaceSessionMetadata(ownerUserId?: number): Promise<Record<string, unknown>> {
+    const ownerKey = ownerUserId === undefined ? null : this.sessionOwnerKey(ownerUserId);
+    const opened = await this.sessionStore.getOpenedSessionMetadata();
+    const visibleScopes = opened.scopes
+      .filter(({ scope }) => !ownerKey || scope.ownerKey === ownerKey);
+    const workspaces = visibleScopes
+      .map(({ scope, metadata }) => ({
+        root: scope.workspaceRoot,
+        available: metadata.exists && !metadata.error,
+        sessionCount: metadata.sessionCount ?? 0,
+        savedAt: metadata.savedAt,
+        version: metadata.version,
+        error: metadata.error,
+      }));
+    const unavailableByScope = new Map<string, { ownerKey: string; root: string; error: string }>();
+    for (const [key, error] of this.workspacePersistenceErrors) {
+      const separator = key.indexOf('\u0000');
+      unavailableByScope.set(key, {
+        ownerKey: key.slice(0, separator),
+        root: key.slice(separator + 1),
+        error,
+      });
+    }
+    for (const { scope, metadata } of opened.scopes) {
+      if (!metadata.error) continue;
+      const key = `${scope.ownerKey}\u0000${scope.workspaceRoot}`;
+      if (!unavailableByScope.has(key)) {
+        unavailableByScope.set(key, {
+          ownerKey: scope.ownerKey,
+          root: scope.workspaceRoot,
+          error: metadata.error,
+        });
+      }
+    }
+    const unavailable = Array.from(unavailableByScope.values())
+      .filter((entry) => !ownerKey || entry.ownerKey === ownerKey)
+      .map(({ root, error }) => ({ root, error }));
+    return {
+      exists: workspaces.some((workspace) => workspace.available),
+      storage: 'workspace-local',
+      layoutVersion: 1,
+      sessionCount: workspaces.reduce((sum, workspace) => sum + workspace.sessionCount, 0),
+      workspaces,
+      unavailable,
+      migrationComplete: unavailable.length === 0,
     };
   }
 
@@ -1211,34 +2330,410 @@ export class ClaudeCodeWebServer {
   }
 
   private async loadPersistedSessions(): Promise<void> {
+    this.claudeSessions.clear();
     try {
-      const sessions = await this.sessionStore.loadSessions();
-      this.claudeSessions.clear();
-      let discarded = 0;
-      for (const [id, session] of sessions) {
-        // A shell that belonged to a conversation is not restored. Its pty died
-        // with the previous process, and nothing lists it: the only thing that
-        // ever pointed at it was one browser's note of which session its pane
-        // was attached to, which is no longer true. Keeping the record would
-        // leave a row nobody can reach and a transcript nobody will read.
-        if (session.ownerSessionId) {
-          discarded++;
-          void this.transcriptStore.deleteTranscript(session);
-          void this.historyStore.deleteHistory(session);
-          this.sessionTeardown.dispose(session);
-          continue;
-        }
-        this.claudeSessions.set(id, session);
-      }
+      // Read the legacy authority before opening any workspace. Once a scoped
+      // store exists the coordinator deliberately refuses to blur the two.
+      const legacy = await this.sessionStore.loadSessions();
+      await this.migrateLegacySessions(legacy);
+      await this.discoverWorkspaceSessions();
       if (this.claudeSessions.size > 0) {
         console.log(`Loaded ${this.claudeSessions.size} persisted sessions`);
       }
-      if (discarded > 0) {
-        // The rows go on the next autosave, which prunes anything not in the map.
-        void this.saveSessionsToDisk();
-      }
     } catch (error) {
       console.error('Failed to load persisted sessions:', error);
+    }
+  }
+
+  /** Resolve every old record to one trusted immutable scope before moving it. */
+  private async migrateLegacySessions(
+    legacy: Map<string, SessionRecord>,
+    options: {
+      onlyScope?: SessionStorageScope;
+      migrateOrphanUsage?: boolean;
+    } = {},
+  ): Promise<void> {
+    const requestedScopeKey = options.onlyScope
+      ? `${options.onlyScope.ownerKey}\u0000${options.onlyScope.workspaceRoot}`
+      : null;
+    const resolved = new Map<string, SessionStorageScope>();
+    const resolving = new Set<string>();
+    const publishBlocked = (
+      session: SessionRecord,
+      reason: unknown,
+      scope?: SessionStorageScope,
+    ): void => {
+      const message = reason instanceof Error ? reason.message : String(reason);
+      // This is a read-only view over the still-authoritative legacy row. It is
+      // deliberately not handed to SessionStore on autosave (see
+      // persistenceUnavailable there), and runtime admission rejects it.
+      const placeholder: SessionRecord = {
+        ...session,
+        ...(scope ? { storageScope: scope } : {}),
+        active: false,
+        agent: null,
+        stopRequested: false,
+        connections: new Set(),
+        outputBuffer: [...(session.outputBuffer || [])],
+        persistenceUnavailable: message,
+      };
+      this.claudeSessions.set(session.id, placeholder);
+    };
+
+    const resolve = (session: SessionRecord): SessionStorageScope => {
+      const cached = resolved.get(session.id);
+      if (cached) return cached;
+      if (resolving.has(session.id)) throw new Error('Legacy session ownership contains a cycle');
+      resolving.add(session.id);
+      try {
+        let scope: SessionStorageScope;
+        if (session.ownerSessionId) {
+          const parent = legacy.get(session.ownerSessionId);
+          if (!parent || parent.ownerUserId !== session.ownerUserId) {
+            throw new Error('Legacy child session has no authorised owner conversation');
+          }
+          scope = resolve(parent);
+          if (session.projectWorkingDirKind !== 'container') {
+            const validation = this.validatePath(session.workingDir, session.ownerUserId);
+            if (!validation.valid || !validation.path) {
+              throw new Error('Legacy child session folder is outside the current authorised base');
+            }
+            const childRoot = canonicalExistingRoot(validation.path);
+            const relative = path.relative(scope.workspaceRoot, childRoot);
+            if (
+              path.isAbsolute(relative)
+              || relative === '..'
+              || relative.startsWith(`..${path.sep}`)
+            ) {
+              throw new Error('Legacy child session folder leaves its owner conversation workspace');
+            }
+          }
+        } else if (session.projectId) {
+          const project = this.projectStore.getProjectForUser(session.projectId, session.ownerUserId);
+          const owner = this.getEnvironmentOwner(session.ownerUserId);
+          if (!project || !owner) throw new Error('Legacy project workspace is unavailable');
+          scope = this.sessionStorageScope(
+            session.ownerUserId,
+            this.projectPaths.worktreePath(project, owner),
+          );
+        } else {
+          const validation = this.validatePath(session.workingDir, session.ownerUserId);
+          if (!validation.valid || !validation.path) {
+            throw new Error('Legacy session folder is outside the current authorised base');
+          }
+          scope = this.sessionStorageScope(session.ownerUserId, validation.path);
+        }
+        resolved.set(session.id, scope);
+        return scope;
+      } finally {
+        resolving.delete(session.id);
+      }
+    };
+
+    const groups = new Map<string, {
+      scope: SessionStorageScope;
+      ownerUserId: number;
+      sessions: SessionRecord[];
+    }>();
+    for (const session of legacy.values()) {
+      try {
+        const scope = resolve(session);
+        const key = `${scope.ownerKey}\u0000${scope.workspaceRoot}`;
+        if (requestedScopeKey && key !== requestedScopeKey) continue;
+        this.workspacePersistenceErrors.delete(`${scope.ownerKey}\u0000legacy:${session.id}`);
+        const group = groups.get(key) ?? { scope, ownerUserId: session.ownerUserId, sessions: [] };
+        if (group.ownerUserId !== session.ownerUserId) {
+          throw new Error('Workspace migration mixed two local account identities');
+        }
+        group.sessions.push(session);
+        groups.set(key, group);
+      } catch (error) {
+        if (requestedScopeKey) continue;
+        const ownerKey = (() => {
+          try { return this.sessionOwnerKey(session.ownerUserId); } catch { return 'legacy-unowned'; }
+        })();
+        this.workspacePersistenceErrors.set(
+          `${ownerKey}\u0000legacy:${session.id}`,
+          error instanceof Error ? error.message : String(error),
+        );
+        publishBlocked(session, error);
+      }
+    }
+
+    for (const [key, group] of groups) {
+      const sessionsById = new Map(group.sessions.map((session) => [session.id, session]));
+      const depthById = new Map<string, number>();
+      const unitRoot = (session: SessionRecord): string => {
+        let current = session;
+        let depth = 0;
+        const seen = new Set<string>();
+        while (current.ownerSessionId) {
+          if (seen.has(current.id)) throw new Error('Legacy session ownership contains a cycle');
+          seen.add(current.id);
+          const parent = sessionsById.get(current.ownerSessionId);
+          if (!parent) {
+            throw new Error('Legacy child session escaped its resolved workspace unit');
+          }
+          current = parent;
+          depth += 1;
+        }
+        depthById.set(session.id, depth);
+        return current.id;
+      };
+      const units = new Map<string, SessionRecord[]>();
+      for (const session of group.sessions) {
+        const rootId = unitRoot(session);
+        const members = units.get(rootId) ?? [];
+        members.push(session);
+        units.set(rootId, members);
+      }
+      for (const members of units.values()) {
+        members.sort((left, right) => (
+          (depthById.get(left.id) ?? 0) - (depthById.get(right.id) ?? 0)
+          || left.id.localeCompare(right.id)
+        ));
+      }
+
+      // The first successful unit creates only a prefix of this archive while
+      // another unit may remain in app.sqlite. Hold pruning before touching
+      // either filesystem so an autosave can never interpret that prefix as a
+      // complete deletion-authoritative snapshot.
+      this.sessionStore.holdWorkspacePublication(group.scope);
+      const failures: string[] = [];
+      const cleanupErrors: string[] = [];
+
+      for (const [rootId, members] of units) {
+        let failure: string | null = null;
+        for (const session of members) {
+          try {
+            const result = await this.workspaceArtifactMigrator.migrate({
+              id: session.id,
+              ownerUserId: session.ownerUserId,
+              workingDir: session.workingDir,
+              projectId: session.projectId,
+              projectWorkingDirKind: session.projectWorkingDirKind,
+              chatDraft: session.chatDraft,
+              storageScope: group.scope,
+            });
+            if (result.status !== 'complete') {
+              const blocked = result.artifacts
+                .filter((artifact) => artifact.state === 'blocked')
+                .map((artifact) => `${artifact.artifact}:${artifact.reason}`)
+                .join(', ');
+              failure = `artifact ${session.id} is incomplete${blocked ? ` (${blocked})` : ''}`;
+              break;
+            }
+          } catch (error) {
+            failure = `artifact ${session.id} failed: ${
+              error instanceof Error ? error.message : String(error)
+            }`;
+            break;
+          }
+        }
+
+        if (!failure) {
+          try {
+            const migrated = this.sessionStore.migrateLegacySessions(
+              group.scope,
+              this.database,
+              group.ownerUserId,
+              members.map((session) => session.id),
+            );
+            if (!migrated) failure = 'SQLite cutover could not be verified';
+          } catch (error) {
+            failure = `SQLite cutover failed: ${
+              error instanceof Error ? error.message : String(error)
+            }`;
+          }
+        }
+
+        if (failure) {
+          const detail = `Legacy migration unit ${rootId} is incomplete: ${failure}`;
+          failures.push(detail);
+          // Parent and descendants share one authority boundary. Even members
+          // whose files were prepared successfully stay read-only legacy views
+          // until every member can cross the SQLite boundary together.
+          for (const session of members) publishBlocked(session, detail, group.scope);
+          continue;
+        }
+
+        // A legacy process cannot still be attached to a read-only migration
+        // placeholder. On live retry, unlike cold startup, the archive may
+        // already contain active sibling sessions and cannot be reset in bulk.
+        // Clear only the rows which just crossed the authority boundary.
+        for (const session of members) {
+          await this.sessionStore.setActive(session.id, false, group.scope);
+        }
+
+        // SQLite deletion is the authority cutover. Confirm file rollback
+        // copies only after every row in this parent/descendant unit crossed it.
+        for (const session of members) {
+          try {
+            await this.workspaceArtifactMigrator.confirm({
+              id: session.id,
+              ownerUserId: session.ownerUserId,
+              workingDir: session.workingDir,
+              projectId: session.projectId,
+              projectWorkingDirKind: session.projectWorkingDirKind,
+              chatDraft: session.chatDraft,
+              storageScope: group.scope,
+            });
+          } catch (error) {
+            cleanupErrors.push(
+              `${session.id}: ${error instanceof Error ? error.message : String(error)}`,
+            );
+          }
+        }
+      }
+
+      if (failures.length > 0) {
+        this.workspacePersistenceErrors.set(key, failures.join('; '));
+      } else if (cleanupErrors.length > 0) {
+        this.workspacePersistenceErrors.set(
+          key,
+          `Legacy artifact cleanup is incomplete (${cleanupErrors.join(', ')})`,
+        );
+      }
+
+      try {
+        // Merge the archive once per workspace, after every independent unit
+        // has had its chance to complete. A failed unit leaves a legacy
+        // placeholder and keeps this archive non-authoritative for pruning.
+        await this.loadWorkspaceSessions(group.ownerUserId, group.scope.workspaceRoot, {
+          refresh: true,
+          publishForPruning: failures.length === 0,
+          skipLegacyRetry: true,
+        });
+      } catch {
+        // Verified unit rows are already authoritative after SQLite cutover.
+        // Discovery retries the archive; failed units retain their legacy rows.
+      }
+    }
+
+    if (options.migrateOrphanUsage === false) return;
+
+    // Older releases intentionally retained usage after conversation deletion.
+    // Such a row has no workspace path left to recover; move it to one current,
+    // authorised owner archive so dashboards remain complete without reading or
+    // writing the installation database at runtime.
+    for (const user of this.database.listUsers()) {
+      const destinationSetting = 'legacyUsageWorkspaceRoot.v1';
+      const orphan = this.database.raw.prepare(`
+        SELECT 1 AS present
+        FROM usage_jobs
+        LEFT JOIN runtime_sessions
+          ON runtime_sessions.id = usage_jobs.session_id
+         AND runtime_sessions.owner_user_id = usage_jobs.user_id
+        WHERE usage_jobs.user_id = ? AND runtime_sessions.id IS NULL
+        LIMIT 1
+      `).get(user.id) as { present: number } | undefined;
+      if (!orphan) {
+        // A crash after source deletion can leave the locator behind. It is a
+        // folder reference only, never session metadata, and is no longer
+        // needed once the legacy source is empty.
+        this.database.deleteUserSetting(user.id, destinationSetting);
+        continue;
+      }
+
+      // Pin the destination before the first cross-database copy. Candidate
+      // order can change between restarts (for example when the selected
+      // folder changes); silently choosing a second archive after a crash
+      // would duplicate one usage ledger across two workspaces.
+      const pinned = this.database.getUserSetting(user.id, destinationSetting);
+      const candidates = [
+          this.getSelectedWorkingDir(user.id),
+          ...this.workspaceCatalog.roots(this.sessionOwnerKey(user.id)).sort(),
+          this.getUserBaseFolder(user.id),
+        ].filter((candidate): candidate is string => Boolean(candidate));
+      let destination = pinned;
+      if (!destination) {
+        for (const candidate of candidates) {
+          try {
+            destination = this.authorizeWorkspaceRoot(user.id, candidate);
+            // This write is the migration's durable prepare marker. Do not
+            // begin copying until it has succeeded.
+            this.database.setUserSetting(user.id, destinationSetting, destination);
+            break;
+          } catch {
+            // Try the next currently-authorised candidate before any copy.
+          }
+        }
+      }
+      let scope: SessionStorageScope | null = null;
+      if (destination) {
+        try {
+          scope = this.sessionStorageScope(user.id, destination);
+        } catch {
+          // A pinned target is immutable: if it is unavailable, expose a
+          // blocked migration instead of selecting a different destination.
+        }
+      }
+      if (!scope) {
+        this.workspacePersistenceErrors.set(
+          `${this.sessionOwnerKey(user.id)}\u0000legacy-usage`,
+          'Legacy usage has no currently authorised workspace archive',
+        );
+        continue;
+      }
+      const migrated = this.sessionStore.migrateLegacyOrphanUsage(
+        scope,
+        this.database,
+        user.id,
+      );
+      if (!migrated) {
+        this.workspacePersistenceErrors.set(
+          `${scope.ownerKey}\u0000${scope.workspaceRoot}`,
+          'Legacy usage migration could not be verified',
+        );
+        continue;
+      }
+      await this.loadWorkspaceSessions(user.id, scope.workspaceRoot, {
+        skipLegacyRetry: true,
+      });
+      this.database.deleteUserSetting(user.id, destinationSetting);
+    }
+  }
+
+  /** Open only roots present in the global folder/project catalog; never scan. */
+  private async discoverWorkspaceSessions(): Promise<void> {
+    for (const user of this.database.listUsers()) {
+      const ownerKey = this.sessionOwnerKey(user.id);
+      const catalogRoots = new Set(this.workspaceCatalog.roots(ownerKey));
+      const candidates = new Set(catalogRoots);
+      const selected = this.getSelectedWorkingDir(user.id);
+      if (selected) candidates.add(path.resolve(selected));
+      const owner = this.getEnvironmentOwner(user.id);
+      if (owner) {
+        for (const project of this.projectStore.listProjectsForUser(user.id)) {
+          candidates.add(this.projectPaths.worktreePath(project, owner));
+        }
+      }
+
+      for (const root of candidates) {
+        const scopeKey = `${ownerKey}\u0000${root}`;
+        if (this.unrestoredProjectScopes.has(scopeKey)) continue;
+        // Avoid creating an empty state database merely because a folder or a
+        // stopped project appears in the discovery catalog.
+        if (!fs.existsSync(path.join(root, '.cc-web', 'session-state.sqlite'))) {
+          if (catalogRoots.has(root)) {
+            this.workspacePersistenceErrors.set(
+              `${ownerKey}\u0000${root}`,
+              'The catalogued workspace archive is unavailable or incomplete',
+            );
+          }
+          continue;
+        }
+        try {
+          await this.loadWorkspaceSessions(user.id, root, {
+            skipLegacyRetry: true,
+          });
+        } catch (error) {
+          this.workspacePersistenceErrors.set(
+            `${ownerKey}\u0000${root}`,
+            error instanceof Error ? error.message : String(error),
+          );
+        }
+      }
     }
   }
 
@@ -1307,6 +2802,7 @@ export class ClaudeCodeWebServer {
   }
 
   private setupAutoSave(): void {
+    if (this.autoSaveInterval) return;
     this.autoSaveInterval = setInterval(() => {
       void this.saveSessionsToDisk();
     }, 30000);
@@ -1315,8 +2811,10 @@ export class ClaudeCodeWebServer {
     });
   }
 
-  private async saveSessionsToDisk(): Promise<boolean> {
-    return this.sessionStore.saveSessions(this.claudeSessions);
+  private async saveSessionsToDisk(
+    sessions: Map<string, SessionRecord> = this.claudeSessions,
+  ): Promise<boolean> {
+    return this.sessionStore.saveSessions(sessions);
   }
 
   /**
@@ -1332,6 +2830,10 @@ export class ClaudeCodeWebServer {
       validatePath: (targetPath: string, userId?: number) => this.validatePath(targetPath, userId),
       getUserBaseFolder: (userId?: number) => this.getUserBaseFolder(userId),
       createSessionRecord: (params) => this.createSessionRecord(params),
+      loadWorkspaceSessions: (userId, storageRoot) =>
+        this.loadWorkspaceSessions(userId, storageRoot),
+      loadProjectWorkspaceSessions: (userId, projectId) =>
+        this.loadProjectWorkspaceSessions(userId, projectId),
       getRuntimeBridge: (agentKind: AgentKind) => this.getRuntimeBridge(agentKind),
       stopSessionRuntime: (session) =>
         this.messageProcessor.retireSessionRuntime(session),
@@ -1343,20 +2845,98 @@ export class ClaudeCodeWebServer {
       getSelectedWorkingDir: (userId: number) => this.getSelectedWorkingDir(userId),
       activeProfileFor: (runtime: string) => this.activeProfileFor(runtime),
       tabCoordinator: this.tabCoordinator,
-      sessionStore: this.sessionStore,
+      sessionStore: {
+        getSessionMetadata: (userId) => this.workspaceSessionMetadata(userId),
+        setActive: (id, active) => this.sessionStore.setActive(
+          id,
+          active,
+          this.claudeSessions.get(id)?.storageScope,
+        ),
+        resetActiveFlags: () => this.sessionStore.resetActiveFlags(),
+      },
       projectsManager: this.projects,
       releaseProjectSessionResources: (sessionId) =>
         this.messageProcessor.releaseProjectSessionResources(sessionId),
       sessionTeardown: this.sessionTeardown,
+      attachmentStore: this.attachmentStore,
       chatStore: this.chatStore,
     };
   }
 
   async shutdown(): Promise<void> {
-    if (this.isShuttingDown) {
-      return;
-    }
+    this.shutdownRequested = true;
     this.isShuttingDown = true;
+    if (this.shutdownExecution) return await this.shutdownExecution;
+    if (this.startInProgress) {
+      return await this.waitForShutdownExecution();
+    }
+    return await this.beginShutdown();
+  }
+
+  private waitForShutdownExecution(): Promise<void> {
+    if (this.shutdownExecution) return this.shutdownExecution;
+    if (!this.shutdownWaiter) {
+      let resolve!: () => void;
+      let reject!: (error: unknown) => void;
+      const promise = new Promise<void>((resolvePromise, rejectPromise) => {
+        resolve = resolvePromise;
+        reject = rejectPromise;
+      });
+      this.shutdownWaiter = { promise, resolve, reject };
+    }
+    return this.shutdownWaiter.promise;
+  }
+
+  private beginShutdown(): Promise<void> {
+    if (this.shutdownExecution) return this.shutdownExecution;
+    this.shutdownRequested = true;
+    this.isShuttingDown = true;
+    const execution = this.shutdownAndReleaseDataDirLease();
+    this.shutdownExecution = execution;
+    void execution.then(
+      () => this.shutdownWaiter?.resolve(),
+      (error) => this.shutdownWaiter?.reject(error),
+    );
+    return execution;
+  }
+
+  private async shutdownAndReleaseDataDirLease(): Promise<void> {
+
+    let shutdownError: unknown;
+    try {
+      await this.shutdownWithDataDirLeaseHeld();
+    } catch (error) {
+      shutdownError = error;
+    }
+
+    let leaseError: unknown;
+    // Releasing after an early teardown failure could admit another process
+    // while this one still owns a timer, SQLite handle, or runtime writer. A
+    // normal shutdown (including a failed final flush) reaches the explicit
+    // writers-closed marker below and is safe to release.
+    if (this.dataDirWritersClosed && this.dataDirLease) {
+      const lease = this.dataDirLease;
+      try {
+        if (!await lease.release()) {
+          leaseError = new Error('Data-directory lease ownership changed before shutdown');
+        } else {
+          this.dataDirLease = null;
+        }
+      } catch (error) {
+        leaseError = error;
+      }
+    }
+
+    if (shutdownError) {
+      if (leaseError && shutdownError instanceof Error) {
+        Object.assign(shutdownError, { leaseReleaseError: leaseError });
+      }
+      throw shutdownError;
+    }
+    if (leaseError) throw leaseError;
+  }
+
+  private async shutdownWithDataDirLeaseHeld(): Promise<void> {
 
     console.log('\nGracefully shutting down...');
     // Stop project policy work and new network admission first. `close()`
@@ -1399,6 +2979,7 @@ export class ClaudeCodeWebServer {
       this.environmentScale = null;
     }
     this.updateChecker.stop();
+    this.lanDiscovery.stop();
 
     if (this.wss) {
       // Stop already-connected clients from creating more work while the rest
@@ -1450,7 +3031,19 @@ export class ClaudeCodeWebServer {
       this.messageProcessor.releaseProjectSessionResources(sessionId);
     }
 
-    await this.saveSessionsToDisk();
+    let finalPersistenceError: Error | null = null;
+    try {
+      if ((await this.saveSessionsToDisk()) === false) {
+        finalPersistenceError = new Error(
+          'Workspace session state could not be flushed during shutdown',
+        );
+      }
+    } catch (error) {
+      finalPersistenceError = Object.assign(
+        new Error('Workspace session state could not be flushed during shutdown'),
+        { cause: error },
+      );
+    }
 
     // Existing workspace requests can own short project leases. Let their
     // responses finish before closing lifecycle admission and SQLite. The
@@ -1475,7 +3068,15 @@ export class ClaudeCodeWebServer {
     this.listener = null;
     this.server = null;
     this.listenerSockets.clear();
+    // Usage stores borrow the workspace SessionStore handles. Drop their
+    // references before closing those SQLite databases, then close the
+    // installation database last.
+    this.usageStore.close();
+    this.sessionStore.closeWorkspaces();
+    closeWorkspaceSessionDirectoryLeases();
     this.database.close();
+    this.dataDirWritersClosed = true;
+    if (finalPersistenceError) throw finalPersistenceError;
   }
 
   private setupExpress(): void {
@@ -1506,7 +3107,29 @@ export class ClaudeCodeWebServer {
       // behavior. Desktop is a local capability endpoint and is exact-origin.
       this.app.use(cors());
     }
-    this.app.use(express.json());
+    // API responses can contain conversation/session data. Even without an
+    // explicit freshness lifetime a browser may write a revalidation entry to
+    // its disk cache, which would create an installation/profile copy outside
+    // the workspace's `.cc-web`. Individual routes may make the policy stricter
+    // but session APIs inherit this durable-storage prohibition by default.
+    this.app.use('/api', (_req, res, next) => {
+      res.setHeader('Cache-Control', 'no-store');
+      next();
+    });
+    const jsonParser = express.json();
+    this.app.use((req, res, next) => {
+      // Attachment uploads are opaque bytes even when the selected file is a
+      // JSON document. Leave this one exact route unread so its route-scoped
+      // raw parser receives byte-identical input and the 20 MiB limit.
+      if (
+        isChatAttachmentUploadRequest(req.method, req.path)
+      ) {
+        next();
+        return;
+      }
+      jsonParser(req, res, next);
+    });
+    registerServerIdentityRoute(this.app, this.serverIdentity);
     this.app.use(this.authService.attachRequestContext());
 
     this.app.get('/login', this.authService.handleLoginPage);
@@ -1582,6 +3205,8 @@ export class ClaudeCodeWebServer {
       selfUpdate: this.selfUpdate,
       getUpdateMode: () => this.getUpdateMode(),
       getInstallerUserId: () => this.database.getInstallerUserId(),
+      maintenance: this.agentMaintenance,
+      resolveTarget: (input) => this.resolveAgentMaintenanceTarget(input),
       deployTargetsEnabled: this.containerizedEnvironmentsEnabled,
       deployTargets: this.deployTargets,
       deployTargetDataDir: this.database.storageDir,
@@ -1693,18 +3318,61 @@ export class ClaudeCodeWebServer {
   }
 
   async start(): Promise<http.Server | https.Server> {
-    // No process survives a server restart. This is deliberately before the
-    // project manager's future boot reconciliation, which reads the same DB
-    // truth to decide whether a project may be stopped or swapped. (#168)
-    await this.sessionStore.resetActiveFlags();
-    await this.loadPersistedSessions();
+    if (this.startAttempted || this.isShuttingDown || !this.dataDirLease) {
+      throw new Error('This server instance cannot be started more than once');
+    }
+    this.startAttempted = true;
+    this.startInProgress = true;
+    try {
+      const server = await this.startWithDataDirLeaseHeld();
+      this.throwIfStartupWasCancelled();
+      return server;
+    } catch (error) {
+      this.shutdownRequested = true;
+      this.isShuttingDown = true;
+      try {
+        // Call the private executor directly. Public shutdown deliberately
+        // waits for an in-flight start, so using it from start's own catch
+        // would deadlock with itself.
+        await this.beginShutdown();
+      } catch (cleanupError) {
+        if (error instanceof Error) Object.assign(error, { cleanupError });
+      }
+      throw error;
+    } finally {
+      this.startInProgress = false;
+    }
+  }
+
+  private throwIfStartupWasCancelled(): void {
+    if (!this.shutdownRequested) return;
+    throw Object.assign(new Error('Server startup was cancelled by shutdown'), {
+      code: 'server_shutdown',
+    });
+  }
+
+  private async startWithDataDirLeaseHeld(): Promise<http.Server | https.Server> {
+    // A crash may leave `.cc-web` in a sibling staging slot while an old
+    // container is still executable. Quiesce every reachable managed runtime
+    // before putting that plaintext archive back into its bind-mounted name.
     if (this.containerizedEnvironmentsEnabled) {
       await this.projects.reconcileOnBoot();
+      this.throwIfStartupWasCancelled();
     } else {
       // Reconciliation scans every reachable deploy engine and can retire
       // recorded runtimes. A dark feature must not contact those engines.
       this.projectStore.clearSessionLeases();
     }
+    await this.restoreStagedProjectSessionArchives();
+    this.throwIfStartupWasCancelled();
+    // No process-local session survives a restart. Load only after staged
+    // project archives are either restored exactly or marked unavailable.
+    await this.loadPersistedSessions();
+    await this.completeRestoredProjectSessionArchives();
+    this.throwIfStartupWasCancelled();
+    // Startup restoration and migration must finish before any timer is able
+    // to interpret an archive missing from the live map as a deletion.
+    this.setupAutoSave();
 
     // A marker left behind means a previous update was killed part-way — host
     // reboot, OOM, an outside restart — so the global prefix may be half
@@ -1717,17 +3385,22 @@ export class ClaudeCodeWebServer {
       );
     }
 
-    // Deliberately not awaited, and delayed: a first-run install should reach
-    // "listening" without waiting on GitHub.
-    const firstCheck = setTimeout(() => {
-      void this.updateChecker.check(false).catch(() => undefined);
-    }, 60_000);
-    firstCheck.unref?.();
-    this.updateChecker.start();
+    if (!this.desktop) {
+      // Deliberately not awaited, and delayed: a first-run install should reach
+      // "listening" without waiting on GitHub. Packaged desktop releases use
+      // the Electron main-process updater instead; their embedded server must
+      // never poll the commit-based server update channel.
+      const firstCheck = setTimeout(() => {
+        void this.updateChecker.check(false).catch(() => undefined);
+      }, 60_000);
+      firstCheck.unref?.();
+      this.updateChecker.start();
+    }
 
     // Embedders may call start() directly without going through
     // runSetupIfNeeded(); this stays as the safety net.
     await this.authService.ensureConfiguredInteractive(false);
+    this.throwIfStartupWasCancelled();
 
     if (this.desktop) {
       const server = http.createServer(this.app);
@@ -1759,6 +3432,15 @@ export class ClaudeCodeWebServer {
           server.off('error', onError);
           this.server = server;
           this.listener = server;
+          if (this.shutdownRequested) {
+            reject(Object.assign(new Error('Server startup was cancelled by shutdown'), {
+              code: 'server_shutdown',
+            }));
+            return;
+          }
+          // This only binds an opt-in responder. It never probes the LAN or
+          // sends a packet until another device sends the exact protocol request.
+          this.lanDiscovery.start();
           resolve(server);
         });
       });
@@ -1771,13 +3453,6 @@ export class ClaudeCodeWebServer {
     // opening the same server at http://192.168.x.x, which is the normal way to
     // use it. An explicit --cert/--key pair still wins; otherwise a local CA is
     // generated in the data directory.
-    if (this.certFile && !this.keyFile) {
-      throw new Error('--cert was given without --key; a certificate needs both.');
-    }
-    if (this.keyFile && !this.certFile) {
-      throw new Error('--key was given without --cert; a certificate needs both.');
-    }
-
     if (!this.certFile || !this.keyFile) {
       const material = ensureCertificates(this.dataDir);
       this.certFile = material.certFile;
@@ -1807,6 +3482,7 @@ export class ClaudeCodeWebServer {
     // Startup has now passed every operation that can throw before binding.
     // Starting here avoids leaving an idle sweep behind when auth or
     // certificate preparation fails.
+    this.throwIfStartupWasCancelled();
     this.projects.startSweep();
     return await new Promise((resolve, reject) => {
       const onError = (error: Error): void => {
@@ -1818,6 +3494,14 @@ export class ClaudeCodeWebServer {
         server.off('error', onError);
         this.server = secure;
         this.listener = server;
+        if (this.shutdownRequested) {
+          reject(Object.assign(new Error('Server startup was cancelled by shutdown'), {
+            code: 'server_shutdown',
+          }));
+          return;
+        }
+        // The HTTP(S) listener is live before discovery can advertise it.
+        this.lanDiscovery.start();
         resolve(secure);
       });
     });

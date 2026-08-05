@@ -27,7 +27,7 @@ before(function () {
     `export { renderToStaticMarkup } from 'react-dom/server';`,
     `export * as React from 'react';`,
     `export * as model from ${JSON.stringify(path.join(ROOT, 'src/shared/conversations'))};`,
-    `export { ConversationsDialog } from ${JSON.stringify(path.join(ROOT, 'src/client/shell/dialogs/ConversationsDialog'))};`,
+    `export { ConversationsDialog, ConversationRow } from ${JSON.stringify(path.join(ROOT, 'src/client/shell/dialogs/ConversationsDialog'))};`,
   ].join('\n');
 
   bundle = path.join(os.tmpdir(), `conversations-${process.pid}.js`);
@@ -219,5 +219,31 @@ describe('the conversations dialog before its list arrives', function () {
   it('offers somewhere to type from the moment it opens', function () {
     const html = render();
     assert.ok(html.includes('aria-label="Search conversations"'), html.slice(0, 600));
+  });
+});
+
+describe('a rollback recovery row', function () {
+  it('cannot be opened but keeps its definitive Delete action enabled', function () {
+    const { renderToStaticMarkup, React, ConversationRow } = mod;
+    const html = renderToStaticMarkup(React.createElement(ConversationRow, {
+      conversation: conversation({
+        rollbackRecoveryPending: true,
+        events: 0,
+        firstMessage: null,
+        canResume: false,
+      }),
+      hasTab: false,
+      isActive: false,
+      onOpen() {},
+      onDelete() {},
+    }));
+
+    assert.match(html, /rollback cleanup pending/i);
+    assert.match(html, /Delete this recovery entry to retry cleanup/i);
+    const buttons = html.match(/<button\b[^>]*>/g) || [];
+    assert.strictEqual(buttons.length, 2, html);
+    assert.match(buttons[0], /disabled=""/);
+    assert.match(buttons[1], /aria-label="Delete/);
+    assert.doesNotMatch(buttons[1], /disabled=/);
   });
 });

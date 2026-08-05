@@ -3,8 +3,10 @@
 
 import { App } from './app';
 import { registerServiceWorker } from './ui/service-worker';
+import { purgeLegacySessionBrowserState } from './session-browser-storage';
 
 document.addEventListener('DOMContentLoaded', () => {
+  purgeLegacySessionBrowserState();
   const app = new App();
   (window as any).app = app;
   app.startHeartbeat();

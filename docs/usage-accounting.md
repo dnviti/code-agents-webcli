@@ -1,8 +1,8 @@
 # Usage accounting
 
 Durable, per-user history of what agent work has cost: tokens, dollars,
-round trips and tool calls, filed as one row per turn and kept forever. This is a
-different thing from [Usage analytics](analytics.md): that page reads
+round trips and tool calls, filed as one row per turn and kept in its workspace.
+This is a different thing from [Usage analytics](analytics.md): that page reads
 Claude Code's own local transcripts to estimate a five-hour billing window for
 one CLI, and disappears with the file. This page is written by the server
 itself, for every runtime, and survives the session, the server restart, and
@@ -1050,17 +1050,20 @@ sampled.
 
 ## Where the data lives
 
-Two tables in the app's own SQLite file (`app.sqlite` in the
-[data directory](configuration.md#where-state-lives), alongside settings,
-users and runtime session records): `usage_jobs`, one row per job, and
-`usage_job_tools`, the per-tool call counts for each job, cascading if a job
-row is ever removed.
+Three owner-scoped tables live beside the session in
+`<workspace>/.cc-web/session-state.sqlite`: `usage_jobs`, one row per job;
+`usage_job_models`, its per-model breakdown; and `usage_job_tools`, its per-tool
+call counts. No new usage row is written to the installation's global
+`app.sqlite`. The server opens only authorised workspace databases and combines
+them for the account-wide dashboard, facets, history, export, burn rate and
+conversation totals. See [Where state lives](configuration.md#where-state-lives)
+for discovery, migration and backup requirements.
 
-Jobs are kept **forever**. There is no retention window and no automatic
-pruning. A record outlives the runtime session it was made in, the
-conversation it happened inside of, and the server process that wrote it —
-deleting a conversation removes its transcript, not the accounting history
-that was filed while it ran. Recording a job is idempotent (it is keyed on
-`<sessionId>:<turnId>` and replaces rather than duplicates), so recovering
-from a crash between the write and the acknowledgement never doubles anybody's
-bill.
+Jobs have no retention window and no automatic age pruning. A record outlives
+the runtime process and can outlive the conversation record it was filed under;
+deleting that conversation does not erase its accounting history. It remains,
+however, part of the workspace archive: deleting the managed project or removing
+that `.cc-web` archive removes its usage too. Recording a job is idempotent (it
+is keyed on `<sessionId>:<turnId>` and replaces rather than duplicates), so
+recovering from a crash between the write and the acknowledgement never doubles
+anybody's bill.

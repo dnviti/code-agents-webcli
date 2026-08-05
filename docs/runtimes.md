@@ -32,6 +32,78 @@ does not reliably have it on `PATH`, and several of these CLIs install there.
 Rename any of them in the UI with the
 [alias flags](configuration.md#display-names).
 
+## Installing and updating an agent
+
+The launcher gives each managed runtime a small maintenance row. It says which
+target is being inspected, the running version, whether that copy is **External**,
+**Managed**, **Not installed**, or **Project managed**, and its publisher
+channel. Claude Code, Codex CLI, pi, Qwen Code, Kimi, and Oh My Pi are labelled
+**Stable**; Grok is **Early beta**; Antigravity is **Preview**. Cursor Agent is
+launchable when manually installed, but it is not offered as a managed runtime
+and has no maintenance row.
+
+The app checks the publisher in the background without holding up the launcher.
+One check has a five-second deadline; successful results are reused for up to
+24 hours. **Retry** starts a new check when a publisher, network, or prerequisite
+could not be checked. A status is never implied from colour alone: it names
+*Current*, *Update available*, or *Unable to check*.
+
+For a missing runtime, choose **Install**. For a runtime found through `PATH` or
+another external location, choose **Install managed copy** if you want CODE
+AGENTS to maintain a separate, app-owned copy. The external installation,
+including an npm, Homebrew, Bun, WinGet, or OS-package-manager copy, is not
+changed. A managed install is only activated after its requested version has
+been verified. Operations persist across a reload or reconnect and show
+Queued, Downloading, Installing, Verifying, Activating, Complete, Failed, or
+Cancelled; an active operation can be cancelled and a failed one can be retried.
+
+Private container environments install into that user's durable home. A normal
+host installation is shared by sessions on that host: only the installer account
+may change its managed copy, and the app asks for an explicit second
+confirmation before doing so. A project recipe remains the owner of a
+project-managed runtime. Its row says **Project managed** and directs updates to
+a project rebuild rather than modifying the project from this control.
+
+After a managed update, the version row stays visible above the active terminal
+or conversation. A safe, idle WebUI conversation whose runtime can resume may
+restart automatically and keep its app transcript. A busy or non-resumable
+conversation instead requires confirmation and may start the replacement with
+fresh agent context. A terminal always asks first: it preserves the tab,
+working directory, and scrollback, but the agent's own interaction cannot be
+promised resumable. External executables are never modified in place; a
+session restart can replace the running external process with the verified
+managed copy only under the rules above.
+
+In the installed desktop controller, each operation is bound to the exact
+server and session from which it was opened. Changing the selected server cannot
+retarget it. Browser and PWA sessions are similarly bound to their current
+single server. This is separate from the **CODE AGENTS** application update
+banner: that banner updates the web application and may restart the service;
+the controls here update only an agent's managed copy.
+
+### Platform and prerequisite guidance
+
+The automatic control is deliberately unavailable when the publisher does not
+support the target platform/architecture. Follow the linked official installer
+when a platform is unavailable or a prerequisite is missing.
+
+The managed pi path downloads the matching official Node.js 22 archive into the
+same managed root and verifies its published SHA-256 checksum before running
+pi's installer. It does not alter a system Node.js installation. Windows still
+needs a user-provided Bash implementation such as Git Bash; CODE AGENTS does
+not provision system-wide tools or WSL.
+
+| Runtime | Supported automatic targets | Important manual guidance |
+| --- | --- | --- |
+| [Claude Code](https://code.claude.com/docs/en/getting-started) | macOS, Linux, Windows — x64 and arm64 | WSL2 enables sandboxing on Windows. |
+| [Codex CLI](https://github.com/openai/codex/blob/main/docs/install.md) | macOS, Linux, Windows — x64 and arm64 | Follow the official Windows/WSL2 requirements guidance. |
+| [pi](https://github.com/badlogic/pi-mono/tree/main/packages/coding-agent) | macOS, Linux, Windows — x64 and arm64 | Windows needs a supported Bash implementation, such as Git Bash. |
+| [Grok](https://docs.x.ai/build/overview) | macOS, Linux, Windows — x64 and arm64 | Use the official xAI installer; Windows supports PowerShell or WSL. |
+| [Qwen Code](https://github.com/QwenLM/qwen-code) | macOS/Linux x64 and arm64; Windows x64 | Windows arm64 is unsupported. |
+| [Kimi](https://github.com/MoonshotAI/kimi-code) | macOS, Linux, Windows — x64 and arm64 | Windows needs Git for Windows or `KIMI_SHELL_PATH`. |
+| [Oh My Pi](https://github.com/can1357/oh-my-pi) | macOS/Linux x64 and arm64; Windows x64 | Windows arm64 is unsupported; Alpine needs `libstdc++` and `libgcc`. |
+| [Antigravity](https://antigravity.google/docs/cli/install) | macOS, Linux, Windows — x64 and arm64 | Use Google's official Antigravity CLI installer. |
+
 ### Permission bypass
 
 Each runtime has a "skip permission prompts" launch option, which maps to that
@@ -536,6 +608,17 @@ staying on, and then what a new chat would open on instead.
 A **branch** opens on the model its source was actually running, for the same
 reason: the context estimate that decided whether the branch fits was measured
 against that model's window.
+
+Every app-owned attachment carried by the selected history is copied into the
+branch's own owner/session namespace before its log and session record are
+committed; carried URLs are rewritten to those new bytes. The copy is accepted
+only when two bounded reads agree on file identity, size, content hash and serve
+metadata, so deleting the source conversation cannot break the branch. In a
+managed project, the whole operation—including compensating cleanup—holds the
+project's no-start workspace lifecycle gate; branching does not start or rebuild
+a stopped project. If durable rollback or an artifact cleanup cannot be proved,
+the API returns the retained branch id with `recoveryPending` and preserves the
+ambiguous data for recovery instead of deleting it speculatively.
 
 Two deliberate omissions. A **terminal** session takes no standing choice: it
 runs the CLI's own interface, where the model is yours to change inside the tool
@@ -1064,9 +1147,23 @@ the control on that.
 
 ## Working directories
 
-A session runs in the folder you pick, and that folder is what the session
-record, the transcript and pasted-image paths all refer to. The file browser is
-bounded by the working directory chosen during
+A session runs in the folder you pick, and its record and runtime paths continue
+to name that working directory. Separately, the session receives an immutable
+storage scope when it is created. A normal host session uses the validated
+folder from the launcher; a managed-project session uses the canonical project
+workspace even when it runs in a subfolder or a container-only path; a child
+shell inherits its owning conversation's scope. Changing cwd later therefore
+does not move a conversation between archives.
+
+Session/tab state, conversation events and indexes, Plan and question state,
+terminal transcript and history, paste metadata, and per-turn usage are kept
+under that scope's `.cc-web/`. The server combines authorised workspace
+databases for account-wide tab, conversation and usage views, and lazy-loads an
+authorised folder when it is opened. See [Where state
+lives](configuration.md#where-state-lives) for the layout, migration and backup
+requirements.
+
+The file browser is bounded by the working directory chosen during
 [setup](configuration.md#first-run-setup) — only that directory and its
 subdirectories are reachable.
 

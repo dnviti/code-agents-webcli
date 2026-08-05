@@ -64,6 +64,9 @@ program
   .option('--key <path>', 'private key for --cert')
   .option('--setup', 'run the interactive installation/setup wizard before starting')
   .option('--public-base-url <url>', 'public base URL used for GitHub OAuth callbacks')
+  .option('--server-name <name>', 'operator-provided name exposed before sign-in')
+  .option('--public-discoverable-url <url>', 'canonical HTTPS URL exposed by server identity and LAN discovery')
+  .option('--lan-discoverable', 'answer explicit LAN discovery probes (off by default)')
   .option('--github-client-id <id>', 'GitHub OAuth client ID')
   .option('--github-client-secret <secret>', 'GitHub OAuth client secret')
   .option('--github-app-token <token>', 'GitHub App token stored during installation')
@@ -205,6 +208,9 @@ async function main() {
       setup: options.setup,
       dev: options.dev,
       publicBaseUrl: options.publicBaseUrl,
+      serverName: options.serverName,
+      publicDiscoverableUrl: options.publicDiscoverableUrl,
+      lanDiscoverable: options.lanDiscoverable === true,
       githubClientId: options.githubClientId,
       githubClientSecret: options.githubClientSecret,
       githubAppToken: options.githubAppToken,
@@ -303,6 +309,10 @@ async function main() {
     // the port and this process must not bind it too.
     const shouldRunHere = await appServer.runSetupIfNeeded();
     if (!shouldRunHere) {
+      // The constructor owns the installation data-directory lease before it
+      // opens SQLite. A setup flow which hands execution to systemd must close
+      // those writers and release the lease before the service starts.
+      await appServer.shutdown();
       process.exit(0);
     }
 

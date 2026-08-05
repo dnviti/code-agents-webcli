@@ -9,6 +9,7 @@ import type {
   WsMessage,
   PlanData,
 } from './types';
+import { controllerTargetAvailability } from './controller/types';
 import type { TerminalController } from './terminal/controller';
 
 import {
@@ -65,6 +66,7 @@ import { watchKeyboardInset } from './terminal/keyboard';
 import { installBrowserShortcutGuard } from './ui/browser-shortcuts';
 import { showNotification, playNotificationSound } from './ui/notifications';
 import { setupUpdateBanner } from './ui/update-banner';
+import { setupDesktopUpdates } from './ui/desktop-update';
 import { pickImage, type ImagePasteTarget } from './terminal/paste';
 import { SplitContainer } from './splits/split-container';
 import { shellStore } from './shell/store';
@@ -72,6 +74,12 @@ import { setupInstallPrompt } from './shell/install-prompt';
 import { setupWindowControlsOverlay } from './shell/window-controls-overlay';
 import { mountShell } from './shell/mount';
 import type { HistoryView, HistoryRange } from './terminal/history-view';
+import {
+  controllerFetch,
+  getControllerSnapshot,
+  initializeController,
+  parseQualifiedSessionId,
+} from './controller/transport';
 
 export class App {
   // Terminal
@@ -87,6 +95,8 @@ export class App {
   historyRequestSeq: number;
   socket: WebSocket | null;
   connectionId: string | null;
+  controllerConnectionIds: Map<string, string>;
+  controllerFeatures: Map<string, string[]>;
 
   // Session state
   currentClaudeSessionId: string | null;
@@ -155,6 +165,8 @@ export class App {
     this.historyRequestSeq = 0;
     this.socket = null;
     this.connectionId = null;
+    this.controllerConnectionIds = new Map();
+    this.controllerFeatures = new Map();
 
     this.currentClaudeSessionId = null;
     this.currentClaudeSessionName = null;
@@ -221,9 +233,15 @@ export class App {
   // Authenticated fetch helper
   // ---------------------------------------------------------------------------
 
-  async authFetch(url: string, options: RequestInit = {}): Promise<Response> {
-    const response = await fetch(url, options);
+  async authFetch(url: string, options: RequestInit = {}, serverId?: string | null): Promise<Response> {
+    const response = await controllerFetch(url, options, serverId);
     if (response.status === 401) {
+      if (getControllerSnapshot().enabled) {
+        const selected = getControllerSnapshot().targets.find(
+          (target) => target.id === (serverId || getControllerSnapshot().selectedServerId),
+        );
+        throw new Error(`Sign in to ${selected?.name || 'this server'} to continue.`);
+      }
       const next = encodeURIComponent(window.location.pathname + window.location.search);
       window.location.href = `/login?next=${next}`;
       throw new Error('Authentication required');
@@ -246,13 +264,22 @@ export class App {
     // that can miss it outright.
     setupInstallPrompt();
     setupWindowControlsOverlay();
+    setupDesktopUpdates();
     // Same reason: a notification outlives the page that raised it, so one can
     // be clicked while this window is still fetching its session list. The
     // worker posts once and does not retry — the id is held until the tab
     // manager exists to act on it.
     startNotifyRouting();
 
+    // A normal browser gets a fast 404 and keeps its existing single-server
+    // behavior. The Electron gateway answers with a secret-free target list;
+    // every subsequent API call can then carry an explicit server id.
+    await initializeController();
+
     await loadConfig(this);
+    if (getControllerSnapshot().enabled) {
+      window.addEventListener('cc-controller-changed', () => void loadConfig(this));
+    }
     setupTerminal(this);
     // One listener for the page. Which surfaces it applies to is decided by
     // the `data-claims-shortcuts` attribute, not by this call — the composer,
@@ -408,6 +435,15 @@ export class App {
   }
 
   send(data: Record<string, unknown>): boolean {
+    const controller = getControllerSnapshot();
+    if (controller.enabled && data.type !== 'ping') {
+      const messageSessionId = typeof data.sessionId === 'string' ? data.sessionId : null;
+      const owner = typeof data.serverId === 'string'
+        ? data.serverId
+        : parseQualifiedSessionId(messageSessionId || this.currentClaudeSessionId || '')?.serverId;
+      const target = owner ? controller.targets.find((item) => item.id === owner) : null;
+      if (owner && (!target || controllerTargetAvailability(target))) return false;
+    }
     return this.wsConnection.send(data);
   }
 
@@ -416,10 +452,12 @@ export class App {
   }
 
   /** Let cards whose answer socket disappeared become interactive again. */
-  handleChatConnectionLost(): void {
-    for (const sessionId of this.chats.ids()) {
-      this.chats.get(sessionId)?.connectionLost();
-    }
+  handleChatConnectionLost(serverId?: string): void {
+    this.chats.connectionLost(serverId);
+  }
+
+  handleChatConnectionRestored(serverId?: string): void {
+    this.chats.connectionRestored(serverId);
   }
 
   fitTerminal(): void {
@@ -451,8 +489,8 @@ export class App {
     return sessionsJoinSession(this, sessionId);
   }
 
-  leaveSession(): void {
-    sessionsLeaveSession(this);
+  leaveSession(serverId?: string): void {
+    sessionsLeaveSession(this, serverId);
   }
 
   /** Resolves true when the session was actually deleted. */

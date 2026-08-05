@@ -2,6 +2,22 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { SessionRecord } from '../types.js';
 import {
+  ensureWorkspaceSessionDirectory,
+  workspaceSessionAccessDirectory,
+  WorkspaceSessionStorageRef,
+} from '../services/workspace-session-storage.js';
+import {
+  appendSessionFile,
+  openSessionFileForRead,
+  prepareSessionFile,
+  publishPreparedSessionFile,
+  replaceSessionFile,
+  statSessionFile,
+  truncateSessionFile,
+  unlinkSessionEntry,
+  writePreparedSessionFile,
+} from '../services/safe-session-file.js';
+import {
   AccountLimits,
   ChatCapabilities,
   ChatEvent,
@@ -199,7 +215,7 @@ export interface ChatSnapshotOptions {
   bypassPermissions?: boolean;
 }
 
-export type ChatSessionRef = Pick<SessionRecord, 'id' | 'ownerUserId'>;
+export type ChatSessionRef = Pick<SessionRecord, 'id' | 'ownerUserId'> & WorkspaceSessionStorageRef;
 
 /** What a conversation can be listed and resumed by, read from its first lines. */
 export interface ChatDescription {
@@ -279,6 +295,8 @@ export interface ChatStoreLike {
    * embedders may keep the original fire-and-forget `void` contract.
    */
   append(session: ChatSessionRef, events: ChatEvent[]): void | Promise<void>;
+  /** Wait for every operation admitted before a workspace lifecycle gate. */
+  flush?(session: ChatSessionRef): Promise<void>;
   stat(session: ChatSessionRef): Promise<ChatStats>;
   read(session: ChatSessionRef, fromSeq: number, count: number): Promise<ChatPage>;
   turnIndex(session: ChatSessionRef): Promise<ChatTurnIndex>;
@@ -386,7 +404,8 @@ export class ChatStore implements ChatStoreLike {
       throw new Error(`Refusing non-integer owner id for chat storage: ${session.ownerUserId}`);
     }
 
-    return path.join(this.storageDir, String(session.ownerUserId), id);
+    const workspaceDir = workspaceSessionAccessDirectory(session);
+    return workspaceDir ? path.join(workspaceDir, 'chat') : path.join(this.storageDir, String(session.ownerUserId), id);
   }
 
   /**
@@ -432,7 +451,10 @@ export class ChatStore implements ChatStoreLike {
     const found: ChatDescription = { nativeSessionId: null, firstMessage: null };
     const cached = this.descriptions.get(base);
     if (cached) return cached;
-    const handle = await fs.promises.open(`${base}.jsonl`, 'r').catch(() => null);
+    const handle = await openSessionFileForRead(`${base}.jsonl`).catch((error: NodeJS.ErrnoException) => {
+      if (error.code === 'ENOENT') return null;
+      throw error;
+    });
     if (!handle) return found;
 
     // The id of the message the *user* opened with, so a block belonging to the
@@ -537,7 +559,7 @@ export class ChatStore implements ChatStoreLike {
     // repairIndex there is a log to rebuild from when the index cannot be
     // trusted. Reading it only inside the happy path is what made a bad index
     // hide the entire conversation instead of triggering a repair.
-    const logStat = await fs.promises.stat(`${base}.jsonl`).catch(() => null);
+    const logStat = await statSessionFile(`${base}.jsonl`);
     state.logSize = logStat ? logStat.size : 0;
 
     // A retention swap commits JSONL first and its derived index second. If
@@ -546,12 +568,12 @@ export class ChatStore implements ChatStoreLike {
     // When both temp files remain, the canonical log was never replaced and
     // the old canonical pair is still the right one.
     const [preparedIndex, preparedLog] = await Promise.all([
-      fs.promises.stat(`${base}.idx.tmp`).catch(() => null),
-      fs.promises.stat(`${base}.jsonl.tmp`).catch(() => null),
+      statSessionFile(`${base}.idx.tmp`),
+      statSessionFile(`${base}.jsonl.tmp`),
     ]);
     if (logStat && preparedIndex?.isFile() && !preparedLog) {
       try {
-        await fs.promises.rename(`${base}.idx.tmp`, `${base}.idx`);
+        await publishPreparedSessionFile(`${base}.idx.tmp`, `${base}.idx`);
         console.warn(`Completed interrupted chat retention index swap for ${base}.`);
       } catch (error) {
         console.warn(`Could not complete interrupted chat retention index swap for ${base}:`, error);
@@ -562,7 +584,7 @@ export class ChatStore implements ChatStoreLike {
     let truncateIndexTo: number | null = null;
     try {
       const header = Buffer.alloc(HEADER_BYTES);
-      const handle = await fs.promises.open(`${base}.idx`, 'r');
+      const handle = await openSessionFileForRead(`${base}.idx`);
       try {
         const { size } = await handle.stat();
         if (size >= HEADER_BYTES) {
@@ -581,6 +603,7 @@ export class ChatStore implements ChatStoreLike {
         await handle.close();
       }
     } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'UNSAFE_WORKSPACE_SESSION_FILE') throw error;
       if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
         console.error(`Failed to read chat index ${base}.idx:`, error);
       }
@@ -591,7 +614,7 @@ export class ChatStore implements ChatStoreLike {
     // next cold read interpret a hybrid offset as real. Drop only the partial
     // entry; the complete JSONL records below rebuild what is missing.
     if (truncateIndexTo !== null) {
-      await fs.promises.truncate(`${base}.idx`, truncateIndexTo);
+      await truncateSessionFile(`${base}.idx`, truncateIndexTo);
     }
 
     // Retention commits the canonical JSONL and its derived index with two
@@ -611,7 +634,7 @@ export class ChatStore implements ChatStoreLike {
         // The interrupted replacement's header may be unavailable, so the
         // exact number trimmed cannot be reconstructed from JSONL alone.
         state.turnsDropped = 0;
-        await fs.promises.writeFile(
+        await replaceSessionFile(
           `${base}.idx`,
           headerBuffer(state.firstSeq, state.turnsDropped),
         );
@@ -633,7 +656,10 @@ export class ChatStore implements ChatStoreLike {
       // The numbers a rebuilt conversation shows are its own, and they are at
       // least self-consistent from here on.
       state.turnsDropped = 0;
-      await fs.promises.writeFile(`${base}.idx`, headerBuffer(state.firstSeq, state.turnsDropped));
+      await replaceSessionFile(
+        `${base}.idx`,
+        headerBuffer(state.firstSeq, state.turnsDropped),
+      );
     }
 
     await this.repairIndex(base, state);
@@ -658,7 +684,10 @@ export class ChatStore implements ChatStoreLike {
     if (state.logSize === 0) {
       if (state.count !== 0) {
         console.warn(`Chat index for ${base} describes events an empty log does not have; resetting.`);
-        await fs.promises.writeFile(`${base}.idx`, headerBuffer(state.firstSeq)).catch(() => undefined);
+        await replaceSessionFile(
+          `${base}.idx`,
+          headerBuffer(state.firstSeq),
+        ).catch(() => undefined);
         state.count = 0;
       }
       return;
@@ -667,7 +696,7 @@ export class ChatStore implements ChatStoreLike {
     let scanFrom = 0;
     if (state.count > 0) {
       const entry = Buffer.alloc(ENTRY_BYTES);
-      const handle = await fs.promises.open(`${base}.idx`, 'r');
+      const handle = await openSessionFileForRead(`${base}.idx`);
       try {
         await handle.read(entry, 0, ENTRY_BYTES, HEADER_BYTES + (state.count - 1) * ENTRY_BYTES);
       } finally {
@@ -681,14 +710,17 @@ export class ChatStore implements ChatStoreLike {
       state.firstSeq = (await firstSeqInLog(base)) ?? 1;
       state.count = 0;
       state.turnsDropped = 0;
-      await fs.promises.writeFile(`${base}.idx`, headerBuffer(state.firstSeq, state.turnsDropped));
+      await replaceSessionFile(
+        `${base}.idx`,
+        headerBuffer(state.firstSeq, state.turnsDropped),
+      );
       await this.repairIndex(base, state);
       return;
     }
 
     const tail = Buffer.alloc(state.logSize - scanFrom);
     if (tail.length > 0) {
-      const handle = await fs.promises.open(`${base}.jsonl`, 'r');
+      const handle = await openSessionFileForRead(`${base}.jsonl`);
       try {
         await handle.read(tail, 0, tail.length, scanFrom);
       } finally {
@@ -708,7 +740,7 @@ export class ChatStore implements ChatStoreLike {
     const lastNewline = newlines.length > 0 ? newlines[newlines.length - 1] : -1;
     if (lastNewline < tail.length - 1) {
       const keep = scanFrom + lastNewline + 1;
-      await fs.promises.truncate(`${base}.jsonl`, keep);
+      await truncateSessionFile(`${base}.jsonl`, keep);
       state.logSize = keep;
     }
 
@@ -729,7 +761,7 @@ export class ChatStore implements ChatStoreLike {
 
     const entries = Buffer.alloc(recovered.length * ENTRY_BYTES);
     recovered.forEach((offset, index) => entries.writeUInt32LE(offset, index * ENTRY_BYTES));
-    await fs.promises.appendFile(`${base}.idx`, entries);
+    await appendSessionFile(`${base}.idx`, entries);
     state.count += recovered.length;
     console.warn(`Recovered ${recovered.length} unindexed chat event(s) for ${base}.`);
   }
@@ -737,6 +769,14 @@ export class ChatStore implements ChatStoreLike {
   append(session: ChatSessionRef, events: ChatEvent[]): Promise<void> {
     if (events.length === 0) {
       return Promise.resolve();
+    }
+    if (session.persistenceUnavailable) {
+      const error = Object.assign(new Error(session.persistenceUnavailable), {
+        code: 'SESSION_PERSISTENCE_UNAVAILABLE',
+      });
+      const rejected = Promise.reject(error);
+      void rejected.catch(() => undefined);
+      return rejected;
     }
 
     // This runs on the event emission path and never throws synchronously. Its
@@ -764,6 +804,7 @@ export class ChatStore implements ChatStoreLike {
         logRebased: false,
       };
       try {
+        await ensureWorkspaceSessionDirectory(session);
         // Keep the exact bytes handed to appendFile. If the derived index write
         // fails after these bytes land, the JSONL suffix is the authoritative
         // commit record and the caller must not retry the same durable event.
@@ -829,7 +870,7 @@ export class ChatStore implements ChatStoreLike {
         if (attempt.logStart !== null) {
           let size: number;
           try {
-            size = (await fs.promises.stat(`${base}.jsonl`)).size;
+            size = (await statSessionFile(`${base}.jsonl`))?.size ?? 0;
           } catch (statError: unknown) {
             throw new ChatStoreAppendError(
               'unknown',
@@ -839,7 +880,7 @@ export class ChatStore implements ChatStoreLike {
           }
           if (size > attempt.logStart) {
             try {
-              await fs.promises.truncate(`${base}.jsonl`, attempt.logStart);
+              await truncateSessionFile(`${base}.jsonl`, attempt.logStart);
             } catch (truncateError: unknown) {
               // A transient verifier failure followed by a transient rollback
               // failure used to report an unknown outcome even when the whole
@@ -891,12 +932,17 @@ export class ChatStore implements ChatStoreLike {
     return write;
   }
 
+  async flush(session: ChatSessionRef): Promise<void> {
+    const base = this.basePath(session);
+    await this.enqueue(base, async () => undefined);
+  }
+
   /** Whether the log ends with every byte of the attempted append batch. */
   private async logEndsWith(base: string, payload: string): Promise<boolean> {
     const expected = Buffer.from(payload, 'utf8');
     if (expected.length === 0) return false;
 
-    const handle = await fs.promises.open(`${base}.jsonl`, 'r').catch((error: NodeJS.ErrnoException) => {
+    const handle = await openSessionFileForRead(`${base}.jsonl`).catch((error: NodeJS.ErrnoException) => {
       if (error.code === 'ENOENT') return null;
       throw error;
     });
@@ -952,8 +998,8 @@ export class ChatStore implements ChatStoreLike {
       // wherever the caller started numbering rather than assuming 1, so the
       // store is never coupled to a convention that lives one layer up.
       state.firstSeq = events[0].seq;
-      await fs.promises.writeFile(`${base}.idx`, headerBuffer(state.firstSeq));
-      await fs.promises.writeFile(`${base}.jsonl`, '');
+      await replaceSessionFile(`${base}.idx`, headerBuffer(state.firstSeq));
+      await replaceSessionFile(`${base}.jsonl`, '');
     }
 
     // seq is stamped by the caller, not assigned here, so a gap or reorder
@@ -980,8 +1026,8 @@ export class ChatStore implements ChatStoreLike {
     }
 
     attempt.logStart = state.logSize;
-    await fs.promises.appendFile(`${base}.jsonl`, payload, 'utf8');
-    await fs.promises.appendFile(`${base}.idx`, entries);
+    await appendSessionFile(`${base}.jsonl`, payload, 'utf8');
+    await appendSessionFile(`${base}.idx`, entries);
 
     state.count += events.length;
     state.logSize = offset;
@@ -1154,7 +1200,7 @@ export class ChatStore implements ChatStoreLike {
       // The Plan document belongs to the discarded conversation. Keeping its
       // removal in this same per-session queue means an older in-flight save
       // cannot land after the truncation and resurrect it.
-      await fs.promises.rm(`${base}${PLAN_SUFFIX}`, { force: true });
+      await unlinkSessionEntry(`${base}${PLAN_SUFFIX}`);
     });
   }
 
@@ -1192,7 +1238,7 @@ export class ChatStore implements ChatStoreLike {
     // record disagree about the same turn (#86).
     const dropped = state.turnsDropped + (await this.turnsBelow(base, state, state.firstSeq + drop));
 
-    const idxHandle = await fs.promises.open(`${base}.idx`, 'r');
+    const idxHandle = await openSessionFileForRead(`${base}.idx`);
     let cutOffset = 0;
     let remaining: Buffer;
     try {
@@ -1216,14 +1262,14 @@ export class ChatStore implements ChatStoreLike {
     const keptBytes = Math.max(0, state.logSize - cutOffset);
     await this.copyLogTail(base, cutOffset, keptBytes);
 
-    await fs.promises.writeFile(
+    await writePreparedSessionFile(
       `${base}.idx.tmp`,
       Buffer.concat([headerBuffer(state.firstSeq + drop, dropped), remaining]),
     );
     if (attempt) attempt.logRebaseStarted = true;
-    await fs.promises.rename(`${base}.jsonl.tmp`, `${base}.jsonl`);
+    await publishPreparedSessionFile(`${base}.jsonl.tmp`, `${base}.jsonl`);
     if (attempt) attempt.logRebased = true;
-    await fs.promises.rename(`${base}.idx.tmp`, `${base}.idx`);
+    await publishPreparedSessionFile(`${base}.idx.tmp`, `${base}.idx`);
 
     state.firstSeq += drop;
     state.count -= drop;
@@ -1249,9 +1295,10 @@ export class ChatStore implements ChatStoreLike {
   }
 
   private async copyLogTail(base: string, from: number, length: number): Promise<void> {
-    const source = await fs.promises.open(`${base}.jsonl`, 'r');
-    const target = await fs.promises.open(`${base}.jsonl.tmp`, 'w');
+    const source = await openSessionFileForRead(`${base}.jsonl`);
+    let target: fs.promises.FileHandle | null = null;
     try {
+      target = await prepareSessionFile(`${base}.jsonl.tmp`);
       const chunk = Buffer.alloc(Math.min(length, TRIM_CHUNK_BYTES) || 1);
       let copied = 0;
       while (copied < length) {
@@ -1265,7 +1312,7 @@ export class ChatStore implements ChatStoreLike {
       }
     } finally {
       await source.close();
-      await target.close();
+      await target?.close();
     }
   }
 
@@ -1488,26 +1535,32 @@ export class ChatStore implements ChatStoreLike {
    */
   async setOpeningContext(session: ChatSessionRef, context: string): Promise<void> {
     const base = this.basePath(session);
+    await ensureWorkspaceSessionDirectory(session);
     await fs.promises.mkdir(path.dirname(base), { recursive: true });
-    await fs.promises.writeFile(`${base}${CONTEXT_SUFFIX}`, context, 'utf8');
+    await replaceSessionFile(`${base}${CONTEXT_SUFFIX}`, context, 'utf8');
   }
 
   /** The context this conversation opens with, or null once it has been used. */
   async openingContext(session: ChatSessionRef): Promise<string | null> {
     try {
-      const text = await fs.promises.readFile(`${this.basePath(session)}${CONTEXT_SUFFIX}`, 'utf8');
-      return text || null;
-    } catch {
+      const handle = await openSessionFileForRead(`${this.basePath(session)}${CONTEXT_SUFFIX}`);
+      try {
+        const text = await handle.readFile('utf8');
+        return text || null;
+      } finally {
+        await handle.close();
+      }
+    } catch (error) {
       // The ordinary case by a wide margin: every conversation that was not
       // branched has nothing here, and that is not a failure to report.
+      if ((error as NodeJS.ErrnoException).code === 'UNSAFE_WORKSPACE_SESSION_FILE') throw error;
       return null;
     }
   }
 
   /** It has been handed over; there is no second first turn. */
   async clearOpeningContext(session: ChatSessionRef): Promise<void> {
-    await fs.promises
-      .rm(`${this.basePath(session)}${CONTEXT_SUFFIX}`, { force: true })
+    await unlinkSessionEntry(`${this.basePath(session)}${CONTEXT_SUFFIX}`)
       .catch(() => undefined);
   }
 
@@ -1515,16 +1568,10 @@ export class ChatStore implements ChatStoreLike {
   async setPlanDocument(session: ChatSessionRef, plan: PlanDocument): Promise<void> {
     const base = this.basePath(session);
     await this.enqueue(base, async () => {
+      await ensureWorkspaceSessionDirectory(session);
       const target = `${base}${PLAN_SUFFIX}`;
-      const temporary = `${target}.${process.pid}.${Date.now()}.tmp`;
       await fs.promises.mkdir(path.dirname(base), { recursive: true });
-      try {
-        await fs.promises.writeFile(temporary, JSON.stringify(plan), { encoding: 'utf8', mode: 0o600 });
-        await fs.promises.rename(temporary, target);
-      } catch (error) {
-        await fs.promises.rm(temporary, { force: true }).catch(() => undefined);
-        throw error;
-      }
+      await replaceSessionFile(target, JSON.stringify(plan), 'utf8');
     });
   }
 
@@ -1532,7 +1579,8 @@ export class ChatStore implements ChatStoreLike {
     const base = this.basePath(session);
     return this.enqueue(base, async () => {
       try {
-        const raw = await fs.promises.readFile(`${base}${PLAN_SUFFIX}`, 'utf8');
+        const handle = await openSessionFileForRead(`${base}${PLAN_SUFFIX}`);
+        const raw = await handle.readFile('utf8').finally(() => handle.close());
         const value = JSON.parse(raw) as Partial<PlanDocument>;
         if (typeof value.markdown !== 'string' || value.markdown.length === 0) return null;
         if (!Number.isSafeInteger(value.revision) || Number(value.revision) < 1) return null;
@@ -1541,7 +1589,8 @@ export class ChatStore implements ChatStoreLike {
           revision: Number(value.revision),
           ts: typeof value.ts === 'number' && Number.isFinite(value.ts) ? value.ts : 0,
         };
-      } catch {
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'UNSAFE_WORKSPACE_SESSION_FILE') throw error;
         return null;
       }
     });
@@ -1549,7 +1598,7 @@ export class ChatStore implements ChatStoreLike {
 
   async clearPlanDocument(session: ChatSessionRef): Promise<void> {
     const base = this.basePath(session);
-    await this.enqueue(base, () => fs.promises.rm(`${base}${PLAN_SUFFIX}`, { force: true }));
+    await this.enqueue(base, () => unlinkSessionEntry(`${base}${PLAN_SUFFIX}`));
   }
 
   /**
@@ -1566,7 +1615,7 @@ export class ChatStore implements ChatStoreLike {
   ): Promise<void> {
     let handle: fs.promises.FileHandle;
     try {
-      handle = await fs.promises.open(`${base}.jsonl`, 'r');
+      handle = await openSessionFileForRead(`${base}.jsonl`);
     } catch {
       // No log is an empty conversation, not a failure.
       return;
@@ -1627,7 +1676,7 @@ export class ChatStore implements ChatStoreLike {
 
     const spanEntries = relEnd - relStart + 1;
     const offsets = Buffer.alloc(spanEntries * ENTRY_BYTES);
-    const idxHandle = await fs.promises.open(`${base}.idx`, 'r');
+    const idxHandle = await openSessionFileForRead(`${base}.idx`);
     let read = 0;
     try {
       const result = await idxHandle.read(
@@ -1660,7 +1709,7 @@ export class ChatStore implements ChatStoreLike {
     }
 
     const buffer = Buffer.alloc(length);
-    const logHandle = await fs.promises.open(`${base}.jsonl`, 'r');
+    const logHandle = await openSessionFileForRead(`${base}.jsonl`);
     try {
       await logHandle.read(buffer, 0, length, sliceStart);
     } finally {
@@ -2082,7 +2131,7 @@ export class ChatStore implements ChatStoreLike {
 
     const withStats = await Promise.all(
       candidates.map(async (id) => {
-        const stat = await fs.promises.stat(path.join(dir, `${id}.jsonl`)).catch(() => null);
+        const stat = await statSessionFile(path.join(dir, `${id}.jsonl`)).catch(() => null);
         return { id, mtimeMs: stat?.mtimeMs ?? 0 };
       }),
     );
@@ -2099,8 +2148,8 @@ export class ChatStore implements ChatStoreLike {
       await Promise.all(
         ['.jsonl', '.idx', '.jsonl.tmp', '.idx.tmp', CONTEXT_SUFFIX, PLAN_SUFFIX].map((suffix) =>
           suffix === PLAN_SUFFIX
-            ? fs.promises.rm(`${base}${suffix}`, { force: true })
-            : fs.promises.rm(`${base}${suffix}`, { force: true }).catch(() => undefined),
+            ? unlinkSessionEntry(`${base}${suffix}`)
+            : unlinkSessionEntry(`${base}${suffix}`).catch(() => undefined),
         ),
       );
     });
@@ -2191,7 +2240,7 @@ async function firstSeqInLog(base: string): Promise<number | null> {
   const buffer = Buffer.alloc(64 * 1024);
   let read = 0;
   try {
-    const handle = await fs.promises.open(`${base}.jsonl`, 'r');
+    const handle = await openSessionFileForRead(`${base}.jsonl`);
     try {
       ({ bytesRead: read } = await handle.read(buffer, 0, buffer.length, 0));
     } finally {

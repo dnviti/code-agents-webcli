@@ -534,13 +534,10 @@ export class ProjectStore {
       .prepare(
         `SELECT p.id, p.name, p.last_activity_at,
            p.state,
-           (EXISTS(
-             SELECT 1 FROM runtime_sessions s
-             WHERE s.project_id = p.id AND s.active = 1
-           ) OR EXISTS(
+           EXISTS(
              SELECT 1 FROM project_session_leases l
              WHERE l.project_id = p.id
-           )) AS has_active_work
+           ) AS has_active_work
          FROM projects p
          WHERE p.owner_user_id = ? AND p.state IN (${marks})
          ORDER BY p.last_activity_at ASC`,
@@ -690,18 +687,15 @@ export class ProjectStore {
     return result.changes > 0;
   }
 
-  /** Whether any session row says work is live in this project. */
+  /** Whether this process holds any atomic admission lease for the project. */
   projectHasActiveSessions(projectId: string): boolean {
     const row = this.db.raw
       .prepare(
-        `SELECT 1 AS x
-           WHERE EXISTS(
-             SELECT 1 FROM runtime_sessions WHERE project_id = ? AND active = 1
-           ) OR EXISTS(
-             SELECT 1 FROM project_session_leases WHERE project_id = ?
-           )`,
+        `SELECT 1 AS x WHERE EXISTS(
+           SELECT 1 FROM project_session_leases WHERE project_id = ?
+         )`,
       )
-      .get(projectId, projectId) as { x: number } | undefined;
+      .get(projectId) as { x: number } | undefined;
     return Boolean(row);
   }
 
@@ -722,7 +716,6 @@ export class ProjectStore {
            VALUES (?, ?, ?, ?)`,
         )
         .run(leaseId, projectId, ownerUserId, new Date().toISOString());
-      this.touchActivity(projectId);
       return { ok: true, leaseId };
     });
   }
@@ -736,7 +729,6 @@ export class ProjectStore {
            WHERE id = ? AND project_id = ? AND owner_user_id = ?`,
         )
         .run(leaseId, projectId, ownerUserId);
-      if (result.changes > 0) this.touchActivity(projectId);
       return result.changes > 0;
     });
   }

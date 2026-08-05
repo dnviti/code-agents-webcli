@@ -37,6 +37,9 @@
  * changing its mind is visible.
  */
 
+import fs from 'node:fs';
+import path from 'node:path';
+import { randomBytes } from 'node:crypto';
 import type { StatementSync } from 'node:sqlite';
 
 /** Minimum Node that exposes `node:sqlite` without an --experimental flag. */
@@ -82,8 +85,46 @@ export interface SqliteDatabase {
   transaction<Args extends unknown[], Result>(
     fn: (...args: Args) => Result,
   ): (...args: Args) => Result;
+  /**
+   * Re-prove the persistent files held by a security-bound connection.
+   *
+   * Ordinary installation databases do not expose this method. Workspace
+   * callers pass independently opened descriptors for the main database and
+   * every currently visible sidecar, so a SQLite fd which followed a swapped
+   * name cannot hide behind a later path restoration.
+   */
+  verifyFileBindings?(expected: readonly SqliteExpectedFileBinding[]): void;
   close(): void;
 }
+
+export interface SqliteExpectedFileBinding {
+  readonly fd: number;
+  readonly displayPath: string;
+}
+
+export interface SqliteOpenFileBinding {
+  /** Independently opened, single-link file SQLite is required to use. */
+  readonly expectedFd: number;
+  /** Canonical path used only in fail-closed diagnostics. */
+  readonly displayPath: string;
+  /** Re-check the pinned parent around every path lookup/mutation. */
+  readonly verifyContainer?: () => void;
+  /** Deterministic swap seam for security tests; never supplied in production. */
+  readonly testHooks?: {
+    beforeBackendOpen?(): void;
+    afterBackendOpen?(): void;
+    bindingBackendForTest?: SqliteFileBindingBackend;
+  };
+}
+
+export interface OpenDatabaseOptions {
+  readonly fileBinding?: SqliteOpenFileBinding;
+}
+
+export type SqliteFileBindingBackend =
+  | 'descriptor-inventory'
+  | 'windows-mandatory-share'
+  | 'unavailable';
 
 type SqliteModule = typeof import('node:sqlite');
 
@@ -172,9 +213,377 @@ function wrapStatement(statement: StatementSync): SqliteStatement {
   };
 }
 
-export function openDatabase(path: string): SqliteDatabase {
+interface OpenDescriptor {
+  readonly fd: number;
+  readonly stat: fs.BigIntStats;
+}
+
+function unsafeFileBinding(message: string, cause?: unknown): NodeJS.ErrnoException {
+  return Object.assign(new Error(message), {
+    code: 'UNSAFE_WORKSPACE_STORAGE',
+    cause,
+  });
+}
+
+function sameFileIdentity(left: fs.BigIntStats, right: fs.BigIntStats): boolean {
+  return left.dev === right.dev && left.ino !== 0n && left.ino === right.ino;
+}
+
+/**
+ * Locate a descriptor namespace which exposes every fd in this process.
+ *
+ * Linux procfs is the production backend. Some Unix hosts expose the same
+ * enumeration through `/dev/fd`; it is accepted only when it is actually
+ * readable. Windows has no equivalent and uses its mandatory handle-sharing
+ * proof below instead.
+ */
+function descriptorNamespace(): string | null {
+  const candidates = process.platform === 'linux'
+    ? ['/proc/self/fd', '/dev/fd']
+    : ['/dev/fd'];
+  for (const candidate of candidates) {
+    try {
+      if (fs.statSync(candidate).isDirectory()) {
+        fs.readdirSync(candidate);
+        return candidate;
+      }
+    } catch {
+      // Try the next real descriptor namespace, if the platform has one.
+    }
+  }
+  return null;
+}
+
+/** Pure platform routing, exported so non-Windows CI pins the portability decision. */
+export function resolveSqliteFileBindingBackend(
+  platform: NodeJS.Platform = process.platform,
+  descriptorInventoryAvailable = descriptorNamespace() !== null,
+): SqliteFileBindingBackend {
+  if (platform === 'win32') return 'windows-mandatory-share';
+  if (descriptorInventoryAvailable) return 'descriptor-inventory';
+  return 'unavailable';
+}
+
+function snapshotDescriptors(namespace: string, displayPath: string): Map<number, OpenDescriptor> {
+  let names: string[];
+  try {
+    names = fs.readdirSync(namespace);
+  } catch (error) {
+    throw unsafeFileBinding(
+      `Cannot prove the SQLite file descriptor for workspace database: ${displayPath}`,
+      error,
+    );
+  }
+  const descriptors = new Map<number, OpenDescriptor>();
+  for (const name of names) {
+    if (!/^\d+$/.test(name)) continue;
+    const fd = Number(name);
+    try {
+      descriptors.set(fd, { fd, stat: fs.fstatSync(fd, { bigint: true }) });
+    } catch (error) {
+      // Enumerating the namespace briefly opens its own directory descriptor;
+      // it may be gone before fstat. Persistent backend descriptors remain.
+      if ((error as NodeJS.ErrnoException).code !== 'EBADF') {
+        throw unsafeFileBinding(
+          `Cannot inspect SQLite file descriptors for workspace database: ${displayPath}`,
+          error,
+        );
+      }
+    }
+  }
+  return descriptors;
+}
+
+function checkedExpectedDescriptor(binding: SqliteExpectedFileBinding): OpenDescriptor {
+  let stat: fs.BigIntStats;
+  try {
+    stat = fs.fstatSync(binding.fd, { bigint: true });
+  } catch (error) {
+    throw unsafeFileBinding(`Workspace database binding was closed: ${binding.displayPath}`, error);
+  }
+  if (!stat.isFile() || stat.nlink !== 1n || stat.ino === 0n) {
+    throw unsafeFileBinding(`Workspace database binding is unsafe: ${binding.displayPath}`);
+  }
+  return { fd: binding.fd, stat };
+}
+
+function verifyVisibleExpectedDescriptor(
+  binding: SqliteExpectedFileBinding,
+  expected = checkedExpectedDescriptor(binding),
+): OpenDescriptor {
+  let visible: fs.BigIntStats;
+  try {
+    visible = fs.lstatSync(binding.displayPath, { bigint: true });
+  } catch (error) {
+    throw unsafeFileBinding(`Workspace database path disappeared: ${binding.displayPath}`, error);
+  }
+  if (
+    visible.isSymbolicLink()
+    || !visible.isFile()
+    || visible.nlink !== 1n
+    || visible.ino === 0n
+    || !sameFileIdentity(visible, expected.stat)
+  ) {
+    throw unsafeFileBinding(`Workspace database path changed while SQLite opened: ${binding.displayPath}`);
+  }
+  return expected;
+}
+
+const WINDOWS_SHARING_DENIALS = new Set(['EACCES', 'EBUSY', 'EPERM']);
+const NO_FOLLOW = (fs.constants as unknown as Record<string, number>).O_NOFOLLOW ?? 0;
+
+/**
+ * Prove the exact Windows VFS property on which path binding relies.
+ *
+ * SQLite's built-in win32 VFS opens database files with FILE_SHARE_READ and
+ * FILE_SHARE_WRITE, deliberately omitting FILE_SHARE_DELETE. Windows enforces
+ * that share mask across the system: while DatabaseSync owns the handle, the
+ * directory entry cannot be renamed, deleted or replaced. Therefore an
+ * attacker can swap a name before sqlite3_open or after our check, but cannot
+ * perform the dangerous swap-and-restore between those two events.
+ *
+ * Do not trust the platform string alone. A zero-byte sibling proves that an
+ * unlocked rename works on this directory, is denied only while this build's
+ * DatabaseSync handle is live, and works again immediately after close. An
+ * alternate VFS/provider which does not enforce the contract fails closed
+ * before the real database is opened.
+ */
+function proveWindowsMandatoryDeleteSharing(
+  Ctor: SqliteModule['DatabaseSync'],
+  databasePath: string,
+  displayPath: string,
+  verifyContainer: () => void,
+): void {
+  const directory = path.dirname(databasePath);
+  const nonce = randomBytes(12).toString('hex');
+  const probe = path.join(directory, `.ccweb-sqlite-binding-${process.pid}-${nonce}`);
+  const moved = `${probe}.moved`;
+  let probeFd: number | null = null;
+  let probeDatabase: InstanceType<SqliteModule['DatabaseSync']> | null = null;
+  const mutate = <Result>(operation: () => Result): Result => {
+    verifyContainer();
+    try {
+      return operation();
+    } finally {
+      verifyContainer();
+    }
+  };
+  try {
+    probeFd = mutate(() => fs.openSync(
+      probe,
+      fs.constants.O_RDWR | fs.constants.O_CREAT | fs.constants.O_EXCL | NO_FOLLOW,
+      0o600,
+    ));
+    fs.closeSync(probeFd);
+    probeFd = null;
+
+    // Establish that this directory/provider permits an ordinary rename. A
+    // later EACCES is evidence only when the identical operation works here.
+    mutate(() => fs.renameSync(probe, moved));
+    mutate(() => fs.renameSync(moved, probe));
+
+    verifyContainer();
+    probeDatabase = new Ctor(probe, { timeout: BUSY_TIMEOUT_MS });
+    verifyContainer();
+    let denied = false;
+    try {
+      mutate(() => fs.renameSync(probe, moved));
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code ?? '';
+      if (!WINDOWS_SHARING_DENIALS.has(code)) {
+        throw unsafeFileBinding(
+          `Cannot establish SQLite mandatory delete sharing for workspace database: ${displayPath}`,
+          error,
+        );
+      }
+      denied = true;
+    }
+    if (!denied) {
+      // An unexpected permissive provider may have moved the disposable probe;
+      // restore it while that same behavior is still available, then fail.
+      mutate(() => fs.renameSync(moved, probe));
+      throw unsafeFileBinding(
+        `SQLite does not enforce mandatory delete sharing for workspace database: ${displayPath}`,
+      );
+    }
+
+    probeDatabase.close();
+    probeDatabase = null;
+    // Prove the denial came from the live SQLite handle, not a coincidental ACL
+    // or provider error which would leave swap-and-restore possible.
+    mutate(() => fs.renameSync(probe, moved));
+    mutate(() => fs.renameSync(moved, probe));
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'UNSAFE_WORKSPACE_STORAGE') throw error;
+    throw unsafeFileBinding(
+      `Cannot establish SQLite mandatory delete sharing for workspace database: ${displayPath}`,
+      error,
+    );
+  } finally {
+    if (probeFd !== null) {
+      try { fs.closeSync(probeFd); } catch { /* Preserve the binding failure. */ }
+    }
+    try { probeDatabase?.close(); } catch { /* Preserve the binding failure. */ }
+    for (const candidate of [probe, moved]) {
+      try { mutate(() => fs.unlinkSync(candidate)); } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'UNSAFE_WORKSPACE_STORAGE') throw error;
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+          // Cleanup is best effort. Both names are random, direct, non-recursive
+          // children and unlink never follows a raced symlink target.
+        }
+      }
+    }
+  }
+}
+
+function changedRegularDescriptors(
+  before: ReadonlyMap<number, OpenDescriptor>,
+  after: ReadonlyMap<number, OpenDescriptor>,
+): OpenDescriptor[] {
+  const changed: OpenDescriptor[] = [];
+  for (const descriptor of after.values()) {
+    const previous = before.get(descriptor.fd);
+    if (previous && sameFileIdentity(previous.stat, descriptor.stat)) continue;
+    if (descriptor.stat.isFile()) changed.push(descriptor);
+  }
+  return changed;
+}
+
+export function openDatabase(databasePath: string, options: OpenDatabaseOptions = {}): SqliteDatabase {
   const { DatabaseSync: Ctor } = loadSqlite();
-  const db = new Ctor(path, { timeout: BUSY_TIMEOUT_MS });
+  const fileBinding = options.fileBinding;
+  let bindingVerifier: ((expected: readonly SqliteExpectedFileBinding[]) => void) | undefined;
+  let db: InstanceType<SqliteModule['DatabaseSync']>;
+
+  if (!fileBinding) {
+    db = new Ctor(databasePath, { timeout: BUSY_TIMEOUT_MS });
+  } else {
+    const namespace = descriptorNamespace();
+    const backend = fileBinding.testHooks?.bindingBackendForTest
+      ?? resolveSqliteFileBindingBackend(process.platform, namespace !== null);
+    if (backend === 'unavailable' || (backend === 'descriptor-inventory' && !namespace)) {
+      throw unsafeFileBinding(
+        `Cannot prove the SQLite file descriptor for workspace database: ${fileBinding.displayPath}`,
+      );
+    }
+    const expectedBefore = checkedExpectedDescriptor({
+      fd: fileBinding.expectedFd,
+      displayPath: fileBinding.displayPath,
+    });
+    if (backend === 'windows-mandatory-share') {
+      proveWindowsMandatoryDeleteSharing(
+        Ctor,
+        databasePath,
+        fileBinding.displayPath,
+        fileBinding.verifyContainer ?? (() => {}),
+      );
+    }
+    const before = backend === 'descriptor-inventory'
+      ? snapshotDescriptors(namespace!, fileBinding.displayPath)
+      : null;
+    let opened: InstanceType<SqliteModule['DatabaseSync']> | null = null;
+    let failure: unknown = null;
+    let hookStarted = false;
+    try {
+      hookStarted = true;
+      fileBinding.testHooks?.beforeBackendOpen?.();
+      fileBinding.verifyContainer?.();
+      opened = new Ctor(databasePath, { timeout: BUSY_TIMEOUT_MS });
+      fileBinding.verifyContainer?.();
+    } catch (error) {
+      failure = error;
+    } finally {
+      if (hookStarted) {
+        try {
+          fileBinding.testHooks?.afterBackendOpen?.();
+        } catch (error) {
+          if (failure === null) failure = error;
+        }
+      }
+    }
+    if (!opened || failure !== null) {
+      try { opened?.close(); } catch { /* Preserve the open/hook failure. */ }
+      throw failure ?? unsafeFileBinding(`SQLite did not open workspace database: ${fileBinding.displayPath}`);
+    }
+
+    const expectedAfter = checkedExpectedDescriptor({
+      fd: fileBinding.expectedFd,
+      displayPath: fileBinding.displayPath,
+    });
+    if (!sameFileIdentity(expectedBefore.stat, expectedAfter.stat)) {
+      opened.close();
+      throw unsafeFileBinding(`Workspace database binding changed while SQLite opened: ${fileBinding.displayPath}`);
+    }
+    if (backend === 'descriptor-inventory') {
+      const after = snapshotDescriptors(namespace!, fileBinding.displayPath);
+      const backendFiles = changedRegularDescriptors(before!, after);
+      if (
+        backendFiles.length !== 1
+        || backendFiles[0].stat.nlink !== 1n
+        || !sameFileIdentity(backendFiles[0].stat, expectedBefore.stat)
+      ) {
+        opened.close();
+        throw unsafeFileBinding(
+          `SQLite did not bind the verified workspace database inode: ${fileBinding.displayPath}`,
+        );
+      }
+
+      const backendMainFd = backendFiles[0].fd;
+      bindingVerifier = (expectedBindings) => {
+        const expected = expectedBindings.map(checkedExpectedDescriptor);
+        const current = snapshotDescriptors(namespace!, fileBinding.displayPath);
+        const actualMain = current.get(backendMainFd);
+        if (
+          !actualMain
+          || !actualMain.stat.isFile()
+          || actualMain.stat.nlink !== 1n
+          || !sameFileIdentity(actualMain.stat, expectedBefore.stat)
+        ) {
+          throw unsafeFileBinding(
+            `SQLite workspace database descriptor changed: ${fileBinding.displayPath}`,
+          );
+        }
+        for (const actual of changedRegularDescriptors(before!, current)) {
+          if (
+            actual.stat.nlink !== 1n
+            || !expected.some((candidate) => sameFileIdentity(candidate.stat, actual.stat))
+          ) {
+            throw unsafeFileBinding(
+              `SQLite opened an unverified workspace database component: ${fileBinding.displayPath}`,
+            );
+          }
+        }
+      };
+    } else {
+      // The capability probe proved that every SQLite-owned Windows name is
+      // immovable until close. A post-open identity match therefore cannot be
+      // fooled by swapping a canary in for open and restoring the original for
+      // verification. Apply the same proof to persistent sidecars as they
+      // appear; single-link checks prevent an outside hardlink alias.
+      bindingVerifier = (expectedBindings) => {
+        verifyVisibleExpectedDescriptor({
+          fd: fileBinding.expectedFd,
+          displayPath: fileBinding.displayPath,
+        }, expectedBefore);
+        for (const candidate of expectedBindings) {
+          if (candidate.displayPath === fileBinding.displayPath) continue;
+          verifyVisibleExpectedDescriptor(candidate);
+        }
+      };
+    }
+    // Prove the backend again through the same reusable verifier before the
+    // wrapper exposes even PRAGMA/prepare to its caller.
+    try {
+      bindingVerifier([{
+        fd: fileBinding.expectedFd,
+        displayPath: fileBinding.displayPath,
+      }]);
+    } catch (error) {
+      opened.close();
+      throw error;
+    }
+    db = opened;
+  }
   let closed = false;
 
   const database: SqliteDatabase = {
@@ -234,6 +643,7 @@ export function openDatabase(path: string): SqliteDatabase {
         }
       };
     },
+    ...(bindingVerifier ? { verifyFileBindings: bindingVerifier } : {}),
     close: () => {
       // better-sqlite3 tolerated a second close; the builtin throws
       // ERR_INVALID_STATE. Shutdown paths that close defensively should not

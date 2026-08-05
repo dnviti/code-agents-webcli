@@ -7,6 +7,7 @@ import {
   PathValidation,
   RuntimeSession,
   SessionRecord,
+  SessionStorageScope,
   WebSocketInfo,
 } from '../types.js';
 import { TranscriptStoreLike } from '../services/transcript-store.js';
@@ -178,7 +179,9 @@ export interface MessageProcessorDeps {
   /** Project sessions resolve only through this manager, never through a user environment. */
   projectsManager?: ProjectsSessionApi;
   /** Active-state DB truth for project run-limit checks. */
-  sessionStore?: { setActive(id: string, active: boolean): Promise<void> };
+  sessionStore?: {
+    setActive(id: string, active: boolean, scope?: SessionStorageScope): Promise<void>;
+  };
   getSelectedWorkingDir(userId: number): string | null;
   createSessionRecord(params: {
     id: string;
@@ -186,10 +189,28 @@ export interface MessageProcessorDeps {
     name?: string;
     workingDir: string;
     connections?: string[];
+    /** Canonical server-validated folder used for workspace-local persistence. */
+    storageRoot?: string;
   }): SessionRecord;
+  /** Load a trusted folder archive before the first save may prune it. */
+  loadWorkspaceSessions?(ownerUserId: number, storageRoot: string): Promise<void>;
   /** Shared with HTTP tab routes so creation cannot cross a tentative close/reorder. */
   tabCoordinator?: AccountTabCoordinatorLike;
   getRuntimeBridge(agentKind: AgentKind): BridgeInterface | null;
+  /** Select an app-managed executable for this exact session environment. */
+  resolveAgentLaunch?(
+    session: SessionRecord,
+    environment: UserEnvironment,
+    agentKind: AgentKind,
+  ): { command: string; version: string } | null;
+  /** Resolve the exact immutable environment already occupied by a live session. */
+  resolveAgentEnvironment?(session: SessionRecord): Promise<UserEnvironment>;
+  /** Probe the executable used by a successful spawn; pointer metadata is not process identity. */
+  probeAgentLaunchVersion?(
+    environment: UserEnvironment,
+    agentKind: AgentKind,
+    command?: string,
+  ): Promise<string | null>;
   saveSessionsToDisk(): Promise<boolean | void>;
   /**
    * Launch configuration for this runtime, already resolved from the active
@@ -270,6 +291,7 @@ export interface ChatManagerLike {
     record: SessionRecord,
     options: {
       runtime: string;
+      command?: string;
       workingDir: string;
       cwdKind?: 'host' | 'container';
       fileAccess?: {
@@ -364,6 +386,10 @@ export interface ChatManagerLike {
     text?: string,
   ): boolean | Promise<boolean>;
   stop(sessionId: string): Promise<void>;
+  restartForAgentUpdate?(
+    sessionId: string,
+    input: { automatic: boolean; allowFreshContext: boolean; command?: string },
+  ): Promise<{ ok: true; resumed: boolean } | { ok: false; reason: 'not_running' | 'busy' | 'cannot_resume' }>;
   readPage(
     record: SessionRecord,
     fromSeq: number,
@@ -432,6 +458,9 @@ interface IncomingMessage {
   effort?: string | null;
   planMode?: boolean;
   revision?: number;
+  /** Agent-update restart policy; the server re-checks all live state. */
+  automatic?: boolean;
+  allowFreshContext?: boolean;
 }
 
 interface HeldProjectSessionLease extends ProjectSessionLease {
@@ -468,6 +497,8 @@ export class MessageProcessor {
     string,
     { session: SessionRecord; runId: string | undefined; promise: Promise<void> }
   >();
+  /** One agent replacement per session; a second click receives Busy. */
+  private agentUpdateRestarts = new Map<string, Promise<void>>();
   /**
    * Successful workflow admissions keyed by owner, conversation and client id.
    *
@@ -492,7 +523,6 @@ export class MessageProcessor {
     const last = this.activityAnnounced.get(session.id) ?? 0;
     if (now - last < ACTIVITY_ANNOUNCE_MS) return;
     this.activityAnnounced.set(session.id, now);
-    if (session.projectId) this.deps.projectsManager?.touchActivity(session.projectId);
     announceSessionActivity(session, true, this.deps.webSocketConnections);
   }
 
@@ -505,7 +535,6 @@ export class MessageProcessor {
    */
   private noteStopped(session: SessionRecord): void {
     this.activityAnnounced.delete(session.id);
-    if (session.projectId) this.deps.projectsManager?.touchActivity(session.projectId);
     announceSessionActivity(session, false, this.deps.webSocketConnections);
   }
 
@@ -564,6 +593,10 @@ export class MessageProcessor {
 
       case 'start_terminal':
         await this.startRuntime(wsId, 'terminal', data.options || {});
+        break;
+
+      case 'runtime_restart':
+        await this.handleAgentUpdateRestart(wsId, wsInfo, data);
         break;
 
       case 'start_chat':
@@ -640,7 +673,7 @@ export class MessageProcessor {
         break;
 
       case 'chat_draft':
-        this.handleChatDraft(wsInfo, data);
+        await this.handleChatDraft(wsInfo, data);
         break;
 
       case 'chat_subscribe':
@@ -756,7 +789,6 @@ export class MessageProcessor {
         || session.projectWorkingDirKind !== cwd.kind;
       session.workingDir = cwd.workingDir;
       session.projectWorkingDirKind = cwd.kind;
-      manager.touchActivity(session.projectId);
       // A rebuild can invalidate a disposable container cwd and move the
       // authoritative session back to its host checkout. Persist that repair
       // while the admission is still held; otherwise a quiet join or
@@ -865,7 +897,7 @@ export class MessageProcessor {
   }
 
   private persistActive(session: SessionRecord, active: boolean): void {
-    void this.deps.sessionStore?.setActive(session.id, active);
+    void this.deps.sessionStore?.setActive(session.id, active, session.storageScope);
   }
 
   private projectIdentity(session: SessionRecord): {
@@ -912,6 +944,17 @@ export class MessageProcessor {
       ? await this.deps.tabCoordinator.acquire(wsInfo.userId)
       : () => {};
     try {
+      try {
+        await this.deps.loadWorkspaceSessions?.(wsInfo.userId, validWorkingDir);
+      } catch (error) {
+        sendToWebSocket(wsInfo.ws, {
+          type: 'error',
+          message: `Workspace persistence is unavailable: ${
+            error instanceof Error ? error.message : 'unknown storage error'
+          }`,
+        });
+        return;
+      }
       // Waiting behind an account write gives this socket time to disconnect or
       // choose a newer destination. A delayed create must not overwrite that
       // newer join (nor create an unattached session for a dead socket).
@@ -921,12 +964,24 @@ export class MessageProcessor {
       const sessionId = randomUUID();
       // Construct inside the account turn: the real factory allocates the
       // append position from the live map, which is now guaranteed committed.
-      const session = this.deps.createSessionRecord({
-        id: sessionId,
-        ownerUserId: wsInfo.userId,
-        name,
-        workingDir: validWorkingDir,
-      });
+      let session: SessionRecord;
+      try {
+        session = this.deps.createSessionRecord({
+          id: sessionId,
+          ownerUserId: wsInfo.userId,
+          name,
+          workingDir: validWorkingDir,
+          storageRoot: validWorkingDir,
+        });
+      } catch (error) {
+        sendToWebSocket(wsInfo.ws, {
+          type: 'error',
+          message: `Workspace persistence is unavailable: ${
+            error instanceof Error ? error.message : 'unknown storage error'
+          }`,
+        });
+        return;
+      }
 
       this.deps.claudeSessions.set(sessionId, session);
       let saved = false;
@@ -998,6 +1053,7 @@ export class MessageProcessor {
       });
       return;
     }
+    if (this.rejectUnavailableRead(wsInfo, session)) return;
 
     let joinedLease: HeldProjectSessionLease | undefined;
     if (session.projectId) {
@@ -1106,7 +1162,6 @@ export class MessageProcessor {
     if (session) {
       session.connections.delete(wsId);
       session.lastActivity = new Date();
-      if (session.projectId) this.deps.projectsManager?.touchActivity(session.projectId);
     }
 
     this.releaseJoinedProjectLease(wsId);
@@ -1143,7 +1198,6 @@ export class MessageProcessor {
       if (session) {
         session.connections.delete(wsId);
         session.lastActivity = new Date();
-        if (session.projectId) this.deps.projectsManager?.touchActivity(session.projectId);
       }
     }
     this.releaseJoinedProjectLease(wsId);
@@ -1192,16 +1246,13 @@ export class MessageProcessor {
         // The old adapter is gone, but its replacement is already committed to
         // start inside ChatSession.restart(). Keep the same admission across
         // that hand-off so stop/reclaim never sees an unprotected gap.
-        if (session?.projectId) this.deps.projectsManager?.touchActivity(session.projectId);
         return;
       }
       this.releaseRuntimeProjectLease(sessionId);
-      if (session?.projectId) this.deps.projectsManager?.touchActivity(session.projectId);
       return;
     }
     if (!session?.projectId) return;
     if (this.runtimeProjectLeases.has(sessionId)) {
-      this.deps.projectsManager?.touchActivity(session.projectId);
       return;
     }
 
@@ -1320,6 +1371,21 @@ export class MessageProcessor {
 
     const session = this.deps.claudeSessions.get(wsInfo.claudeSessionId);
     if (!session) return;
+
+    if (session.persistenceUnavailable) {
+      sendToWebSocket(wsInfo.ws, {
+        type: 'error',
+        message: `This session is read-only until workspace migration succeeds: ${session.persistenceUnavailable}`,
+      });
+      return;
+    }
+    if (session.rollbackRecoveryPending) {
+      sendToWebSocket(wsInfo.ws, {
+        type: 'error',
+        message: 'This session is retained only to retry an incomplete rollback',
+      });
+      return;
+    }
 
     if (session.retiring) {
       sendToWebSocket(wsInfo.ws, {
@@ -1488,6 +1554,11 @@ export class MessageProcessor {
       return;
     }
 
+    const managedLaunch = agentKind === 'terminal'
+      ? null
+      : this.deps.resolveAgentLaunch?.(session, environment, agentKind) ?? null;
+    if (managedLaunch) safeOptions.command = managedLaunch.command;
+
     let runtimeMayBeAlive = false;
     try {
       const runtimeSession = (await bridge.startSession(sessionId, {
@@ -1603,6 +1674,18 @@ export class MessageProcessor {
       this.persistActive(session, true);
       session.agent = agentKind;
       session.lastAgent = agentKind;
+      const verifiedVersion = agentKind === 'terminal'
+        ? null
+        : await this.deps.probeAgentLaunchVersion?.(
+            environment,
+            agentKind,
+            managedLaunch?.command,
+          ) ?? null;
+      session.runningAgentVersion = verifiedVersion;
+      session.runningManagedAgentVersion = managedLaunch && verifiedVersion === managedLaunch.version
+        ? verifiedVersion
+        : null;
+      session.runtimeStartOptions = { ...safeOptions };
       session.stopRequested = false;
       session.lastActivity = new Date();
       session.runtimeLabel =
@@ -1704,6 +1787,143 @@ export class MessageProcessor {
       if (this.runtimeStops.get(sessionId) === entry) {
         this.runtimeStops.delete(sessionId);
       }
+    }
+  }
+
+  private async handleAgentUpdateRestart(
+    wsId: string,
+    wsInfo: WebSocketInfo,
+    data: IncomingMessage,
+  ): Promise<void> {
+    const sessionId = typeof data.sessionId === 'string' ? data.sessionId : '';
+    if (!sessionId) {
+      sendToWebSocket(wsInfo.ws, {
+        type: 'runtime_restart_result', sessionId, ok: false, reason: 'invalid_session',
+      });
+      return;
+    }
+    if (this.agentUpdateRestarts.has(sessionId)) {
+      sendToWebSocket(wsInfo.ws, { type: 'runtime_restart_result', sessionId, ok: false, reason: 'busy' });
+      return;
+    }
+    const attempt = this.handleAgentUpdateRestartOnce(wsId, wsInfo, data, sessionId);
+    this.agentUpdateRestarts.set(sessionId, attempt);
+    try {
+      await attempt;
+    } finally {
+      if (this.agentUpdateRestarts.get(sessionId) === attempt) {
+        this.agentUpdateRestarts.delete(sessionId);
+      }
+    }
+  }
+
+  private async handleAgentUpdateRestartOnce(
+    wsId: string,
+    wsInfo: WebSocketInfo,
+    data: IncomingMessage,
+    sessionId: string,
+  ): Promise<void> {
+    const session = this.deps.claudeSessions.get(sessionId);
+    if (!session || session.ownerUserId !== wsInfo.userId) {
+      sendToWebSocket(wsInfo.ws, { type: 'runtime_restart_result', sessionId, ok: false, reason: 'not_found' });
+      return;
+    }
+    if (wsInfo.claudeSessionId !== sessionId) {
+      sendToWebSocket(wsInfo.ws, { type: 'runtime_restart_result', sessionId, ok: false, reason: 'not_current' });
+      return;
+    }
+    if (session.projectId) {
+      sendToWebSocket(wsInfo.ws, { type: 'runtime_restart_result', sessionId, ok: false, reason: 'project_managed' });
+      return;
+    }
+    const agentKind = session.agent || session.lastAgent;
+    if (!agentKind || agentKind === 'terminal') {
+      sendToWebSocket(wsInfo.ws, { type: 'runtime_restart_result', sessionId, ok: false, reason: 'not_agent' });
+      return;
+    }
+
+    let environment: UserEnvironment;
+    try {
+      environment = this.deps.resolveAgentEnvironment
+        ? await this.deps.resolveAgentEnvironment(session)
+        : await this.userEnvironment(session.ownerUserId);
+    } catch (error) {
+      console.error(`Could not resolve the environment for agent restart ${sessionId}:`, error);
+      sendToWebSocket(wsInfo.ws, {
+        type: 'runtime_restart_result', sessionId, ok: false,
+        reason: 'environment_unavailable',
+      });
+      return;
+    }
+    const selected = this.deps.resolveAgentLaunch?.(session, environment, agentKind) ?? null;
+    if (!selected) {
+      sendToWebSocket(wsInfo.ws, { type: 'runtime_restart_result', sessionId, ok: false, reason: 'no_managed_update' });
+      return;
+    }
+
+    try {
+      if (session.surface === 'chat') {
+        const result = await this.deps.chatManager?.restartForAgentUpdate?.(sessionId, {
+          automatic: data.automatic === true,
+          allowFreshContext: data.allowFreshContext === true,
+          command: selected.command,
+        }) ?? { ok: false as const, reason: 'not_running' as const };
+        if (!result.ok) {
+          sendToWebSocket(wsInfo.ws, { type: 'runtime_restart_result', sessionId, ok: false, reason: result.reason });
+          return;
+        }
+        const verifiedVersion = await this.deps.probeAgentLaunchVersion?.(
+          environment,
+          agentKind,
+          selected.command,
+        ) ?? null;
+        if (verifiedVersion !== selected.version) {
+          sendToWebSocket(wsInfo.ws, {
+            type: 'runtime_restart_result', sessionId, ok: false,
+            reason: 'version_verification_failed',
+          });
+          return;
+        }
+        session.runningAgentVersion = verifiedVersion;
+        session.runningManagedAgentVersion = verifiedVersion;
+        sendToWebSocket(wsInfo.ws, {
+          type: 'runtime_restart_result', sessionId, ok: true,
+          resumed: result.resumed, version: selected.version,
+        });
+        return;
+      }
+
+      if (data.automatic === true) {
+        sendToWebSocket(wsInfo.ws, { type: 'runtime_restart_result', sessionId, ok: false, reason: 'manual_required' });
+        return;
+      }
+      if (wsInfo.claudeSessionId !== sessionId) {
+        sendToWebSocket(wsInfo.ws, { type: 'runtime_restart_result', sessionId, ok: false, reason: 'not_current' });
+        return;
+      }
+      await this.stopRuntime(sessionId, agentKind);
+      await this.startRuntime(wsId, agentKind, {
+        ...(session.runtimeStartOptions || {}),
+        ...(session.termCols ? { cols: session.termCols } : {}),
+        ...(session.termRows ? { rows: session.termRows } : {}),
+      });
+      if (session.runningAgentVersion !== selected.version) {
+        sendToWebSocket(wsInfo.ws, {
+          type: 'runtime_restart_result', sessionId, ok: false,
+          reason: 'version_verification_failed',
+        });
+        return;
+      }
+      sendToWebSocket(wsInfo.ws, {
+        type: 'runtime_restart_result', sessionId, ok: true,
+        resumed: false, version: selected.version,
+      });
+    } catch (error) {
+      console.error(`Could not restart agent for session ${sessionId}:`, error);
+      sendToWebSocket(wsInfo.ws, {
+        type: 'runtime_restart_result', sessionId, ok: false,
+        reason: 'restart_failed',
+      });
     }
   }
 
@@ -2149,6 +2369,21 @@ export class MessageProcessor {
       : this.deps.claudeSessions.get(wsInfo.claudeSessionId);
     if (!session || session.ownerUserId !== wsInfo.userId) return;
 
+    if (session.persistenceUnavailable) {
+      sendToWebSocket(wsInfo.ws, {
+        type: 'error',
+        message: `This conversation is read-only until workspace migration succeeds: ${session.persistenceUnavailable}`,
+      });
+      return;
+    }
+    if (session.rollbackRecoveryPending) {
+      sendToWebSocket(wsInfo.ws, {
+        type: 'error',
+        message: 'This conversation is retained only to retry an incomplete rollback',
+      });
+      return;
+    }
+
     if (session.retiring) {
       sendToWebSocket(wsInfo.ws, {
         type: 'error',
@@ -2310,6 +2545,12 @@ export class MessageProcessor {
       return;
     }
 
+    const managedLaunch = this.deps.resolveAgentLaunch?.(
+      session,
+      chatEnvironment,
+      agentKind as AgentKind,
+    ) ?? null;
+
     /**
      * Which model this launch actually uses — resolved once, because the record
      * has to be told what it was.
@@ -2387,6 +2628,7 @@ export class MessageProcessor {
       if (startFresh) session.chatPlanMode = false;
       const startWith = async (model: string | undefined) => manager.start(session, {
         runtime: agentKind,
+        command: managedLaunch?.command,
         environment: chatEnvironment,
         workingDir: session.workingDir,
         cwdKind: session.projectWorkingDirKind,
@@ -2482,6 +2724,15 @@ export class MessageProcessor {
       }
 
       session.active = true;
+      const verifiedVersion = await this.deps.probeAgentLaunchVersion?.(
+        chatEnvironment,
+        agentKind as AgentKind,
+        managedLaunch?.command,
+      ) ?? null;
+      session.runningAgentVersion = verifiedVersion;
+      session.runningManagedAgentVersion = managedLaunch && verifiedVersion === managedLaunch.version
+        ? verifiedVersion
+        : null;
       this.persistActive(session, true);
       session.stopRequested = false;
       session.sessionStartTime = session.sessionStartTime || new Date();
@@ -2662,8 +2913,6 @@ export class MessageProcessor {
   private unsubscribeChat(wsInfo: WebSocketInfo, sessionId: string): void {
     wsInfo.chatSessionIds.delete(sessionId);
     this.releaseSubscribedProjectLease(wsInfo.id, sessionId);
-    const session = this.deps.claudeSessions.get(sessionId);
-    if (session?.projectId) this.deps.projectsManager?.touchActivity(session.projectId);
   }
 
   async subscribeChat(wsInfo: WebSocketInfo, sessionId: string): Promise<boolean> {
@@ -2676,6 +2925,7 @@ export class MessageProcessor {
       return false;
     }
     if (session.surface !== 'chat') return false;
+    if (this.rejectUnavailableRead(wsInfo, session)) return false;
 
     const alreadyRetained = wsInfo.chatSessionIds.has(sessionId)
       && (!session.projectId
@@ -2765,9 +3015,8 @@ export class MessageProcessor {
         // What is in the composer, so a screen that has just opened this
         // conversation opens it at the sentence the other screen is in the
         // middle of. Null means nothing has been typed since the server came
-        // up, which is what tells the joining browser it may keep the copy it
-        // has in session storage rather than being cleared by a server that
-        // simply has not heard yet.
+        // up. Composer contents are persisted in the workspace record; the
+        // browser deliberately keeps no fallback in Electron userData.
         draft: draftOf(session),
       });
       return true;
@@ -2805,6 +3054,86 @@ export class MessageProcessor {
   }
 
   /**
+   * Refuse every file-backed read while a row is only legacy import authority.
+   * Chat/history readers normally repair torn derived indexes; permitting that
+   * on `persistenceUnavailable` would make a list, join or page request write
+   * into the installation-global source which migration promised to preserve.
+   */
+  private rejectUnavailableRead(
+    wsInfo: WebSocketInfo,
+    session: SessionRecord,
+  ): boolean {
+    if (session.persistenceUnavailable) {
+      sendToWebSocket(wsInfo.ws, {
+        type: 'error',
+        message: `This session is unavailable until workspace persistence succeeds: ${session.persistenceUnavailable}`,
+      });
+      return true;
+    }
+    if (session.rollbackRecoveryPending) {
+      sendToWebSocket(wsInfo.ws, {
+        type: 'error',
+        message: 'This session is retained only to retry an incomplete rollback',
+      });
+      return true;
+    }
+    return false;
+  }
+
+  /**
+   * Resolve one state-changing chat request and fail closed for a legacy row
+   * whose workspace archive has not completed migration.
+   */
+  private mutableChatSessionFor(
+    wsInfo: WebSocketInfo,
+    sessionId?: string,
+    onBlocked?: (message: string) => void,
+  ): SessionRecord | null {
+    const session = this.chatSessionFor(wsInfo, sessionId);
+    if (!session) return null;
+    if (session.persistenceUnavailable) {
+      const message =
+        `This conversation is read-only until workspace persistence succeeds: ${session.persistenceUnavailable}`;
+      if (onBlocked) onBlocked(message);
+      else sendToWebSocket(wsInfo.ws, { type: 'error', message });
+      return null;
+    }
+    if (session.rollbackRecoveryPending) {
+      const message = 'This conversation is retained only to retry an incomplete rollback';
+      if (onBlocked) onBlocked(message);
+      else sendToWebSocket(wsInfo.ws, { type: 'error', message });
+      return null;
+    }
+    return session;
+  }
+
+  /** Persist a control mutation before exposing it to the live runtime or UI. */
+  private async persistChatMutation(
+    wsInfo: WebSocketInfo,
+    session: SessionRecord,
+    rollback: () => void | Promise<void>,
+    label: string,
+  ): Promise<boolean> {
+    try {
+      if ((await this.deps.saveSessionsToDisk()) !== false) return true;
+    } catch (error) {
+      console.error(`Failed to persist ${label} for session ${session.id}:`, error);
+    }
+    try {
+      await rollback();
+    } catch (error) {
+      console.error(`Failed to roll back ${label} for session ${session.id}:`, error);
+    }
+    sendToWebSocket(wsInfo.ws, {
+      type: 'error',
+      message:
+        `The ${label} could not be saved in this workspace. `
+        + 'Verify the conversation state before taking another action.',
+    });
+    return false;
+  }
+
+  /**
    * Take one screen's composer as the conversation's, and tell the others.
    *
    * Routed through `broadcastChat` rather than `sendToUser`, so it follows the
@@ -2819,14 +3148,30 @@ export class MessageProcessor {
    * as it did before any of this existed; an error toast per keystroke would be
    * a worse answer than a feature that quietly stops applying.
    */
-  private handleChatDraft(wsInfo: WebSocketInfo, data: IncomingMessage): void {
-    const session = this.chatSessionFor(wsInfo, data.sessionId);
+  private async handleChatDraft(wsInfo: WebSocketInfo, data: IncomingMessage): Promise<void> {
+    const session = this.mutableChatSessionFor(wsInfo, data.sessionId);
     if (!session || session.surface !== 'chat') return;
 
     const input = readDraft(data.text, data.attachments, session.id);
     if (!input) return;
 
-    this.broadcastDraft(session, applyDraft(session, input), wsInfo.id);
+    const previous = session.chatDraft;
+    const next = applyDraft(session, input);
+    let saved = false;
+    try {
+      saved = (await this.deps.saveSessionsToDisk()) !== false;
+    } catch (error) {
+      console.error(`Failed to persist draft for session ${session.id}:`, error);
+    }
+    if (!saved) {
+      session.chatDraft = previous;
+      sendToWebSocket(wsInfo.ws, {
+        type: 'error',
+        message: 'The draft could not be saved in this workspace.',
+      });
+      return;
+    }
+    this.broadcastDraft(session, next, wsInfo.id);
   }
 
   /**
@@ -2854,7 +3199,7 @@ export class MessageProcessor {
     data: IncomingMessage,
   ): Promise<void> {
     const manager = this.deps.chatManager;
-    const session = this.chatSessionFor(wsInfo, data.sessionId);
+    const session = this.mutableChatSessionFor(wsInfo, data.sessionId);
     if (!manager || !session) return;
 
     const text = typeof data.text === 'string' ? data.text : '';
@@ -2884,8 +3229,14 @@ export class MessageProcessor {
     if (typedModel) {
       const model = normaliseModelName(typedModel[1]);
       if (model) {
+        const previousModel = session.chatModelOverride;
         session.chatModelOverride = model;
-        await this.deps.saveSessionsToDisk();
+        if (!await this.persistChatMutation(
+          wsInfo,
+          session,
+          () => { session.chatModelOverride = previousModel; },
+          'model choice',
+        )) return;
         manager.rememberModel(session.id, model);
         // And the standing default too, on the same terms the picker records
         // one (#135): the two doors reach the same decision, so they have to
@@ -2921,8 +3272,14 @@ export class MessageProcessor {
           } | null)?.capabilities?.efforts
         : undefined;
       if (effort && ladder?.some((level) => level.value === effort)) {
+        const previousEffort = session.chatEffortOverride;
         session.chatEffortOverride = effort;
-        await this.deps.saveSessionsToDisk();
+        if (!await this.persistChatMutation(
+          wsInfo,
+          session,
+          () => { session.chatEffortOverride = previousEffort; },
+          'effort choice',
+        )) return;
         manager.rememberEffort(session.id, effort);
       }
     }
@@ -2958,7 +3315,12 @@ export class MessageProcessor {
       // take those keystrokes back out.
       if (data.fromComposer === true && (draftOf(session)?.revision ?? 0) === draftAtSend) {
         const cleared = clearDraft(session);
-        if (cleared) this.broadcastDraft(session, cleared, wsInfo.id);
+        if (cleared) {
+          // The accepted turn and its empty composer must become durable in the
+          // same order. A restart must not offer a prompt that already ran.
+          await this.deps.saveSessionsToDisk();
+          this.broadcastDraft(session, cleared, wsInfo.id);
+        }
       }
     } catch (error: unknown) {
       const message = error instanceof Error ? error.message : String(error);
@@ -3046,7 +3408,12 @@ export class MessageProcessor {
     }
 
     const manager = this.deps.chatManager;
-    const session = this.chatSessionFor(wsInfo, requestedSessionId);
+    let persistenceBlocked = false;
+    const session = this.mutableChatSessionFor(wsInfo, requestedSessionId, (message) => {
+      persistenceBlocked = true;
+      reply(false, message, undefined, requestedSessionId);
+    });
+    if (persistenceBlocked) return;
     if (!manager || !session || session.surface !== 'chat') {
       reply(false, 'This conversation is unavailable.');
       return;
@@ -3165,7 +3532,7 @@ export class MessageProcessor {
     data: IncomingMessage,
   ): Promise<void> {
     const manager = this.deps.chatManager;
-    const session = this.chatSessionFor(wsInfo, data.sessionId);
+    const session = this.mutableChatSessionFor(wsInfo, data.sessionId);
     if (!manager || !session) return;
     await manager.interrupt(session.id).catch(() => undefined);
   }
@@ -3190,11 +3557,13 @@ export class MessageProcessor {
     wsInfo: WebSocketInfo,
     data: IncomingMessage,
   ): Promise<void> {
-    const session = this.chatSessionFor(wsInfo, data.sessionId);
+    const session = this.mutableChatSessionFor(wsInfo, data.sessionId);
     if (!session) return;
 
     const raw = typeof data.model === 'string' ? data.model.trim() : '';
     const model = raw ? normaliseModelName(raw) : undefined;
+    const previousModel = session.chatModelOverride;
+    const previousPinned = session.chatModelPinned;
     session.chatModelOverride = model;
     // Clearing drops the pin as well, and that is what makes "Use the default
     // for this runtime" mean what it says: the pin is the model this
@@ -3204,7 +3573,15 @@ export class MessageProcessor {
     // conversation, for the defaults to decide again — the one case where
     // re-reading them is not a retcon.
     if (!model) session.chatModelPinned = undefined;
-    await this.deps.saveSessionsToDisk();
+    if (!await this.persistChatMutation(
+      wsInfo,
+      session,
+      () => {
+        session.chatModelOverride = previousModel;
+        session.chatModelPinned = previousPinned;
+      },
+      'model choice',
+    )) return;
 
     // A live session keeps the options it was launched with so that `/clear`
     // can restart the process in place. The model is the one thing in there
@@ -3348,7 +3725,7 @@ export class MessageProcessor {
     wsInfo: WebSocketInfo,
     data: IncomingMessage,
   ): Promise<void> {
-    const session = this.chatSessionFor(wsInfo, data.sessionId);
+    const session = this.mutableChatSessionFor(wsInfo, data.sessionId);
     if (!session) return;
 
     const requested = data.planMode === true;
@@ -3368,7 +3745,19 @@ export class MessageProcessor {
 
     session.chatPlanMode = result.planMode;
     if (previousPlanMode !== result.planMode) {
-      await this.deps.saveSessionsToDisk();
+      if (!await this.persistChatMutation(
+        wsInfo,
+        session,
+        async () => {
+          try {
+            await this.deps.chatManager?.setPlanMode?.(session.id, previousPlanMode === true);
+          } finally {
+            session.chatPlanMode = previousPlanMode;
+            this.deps.chatManager?.rememberPlanMode?.(session.id, previousPlanMode === true);
+          }
+        },
+        'Plan mode change',
+      )) return;
     }
     this.deps.chatManager?.rememberPlanMode?.(session.id, result.planMode);
 
@@ -3391,7 +3780,7 @@ export class MessageProcessor {
     data: IncomingMessage,
     action: 'accept' | 'reject',
   ): Promise<void> {
-    const session = this.chatSessionFor(wsInfo, data.sessionId);
+    const session = this.mutableChatSessionFor(wsInfo, data.sessionId);
     const manager = this.deps.chatManager;
     if (!session || !manager) return;
     // Accept may turn Plan mode off inside ChatSession before returning. The
@@ -3494,7 +3883,19 @@ export class MessageProcessor {
 
     session.chatPlanMode = result.planMode;
     if (previousPlanMode !== result.planMode) {
-      await this.deps.saveSessionsToDisk();
+      if (!await this.persistChatMutation(
+        wsInfo,
+        session,
+        async () => {
+          try {
+            await manager.setPlanMode?.(session.id, previousPlanMode === true);
+          } finally {
+            session.chatPlanMode = previousPlanMode;
+            manager.rememberPlanMode?.(session.id, previousPlanMode === true);
+          }
+        },
+        'Plan action state',
+      )) return;
     }
 
     broadcastChat(
@@ -3517,7 +3918,7 @@ export class MessageProcessor {
     wsInfo: WebSocketInfo,
     data: IncomingMessage,
   ): Promise<void> {
-    const session = this.chatSessionFor(wsInfo, data.sessionId);
+    const session = this.mutableChatSessionFor(wsInfo, data.sessionId);
     if (!session) return;
 
     const raw = typeof data.effort === 'string' ? data.effort.trim() : '';
@@ -3565,8 +3966,14 @@ export class MessageProcessor {
       return;
     }
 
+    const previousEffort = session.chatEffortOverride;
     session.chatEffortOverride = effort;
-    await this.deps.saveSessionsToDisk();
+    if (!await this.persistChatMutation(
+      wsInfo,
+      session,
+      () => { session.chatEffortOverride = previousEffort; },
+      'effort choice',
+    )) return;
     // The same trap the model has, and the reason `rememberEffort` exists: a
     // `/clear` restarts the process in place from the options it was launched
     // with, so without this it would silently go back to the level the
@@ -3642,7 +4049,7 @@ export class MessageProcessor {
    */
   private handleChatQueueCancel(wsInfo: WebSocketInfo, data: IncomingMessage): void {
     const manager = this.deps.chatManager;
-    const session = this.chatSessionFor(wsInfo, data.sessionId);
+    const session = this.mutableChatSessionFor(wsInfo, data.sessionId);
     if (!manager || !session) return;
 
     const queuedId = typeof data.queuedId === 'string' ? data.queuedId : '';
@@ -3665,7 +4072,7 @@ export class MessageProcessor {
     data: IncomingMessage,
   ): Promise<void> {
     const manager = this.deps.chatManager;
-    const session = this.chatSessionFor(wsInfo, data.sessionId);
+    const session = this.mutableChatSessionFor(wsInfo, data.sessionId);
     if (!manager || !session) return;
 
     const queuedId = typeof data.queuedId === 'string' ? data.queuedId : '';
@@ -3682,7 +4089,7 @@ export class MessageProcessor {
    */
   private handleChatQueueRetry(wsInfo: WebSocketInfo, data: IncomingMessage): void {
     const manager = this.deps.chatManager;
-    const session = this.chatSessionFor(wsInfo, data.sessionId);
+    const session = this.mutableChatSessionFor(wsInfo, data.sessionId);
     if (!manager || !session) return;
 
     const queuedId = typeof data.queuedId === 'string' ? data.queuedId : '';
@@ -3692,7 +4099,7 @@ export class MessageProcessor {
 
   private handleChatPermission(wsInfo: WebSocketInfo, data: IncomingMessage): void {
     const manager = this.deps.chatManager;
-    const session = this.chatSessionFor(wsInfo, data.sessionId);
+    const session = this.mutableChatSessionFor(wsInfo, data.sessionId);
     if (!manager || !session) return;
 
     const requestId = typeof data.requestId === 'string' ? data.requestId : '';
@@ -3728,7 +4135,7 @@ export class MessageProcessor {
     if (submissionId && submissionId.length > MAX_QUESTION_ANSWER_SUBMISSION_ID) return;
 
     const manager = this.deps.chatManager;
-    const session = this.chatSessionFor(wsInfo, data.sessionId);
+    const session = this.mutableChatSessionFor(wsInfo, data.sessionId);
     if (!manager || !session) {
       acknowledge(false);
       return;
@@ -3767,6 +4174,7 @@ export class MessageProcessor {
     const manager = this.deps.chatManager;
     const session = this.chatSessionFor(wsInfo, data.sessionId);
     if (!manager || !session) return;
+    if (this.rejectUnavailableRead(wsInfo, session)) return;
 
     const fromSeq = Math.max(0, Math.floor(Number(data.fromSeq) || 0));
     const count = Math.max(1, Math.floor(Number(data.count) || 200));
@@ -3809,6 +4217,7 @@ export class MessageProcessor {
     const manager = this.deps.chatManager;
     const session = this.chatSessionFor(wsInfo, data.sessionId);
     if (!manager || !session) return;
+    if (this.rejectUnavailableRead(wsInfo, session)) return;
 
     try {
       const index = await manager.turnIndex(session);
@@ -3846,6 +4255,7 @@ export class MessageProcessor {
       });
       return;
     }
+    if (this.rejectUnavailableRead(wsInfo, session)) return;
 
     try {
       const page = await this.deps.historyStore.read(
@@ -3875,7 +4285,7 @@ export class MessageProcessor {
       return existing;
     }
 
-    const ref = { id: session.id, ownerUserId: session.ownerUserId };
+    const ref = session;
     const recorder = new ScrollbackRecorder({
       cols: session.termCols || 80,
       rows: session.termRows || 24,
@@ -3927,7 +4337,7 @@ export class MessageProcessor {
       const screen = recorder.snapshotScreen();
       if (screen.length > 0) {
         this.deps.historyStore.append(
-          { id: session.id, ownerUserId: session.ownerUserId },
+          session,
           screen,
         );
       }

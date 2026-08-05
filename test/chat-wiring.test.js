@@ -25,6 +25,8 @@ function createSessionRecord(params = {}) {
     nativeChatSessionId: params.nativeChatSessionId,
     chatBypassPermissions: params.chatBypassPermissions,
     chatPlanMode: params.chatPlanMode,
+    persistenceUnavailable: params.persistenceUnavailable,
+    rollbackRecoveryPending: params.rollbackRecoveryPending,
     terminalOptions: null,
     stopRequested: false,
     workingDir: params.workingDir || '/tmp/project',
@@ -429,6 +431,59 @@ describe('chat wiring', function () {
   });
 
   describe('start_chat', function () {
+    it('rejects terminal and chat WebSocket starts before either runtime is invoked', async function () {
+      const reason = 'Workspace migration is blocked';
+      const { processor, session, chatManager, sent } = build({
+        persistenceUnavailable: reason,
+        rollbackRecoveryPending: true,
+      });
+      const terminalStarts = [];
+      processor.deps.getRuntimeBridge = () => ({
+        async startSession(...args) {
+          terminalStarts.push(args);
+          return { pid: 1 };
+        },
+      });
+
+      await processor.handleMessage('ws-1', { type: 'start_terminal', options: {} });
+      await processor.handleMessage('ws-1', {
+        type: 'start_chat', agentKind: 'claude', options: {}, sessionId: session.id,
+      });
+
+      assert.strictEqual(terminalStarts.length, 0, 'the PTY bridge must not be reached');
+      assert.strictEqual(chatManager.calls.start.length, 0, 'the chat manager must not be reached');
+      assert.strictEqual(session.active, false);
+      assert.strictEqual(session.surface, undefined);
+      const errors = sent.filter((message) => message.type === 'error');
+      assert.strictEqual(errors.length, 2);
+      assert.ok(errors.every((message) => message.message.includes(reason)));
+    });
+
+    it('rejects terminal and chat starts for a rollback recovery anchor', async function () {
+      const { processor, session, chatManager, sent } = build({
+        rollbackRecoveryPending: true,
+      });
+      const terminalStarts = [];
+      processor.deps.getRuntimeBridge = () => ({
+        async startSession(...args) {
+          terminalStarts.push(args);
+          return { pid: 1 };
+        },
+      });
+
+      await processor.handleMessage('ws-1', { type: 'start_terminal', options: {} });
+      await processor.handleMessage('ws-1', {
+        type: 'start_chat', agentKind: 'claude', options: {}, sessionId: session.id,
+      });
+
+      assert.strictEqual(terminalStarts.length, 0);
+      assert.strictEqual(chatManager.calls.start.length, 0);
+      assert.strictEqual(session.active, false);
+      const errors = sent.filter((message) => message.type === 'error');
+      assert.strictEqual(errors.length, 2);
+      assert.ok(errors.every((message) => /incomplete rollback/.test(message.message)));
+    });
+
     it('launches the runtime through the chat manager, not the PTY bridge', async function () {
       const { processor, session, chatManager, sent } = build();
 
@@ -1335,6 +1390,24 @@ describe('chat wiring', function () {
   });
 
   describe('rejoining', function () {
+    it('does not open file-backed history for unavailable or recovery-only rows', async function () {
+      for (const blocked of [
+        { persistenceUnavailable: 'workspace migration is blocked', message: /migration is blocked/ },
+        { rollbackRecoveryPending: true, message: /incomplete rollback/ },
+      ]) {
+        const { processor, session, chatManager, sent } = build({ surface: 'chat', ...blocked });
+        const previousActivity = session.lastActivity;
+
+        await processor.joinSession('ws-1', session.id);
+
+        assert.strictEqual(lastOfType(sent, 'session_joined'), undefined);
+        assert.strictEqual(lastOfType(sent, 'chat_snapshot'), undefined);
+        assert.strictEqual(chatManager.calls.page.length, 0);
+        assert.strictEqual(session.lastActivity, previousActivity, 'a refused read does not mutate metadata');
+        assert.match(lastOfType(sent, 'error').message, blocked.message);
+      }
+    });
+
     it('hands a chat session its conversation, and says which surface it is', async function () {
       const { processor, sent } = build({ surface: 'chat' });
 
@@ -1538,6 +1611,138 @@ describe('chat wiring', function () {
       await processor.handleMessage('ws-1', { type: 'chat_interrupt' });
       assert.strictEqual(chatManager.calls.send.length, 0);
       assert.strictEqual(chatManager.calls.interrupt.length, 0);
+    });
+  });
+
+  describe('workspace persistence failures', function () {
+    it('rolls back model and effort controls without reporting or applying a false success', async function () {
+      const model = build(
+        { surface: 'chat' },
+        {},
+        { saveSessionsToDisk: async () => false },
+      );
+      model.session.chatModelOverride = 'old-model';
+      model.session.chatModelPinned = 'old-pin';
+
+      await model.processor.handleMessage('ws-1', {
+        type: 'chat_set_model', sessionId: model.session.id, model: 'new-model',
+      });
+
+      assert.strictEqual(model.session.chatModelOverride, 'old-model');
+      assert.strictEqual(model.session.chatModelPinned, 'old-pin');
+      assert.deepStrictEqual(model.chatManager.calls.setModel, []);
+      assert.deepStrictEqual(model.chatManager.calls.rememberModel, []);
+      assert.strictEqual(lastOfType(model.sent, 'chat_model_result'), undefined);
+      assert.match(lastOfType(model.sent, 'error').message, /could not be saved/i);
+
+      const effort = build(
+        { surface: 'chat' },
+        {},
+        { saveSessionsToDisk: async () => false },
+      );
+      effort.session.chatEffortOverride = 'low';
+
+      await effort.processor.handleMessage('ws-1', {
+        type: 'chat_set_effort', sessionId: effort.session.id, effort: 'high',
+      });
+
+      assert.strictEqual(effort.session.chatEffortOverride, 'low');
+      assert.deepStrictEqual(effort.chatManager.calls.setEffort, []);
+      assert.deepStrictEqual(effort.chatManager.calls.rememberEffort, []);
+      assert.strictEqual(lastOfType(effort.sent, 'chat_effort_result'), undefined);
+      assert.match(lastOfType(effort.sent, 'error').message, /could not be saved/i);
+    });
+
+    it('rolls back a live Plan mode change and suppresses its success broadcast', async function () {
+      const modes = [];
+      const { processor, session, sent } = build(
+        { surface: 'chat', chatPlanMode: false },
+        {
+          async setPlanMode(_id, on) {
+            modes.push(on);
+            session.chatPlanMode = on;
+            return { planMode: on, changed: true, detail: `Plan mode ${on ? 'on' : 'off'}.` };
+          },
+        },
+        { saveSessionsToDisk: async () => false },
+      );
+
+      await processor.handleMessage('ws-1', {
+        type: 'chat_set_plan_mode', sessionId: session.id, planMode: true,
+      });
+
+      assert.deepStrictEqual(modes, [true, false], 'the live runtime receives the compensating mode');
+      assert.strictEqual(session.chatPlanMode, false);
+      assert.strictEqual(lastOfType(sent, 'chat_plan_mode'), undefined);
+      assert.match(lastOfType(sent, 'error').message, /could not be saved/i);
+    });
+
+    it('does not forward a typed control whose durable choice was refused', async function () {
+      const { processor, session, chatManager, sent } = build(
+        { surface: 'chat' },
+        {},
+        { saveSessionsToDisk: async () => false },
+      );
+      session.chatModelOverride = 'old-model';
+
+      await processor.handleMessage('ws-1', { type: 'chat_send', text: '/model new-model' });
+
+      assert.strictEqual(session.chatModelOverride, 'old-model');
+      assert.deepStrictEqual(chatManager.calls.send, [], 'the runtime must not change behind an unsaved record');
+      assert.deepStrictEqual(chatManager.calls.rememberModel, []);
+      assert.match(lastOfType(sent, 'error').message, /could not be saved/i);
+    });
+
+    it('centrally gates state changes and file-backed reads for unavailable rows', async function () {
+      const frames = [
+        { type: 'chat_draft', text: 'blocked draft', attachments: [] },
+        { type: 'chat_send', text: 'blocked turn' },
+        { type: 'chat_start_builtin_workflow', requestId: 'blocked-workflow', workflow: 'gh-issue', text: 'blocked workflow' },
+        { type: 'chat_interrupt' },
+        { type: 'chat_set_model', model: 'blocked-model' },
+        { type: 'chat_set_effort', effort: 'high' },
+        { type: 'chat_set_plan_mode', planMode: false },
+        { type: 'chat_accept_plan', revision: 1 },
+        { type: 'chat_reject_plan', revision: 1 },
+        { type: 'chat_queue_cancel', queuedId: 'q1' },
+        { type: 'chat_queue_send_now', queuedId: 'q1' },
+        { type: 'chat_queue_retry', queuedId: 'q1' },
+        { type: 'chat_permission_response', requestId: 'p1', optionId: 'allow_once' },
+        { type: 'chat_question_answer', requestId: 'a1', submissionId: 's1', optionIds: ['yes'] },
+      ];
+      for (const blocked of [
+        { persistenceUnavailable: 'workspace is read-only', message: /read-only/ },
+        { rollbackRecoveryPending: true, message: /incomplete rollback/ },
+      ]) {
+        let saves = 0;
+        const { processor, session, chatManager, sent } = build(
+          { surface: 'chat', chatPlanMode: true, ...blocked },
+          {},
+          { saveSessionsToDisk: async () => { saves += 1; return true; } },
+        );
+        for (const frame of frames) {
+          await processor.handleMessage('ws-1', { ...frame, sessionId: session.id });
+        }
+
+        assert.strictEqual(saves, 0);
+        assert.strictEqual(session.chatDraft, undefined);
+        assert.strictEqual(session.chatModelOverride, undefined);
+        assert.strictEqual(session.chatEffortOverride, undefined);
+        assert.strictEqual(session.chatPlanMode, true);
+        assert.deepStrictEqual(chatManager.calls.send, []);
+        assert.deepStrictEqual(chatManager.calls.interrupt, []);
+        assert.deepStrictEqual(chatManager.calls.cancelQueued, []);
+        assert.deepStrictEqual(chatManager.calls.sendQueuedNow, []);
+        assert.deepStrictEqual(chatManager.calls.permission, []);
+        assert.ok(sent.some((message) => message.type === 'error' && blocked.message.test(message.message)));
+        assert.strictEqual(lastOfType(sent, 'chat_builtin_workflow_result').accepted, false);
+
+        await processor.handleMessage('ws-1', {
+          type: 'chat_history_request', sessionId: session.id, fromSeq: 0, count: 20,
+        });
+        assert.strictEqual(chatManager.calls.page.length, 0, 'history repair is not run against import authority');
+        assert.strictEqual(lastOfType(sent, 'chat_page'), undefined);
+      }
     });
   });
 

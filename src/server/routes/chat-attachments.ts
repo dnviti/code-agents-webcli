@@ -52,12 +52,20 @@ export function attachmentUrl(sessionId: string, storedName: string): string {
   return attachmentUrlFor(sessionId, storedName);
 }
 
+/** Keep opaque attachment bytes out of the installation-wide JSON parser. */
+export function isChatAttachmentUploadRequest(method: string, pathname: string): boolean {
+  return method === 'POST' && /^\/api\/sessions\/[^/]+\/chat-attachments$/.test(pathname);
+}
+
 /** Same reasoning as the paste route's copy: SameSite=Lax is site-, not origin-scoped. */
 function isSameOrigin(req: Request): boolean {
   const origin = req.headers.origin;
+  const host = req.headers.host;
   if (!origin) return true;
+  if (!host) return false;
   try {
-    return new URL(origin).host === req.headers.host;
+    const parsed = new URL(origin);
+    return parsed.protocol === `${req.protocol}:` && parsed.host === host;
   } catch {
     return false;
   }
@@ -80,6 +88,22 @@ function sessionFor(
     res.status(404).json({ error: 'Session not found' });
     return null;
   }
+  if (session.persistenceUnavailable) {
+    res.status(409).json({
+      error: 'session_persistence_unavailable',
+      message: session.persistenceUnavailable,
+      retryable: true,
+    });
+    return null;
+  }
+  if (session.rollbackRecoveryPending) {
+    res.status(409).json({
+      error: 'session_recovery_pending',
+      message: 'This session is retained only to retry an incomplete rollback',
+      retryable: true,
+    });
+    return null;
+  }
 
   // A project cwd can be a container path (`/tmp`, `/etc`, ...), whose string
   // may also name an unrelated host path. Never pass it through host path
@@ -92,7 +116,11 @@ function sessionFor(
     return Object.assign(session, { validatedDir: session.workingDir });
   }
 
-  const validation = deps.validatePath(session.workingDir, session.ownerUserId);
+  // Scoped sessions keep their attachments at the immutable workspace root,
+  // even when the live runtime has moved into a subdirectory. Validate the
+  // path that will actually be opened rather than the mutable cwd.
+  const attachmentRoot = session.storageScope?.workspaceRoot ?? session.workingDir;
+  const validation = deps.validatePath(attachmentRoot, session.ownerUserId);
   if (!validation.valid || !validation.path) {
     res.status(403).json({ error: 'session_outside_base' });
     return null;
@@ -120,6 +148,9 @@ function attachmentSessionRef(
     workingDir: session.validatedDir,
     projectId: session.projectId,
     projectWorkingDirKind: session.projectWorkingDirKind,
+    storageScope: session.storageScope
+      ? { ...session.storageScope, workspaceRoot: session.validatedDir }
+      : undefined,
   };
 }
 
@@ -128,16 +159,22 @@ export function createChatAttachmentRoutes(deps: ChatAttachmentRoutesDeps): Rout
 
   router.post(
     '/api/sessions/:sessionId/chat-attachments',
-    // Route-scoped so the app-wide express.json() 100 kB default stays put.
-    express.raw({ type: () => true, limit: ATTACHMENT_MAX_BYTES }),
-    async (req: Request, res: Response): Promise<void> => {
+    // Authenticate, authorise the session/path, and reject a foreign origin
+    // before body-parser is allowed to allocate up to 20 MiB for this request.
+    (req: Request, res: Response, next: NextFunction): void => {
       const session = sessionFor(deps, req, res);
       if (!session) return;
-
       if (!isSameOrigin(req)) {
         res.status(403).json({ error: 'cross_origin' });
         return;
       }
+      res.locals.attachmentSession = session;
+      next();
+    },
+    // Route-scoped so the app-wide express.json() 100 kB default stays put.
+    express.raw({ type: () => true, limit: ATTACHMENT_MAX_BYTES }),
+    async (req: Request, res: Response): Promise<void> => {
+      const session = res.locals.attachmentSession as SessionRecord & { validatedDir: string };
 
       const filename = typeof req.query.name === 'string' ? req.query.name : 'attachment';
       const declaredMime = String(req.headers['content-type'] || '');
@@ -170,6 +207,9 @@ export function createChatAttachmentRoutes(deps: ChatAttachmentRoutesDeps): Rout
             return;
           case 'QUOTA_EXCEEDED':
             res.status(507).json({ error: 'quota_exceeded' });
+            return;
+          case 'SESSION_DELETED':
+            res.status(409).json({ error: 'session_deleted' });
             return;
           case 'UNSUPPORTED_ATTACHMENT_NAMESPACE':
             res.status(409).json({ error: 'unsupported_attachment_namespace' });
@@ -215,9 +255,12 @@ export function createChatAttachmentRoutes(deps: ChatAttachmentRoutesDeps): Rout
           'Content-Disposition',
           `${serve.inline ? 'inline' : 'attachment'}; filename="${serve.filename.replace(/["\\]/g, '')}"`,
         );
-        // Private: this is one user's file behind a cookie, and a shared cache
-        // holding it would be the one place the ownership check does not run.
-        res.setHeader('Cache-Control', 'private, max-age=3600');
+        // The workspace is the sole durable home for attachment bytes. A
+        // cacheable response would let Chromium/Electron duplicate them under
+        // its installation-level userData profile, outside `.cc-web` and
+        // outside this route's owner check. Browser and desktop clients may
+        // still render/download the stream, but must not persist it implicitly.
+        res.setHeader('Cache-Control', 'no-store');
 
         stream.on('error', () => {
           if (!res.headersSent) res.status(500).json({ error: 'read_failed' });

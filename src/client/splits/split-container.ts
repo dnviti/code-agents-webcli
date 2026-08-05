@@ -476,12 +476,10 @@ export class SplitContainer {
 
   private saveState(): void {
     try {
-      const state = {
-        enabled: this.enabled,
-        dividerPosition: this.dividerPosition,
-        activeSplitIndex: this.activeSplitIndex,
-        sessions: this.splits.map((s) => s.sessionId),
-      };
+      // Divider placement is a device preference. Session assignments, enabled
+      // state and focus are session metadata and belong to workspace storage,
+      // never Electron's Chromium profile.
+      const state = { dividerPosition: this.dividerPosition };
       localStorage.setItem('cc-web-splits', JSON.stringify(state));
     } catch (error) {
       console.error('Failed to save split state:', error);
@@ -493,7 +491,16 @@ export class SplitContainer {
       const saved = localStorage.getItem('cc-web-splits');
       if (!saved) return;
       const state = JSON.parse(saved);
-      if (state.dividerPosition) this.dividerPosition = state.dividerPosition;
+      if (Number.isFinite(state?.dividerPosition)) {
+        this.dividerPosition = state.dividerPosition;
+        // Strip session ids written by older builds as soon as this renderer
+        // sees the preference, even if the user never moves the divider.
+        localStorage.setItem('cc-web-splits', JSON.stringify({
+          dividerPosition: this.dividerPosition,
+        }));
+      } else {
+        localStorage.removeItem('cc-web-splits');
+      }
     } catch (error) {
       console.error('Failed to restore split state:', error);
     }

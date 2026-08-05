@@ -1,6 +1,9 @@
 /** The project-shaped container: a durable owner home plus a disposable workspace. */
 
+import { constants as fsConstants } from 'node:fs';
+import type { BigIntStats } from 'node:fs';
 import fsp from 'node:fs/promises';
+import type { FileHandle } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { ContainerEnvironment, EnvironmentManager, HostEnvironment, LOGIN_LABEL, MANAGED_LABEL, TIER_LABEL, USER_ID_LABEL } from '../environments/manager.js';
@@ -10,10 +13,26 @@ import { PROJECT_LABEL, projectContainerName, TARGET_LABEL, targetLabelValue } f
 import { EnvironmentOwner, Mount, UserEnvironment, WrappedProcessControl } from '../environments/types.js';
 import { Project } from './store.js';
 import { repoBaseName } from './clone.js';
+import type { WorkspaceStorageIdentity } from '../workspace-session-storage.js';
 
 export const PROJECT_WORKSPACE = '/workspace';
 export const PROJECT_OVERLAY = '/opt/code-agents-project';
 export const FORGE_SCRATCH = '/run/code-agents-forge';
+const WORKSPACE_SESSION_STORAGE = '.cc-web';
+
+interface PinnedWorkspaceDirectory {
+  directory: string;
+  handle: FileHandle | null;
+  dev: bigint;
+  ino: bigint;
+  descriptorPath: string | null;
+}
+
+export type WorkspaceSessionStorageIdentity = WorkspaceStorageIdentity;
+
+interface StagedWorkspaceSessionStorage extends WorkspaceSessionStorageIdentity {
+  readonly path: string;
+}
 
 /** Portable app-owned root used by host-local projects. */
 export function localProjectWorkspaceRoot(homeDir = os.homedir(), pathApi: Pick<typeof path, 'join'> = path): string {
@@ -124,12 +143,19 @@ export class ProjectContainerStateUnknownError extends Error {
   }
 }
 
+/** Workspace history could not be moved without risking traversal or loss. */
+export class ProjectWorkspaceSessionStorageError extends Error {}
+
 export type ProjectCheckoutState = 'valid' | 'empty_or_absent' | 'unsafe';
 
 export class ProjectEnvironmentManager {
   constructor(
     private readonly environments: EnvironmentManager,
     private readonly localWorkspaceRoot = localProjectWorkspaceRoot(),
+    /** Linux can address an opened directory without resolving its mutable name again. */
+    private readonly descriptorDirectory: string | null = process.platform === 'linux' ? '/proc/self/fd' : null,
+    /** Test seam for the path-only fallback used where directory handles are unavailable. */
+    private readonly allowDirectoryHandles = process.platform !== 'win32',
   ) {}
 
   worktreePath(project: Project, _owner: EnvironmentOwner): string {
@@ -182,7 +208,1027 @@ export class ProjectEnvironmentManager {
 
   /** Integration calls this only after the owner-scoped project row is deleted. */
   async removeOverlay(project: Project): Promise<void> {
-    await fsp.rm(this.overlayPath(project), { recursive: true, force: true });
+    await this.removePinnedOwnedDirectory(
+      this.overlayPath(project),
+      project.id,
+      'project overlay',
+    );
+  }
+
+  /** Durable project root: checkout replacement never owns this directory. */
+  workspaceSessionStoragePath(project: Project, owner: EnvironmentOwner): string {
+    return path.join(this.worktreePath(project, owner), WORKSPACE_SESSION_STORAGE);
+  }
+
+  /**
+   * Crash-recovery slot outside the bind-mounted project root.
+   *
+   * A container can rename any child below `/workspace`, so merely keeping an
+   * open handle to `<workspace>/.cc-web` does not stop it exchanging that name
+   * with the checkout immediately before a recursive delete.  The parent of
+   * the project root is not mounted into the project container; moving the
+   * exact pinned archive here removes it from that mutation namespace for the
+   * complete destructive operation.  The deterministic name also lets the
+   * next process restore an archive after a crash between stage and restore.
+   */
+  private workspaceSessionStorageStagingPath(project: Project, owner: EnvironmentOwner): string {
+    const root = this.worktreePath(project, owner);
+    if (
+      !project.id
+      || project.id === '.'
+      || project.id === '..'
+      || path.basename(project.id) !== project.id
+      || path.basename(root) !== project.id
+    ) {
+      throw new ProjectWorkspaceSessionStorageError('refusing unsafe workspace session staging path');
+    }
+    return path.join(path.dirname(root), `.${project.id}.ccweb-session-storage-retained`);
+  }
+
+  /** Durable authority survives both a failed stage and a process crash. */
+  private workspaceSessionStorageIntentPaths(
+    project: Project,
+    owner: EnvironmentOwner,
+  ): { intent: string; pending: string } {
+    const staging = this.workspaceSessionStorageStagingPath(project, owner);
+    const prefix = staging.slice(0, -'retained'.length);
+    const intent = `${prefix}intent`;
+    return { intent, pending: `${intent}.pending` };
+  }
+
+  private parseWorkspaceSessionStorageIntent(
+    raw: string,
+    label: string,
+  ): WorkspaceSessionStorageIdentity {
+    if (Buffer.byteLength(raw) > 512) {
+      throw new ProjectWorkspaceSessionStorageError(`${label} is too large`);
+    }
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      throw new ProjectWorkspaceSessionStorageError(`${label} is corrupt`);
+    }
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      throw new ProjectWorkspaceSessionStorageError(`${label} is corrupt`);
+    }
+    const record = parsed as Record<string, unknown>;
+    if (
+      record.version !== 1
+      || typeof record.dev !== 'string'
+      || typeof record.ino !== 'string'
+      || !/^\d{1,32}$/.test(record.dev)
+      || !/^[1-9]\d{0,31}$/.test(record.ino)
+      || Object.keys(record).some((key) => !['version', 'dev', 'ino'].includes(key))
+    ) {
+      throw new ProjectWorkspaceSessionStorageError(`${label} is corrupt`);
+    }
+    return { dev: BigInt(record.dev), ino: BigInt(record.ino) };
+  }
+
+  private async readWorkspaceSessionStorageIntentFile(
+    target: string,
+    label: string,
+  ): Promise<WorkspaceSessionStorageIdentity | null> {
+    const before = await this.lstatOrNull(target);
+    if (!before) return null;
+    if (before.isSymbolicLink() || !before.isFile() || before.nlink !== 1 || before.size > 512) {
+      throw new ProjectWorkspaceSessionStorageError(`${label} is not a private regular file`);
+    }
+    const flags = fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW || 0);
+    let handle: FileHandle;
+    try {
+      handle = await fsp.open(target, flags);
+    } catch (error) {
+      throw new ProjectWorkspaceSessionStorageError(`could not open ${label}: ${(error as Error).message}`);
+    }
+    try {
+      const opened = await handle.stat();
+      if (
+        !opened.isFile()
+        || opened.nlink !== 1
+        || opened.dev !== before.dev
+        || opened.ino !== before.ino
+        || opened.size > 512
+      ) {
+        throw new ProjectWorkspaceSessionStorageError(`${label} changed while it was opened`);
+      }
+      const raw = await handle.readFile({ encoding: 'utf8' });
+      const [after, openedAfter] = await Promise.all([this.lstatOrNull(target), handle.stat()]);
+      if (
+        !after
+        || after.isSymbolicLink()
+        || !after.isFile()
+        || after.nlink !== 1
+        || after.dev !== openedAfter.dev
+        || after.ino !== openedAfter.ino
+        || openedAfter.dev !== opened.dev
+        || openedAfter.ino !== opened.ino
+      ) {
+        throw new ProjectWorkspaceSessionStorageError(`${label} changed while it was read`);
+      }
+      return this.parseWorkspaceSessionStorageIntent(raw, label);
+    } finally {
+      await handle.close();
+    }
+  }
+
+  private async readWorkspaceSessionStorageIntent(
+    project: Project,
+    owner: EnvironmentOwner,
+  ): Promise<WorkspaceSessionStorageIdentity | null> {
+    const parent = await this.pinDirectory(
+      path.dirname(this.worktreePath(project, owner)),
+      'project workspace parent',
+    );
+    if (!parent) return null;
+    try {
+      const paths = this.workspaceSessionStorageIntentPaths(project, owner);
+      const intentPath = await this.pinnedChildPath(parent, path.basename(paths.intent), 'project workspace parent');
+      const pendingPath = await this.pinnedChildPath(parent, path.basename(paths.pending), 'project workspace parent');
+      const [intent, pending] = await Promise.all([
+        this.readWorkspaceSessionStorageIntentFile(intentPath, 'workspace session storage intent'),
+        this.readWorkspaceSessionStorageIntentFile(pendingPath, 'pending workspace session storage intent'),
+      ]);
+      if (intent && pending && !this.storageIdentityMatches(intent, pending)) {
+        throw new ProjectWorkspaceSessionStorageError('workspace session storage intent generations disagree');
+      }
+      await this.assertPinnedNamespace(parent, 'project workspace parent');
+      return intent || pending;
+    } finally {
+      await parent.handle?.close();
+    }
+  }
+
+  /**
+   * Persist authority obtained from the live SQLite directory lease before the
+   * composition root closes that lease. Both the final and pending names are
+   * recognised during recovery, so a crash on either side of rename fails
+   * closed instead of accepting a same-name replacement.
+   */
+  async recordWorkspaceSessionStorageIntent(
+    project: Project,
+    owner: EnvironmentOwner,
+    expected: WorkspaceSessionStorageIdentity,
+  ): Promise<void> {
+    const parent = await this.pinDirectory(
+      path.dirname(this.worktreePath(project, owner)),
+      'project workspace parent',
+    );
+    if (!parent) {
+      throw new ProjectWorkspaceSessionStorageError(
+        'project workspace parent disappeared before session storage intent could be recorded',
+      );
+    }
+    let pendingHandle: FileHandle | null = null;
+    try {
+      const paths = this.workspaceSessionStorageIntentPaths(project, owner);
+      const intentPath = await this.pinnedChildPath(parent, path.basename(paths.intent), 'project workspace parent');
+      const pendingPath = await this.pinnedChildPath(parent, path.basename(paths.pending), 'project workspace parent');
+      const [intent, pending] = await Promise.all([
+        this.readWorkspaceSessionStorageIntentFile(intentPath, 'workspace session storage intent'),
+        this.readWorkspaceSessionStorageIntentFile(pendingPath, 'pending workspace session storage intent'),
+      ]);
+      for (const existing of [intent, pending]) {
+        if (existing && !this.storageIdentityMatches(expected, existing)) {
+          throw new ProjectWorkspaceSessionStorageError(
+            'workspace session storage intent belongs to another inode',
+          );
+        }
+      }
+      if (!intent && !pending) {
+        const flags = fsConstants.O_WRONLY
+          | fsConstants.O_CREAT
+          | fsConstants.O_EXCL
+          | (fsConstants.O_NOFOLLOW || 0);
+        pendingHandle = await fsp.open(pendingPath, flags, 0o600);
+        const payload = `${JSON.stringify({
+          version: 1,
+          dev: String(expected.dev),
+          ino: String(expected.ino),
+        })}\n`;
+        await pendingHandle.writeFile(payload, { encoding: 'utf8' });
+        await pendingHandle.chmod(0o600);
+        await pendingHandle.sync();
+        const written = await pendingHandle.stat();
+        if (!written.isFile() || written.nlink !== 1 || written.size !== Buffer.byteLength(payload)) {
+          throw new ProjectWorkspaceSessionStorageError(
+            'pending workspace session storage intent was not written safely',
+          );
+        }
+        await pendingHandle.close();
+        pendingHandle = null;
+      }
+      if (!intent) {
+        if (await this.lstatOrNull(intentPath)) {
+          throw new ProjectWorkspaceSessionStorageError(
+            'workspace session storage intent name became occupied',
+          );
+        }
+        await this.assertPinnedNamespace(parent, 'project workspace parent');
+        await fsp.rename(pendingPath, intentPath);
+      }
+      await this.syncPinnedDirectory(parent, 'project workspace parent');
+      const durable = await this.readWorkspaceSessionStorageIntentFile(
+        intentPath,
+        'workspace session storage intent',
+      );
+      if (!durable || !this.storageIdentityMatches(expected, durable)) {
+        throw new ProjectWorkspaceSessionStorageError(
+          'workspace session storage intent did not become durable',
+        );
+      }
+    } catch (error) {
+      if (error instanceof ProjectWorkspaceSessionStorageError) throw error;
+      throw new ProjectWorkspaceSessionStorageError(
+        `could not record workspace session storage intent: ${(error as Error).message}`,
+      );
+    } finally {
+      await pendingHandle?.close();
+      await parent.handle?.close();
+    }
+
+    const visible = await this.workspaceSessionStorageIdentity(project, owner);
+    if (!visible || !this.storageIdentityMatches(expected, visible)) {
+      throw new ProjectWorkspaceSessionStorageError(
+        'workspace session storage changed before its durable intent was verified',
+      );
+    }
+  }
+
+  private async clearWorkspaceSessionStorageIntent(
+    project: Project,
+    owner: EnvironmentOwner,
+    expected: WorkspaceSessionStorageIdentity,
+  ): Promise<void> {
+    const parent = await this.pinDirectory(
+      path.dirname(this.worktreePath(project, owner)),
+      'project workspace parent',
+    );
+    if (!parent) {
+      throw new ProjectWorkspaceSessionStorageError(
+        'project workspace parent disappeared before session storage intent could be cleared',
+      );
+    }
+    try {
+      const paths = this.workspaceSessionStorageIntentPaths(project, owner);
+      for (const [target, label] of [
+        [paths.intent, 'workspace session storage intent'],
+        [paths.pending, 'pending workspace session storage intent'],
+      ] as const) {
+        const anchored = await this.pinnedChildPath(parent, path.basename(target), 'project workspace parent');
+        const identity = await this.readWorkspaceSessionStorageIntentFile(anchored, label);
+        if (!identity) continue;
+        if (!this.storageIdentityMatches(expected, identity)) {
+          throw new ProjectWorkspaceSessionStorageError(`${label} belongs to another inode`);
+        }
+        await fsp.unlink(anchored);
+      }
+      await this.syncPinnedDirectory(parent, 'project workspace parent');
+    } finally {
+      await parent.handle?.close();
+    }
+  }
+
+  /**
+   * Capture the exact archive inode before integration suspends its open stores.
+   * Lifecycle replacement must carry this authority through staging and reopen;
+   * a later safe-looking directory at the same name is not equivalent.
+   */
+  async workspaceSessionStorageIdentity(
+    project: Project,
+    owner: EnvironmentOwner,
+  ): Promise<WorkspaceSessionStorageIdentity | null> {
+    const root = this.worktreePath(project, owner);
+    const pinned = await this.pinDirectory(root, 'project workspace');
+    if (!pinned) return null;
+    let storage: PinnedWorkspaceDirectory | null = null;
+    try {
+      storage = await this.pinWorkspaceSessionStorage(pinned);
+      await this.assertPinnedNamespace(pinned, 'project workspace');
+      if (storage) await this.assertPinnedNamespace(storage, 'workspace session storage');
+      if (!storage) return null;
+      const identity = storage.handle
+        ? await storage.handle.stat({ bigint: true })
+        : await fsp.lstat(storage.directory, { bigint: true });
+      return { dev: identity.dev, ino: identity.ino };
+    } finally {
+      await storage?.handle?.close();
+      await pinned.handle?.close();
+    }
+  }
+
+  /** Validate the in-place archive before any rebuild operation. */
+  async preserveWorkspaceSessionStorage(project: Project, owner: EnvironmentOwner): Promise<boolean> {
+    return (await this.workspaceSessionStorageIdentity(project, owner)) !== null;
+  }
+
+  /** Restore a crash-staged archive, then revalidate its canonical namespace. */
+  async restoreWorkspaceSessionStorage(
+    project: Project,
+    owner: EnvironmentOwner,
+    expected?: WorkspaceSessionStorageIdentity,
+  ): Promise<boolean> {
+    const intent = await this.readWorkspaceSessionStorageIntent(project, owner);
+    if (intent && expected && !this.storageIdentityMatches(expected, intent)) {
+      throw new ProjectWorkspaceSessionStorageError(
+        'workspace session storage intent does not match the requested inode',
+      );
+    }
+    const authority = intent || expected;
+    await this.restoreStagedWorkspaceSessionStorage(project, owner, authority);
+    const restored = await this.workspaceSessionStorageIdentity(project, owner);
+    if (authority && (!restored || !this.storageIdentityMatches(authority, restored))) {
+      throw new ProjectWorkspaceSessionStorageError(
+        'workspace session storage is not the pre-suspension inode',
+      );
+    }
+    return restored !== null;
+  }
+
+  /** Authority remains durable until integration has reopened the exact inode. */
+  async workspaceSessionStorageRecoveryIdentity(
+    project: Project,
+    owner: EnvironmentOwner,
+  ): Promise<WorkspaceSessionStorageIdentity | null> {
+    return this.readWorkspaceSessionStorageIntent(project, owner);
+  }
+
+  /** Retire the crash intent only after the reopened database lease agrees. */
+  async completeWorkspaceSessionStorageRestore(
+    project: Project,
+    owner: EnvironmentOwner,
+    reopened: WorkspaceSessionStorageIdentity,
+  ): Promise<void> {
+    const intent = await this.readWorkspaceSessionStorageIntent(project, owner);
+    if (!intent) return;
+    if (!this.storageIdentityMatches(intent, reopened)) {
+      throw new ProjectWorkspaceSessionStorageError(
+        'reopened workspace database does not hold the retained archive inode',
+      );
+    }
+    const canonical = await this.workspaceSessionStorageIdentity(project, owner);
+    if (!canonical || !this.storageIdentityMatches(intent, canonical)) {
+      throw new ProjectWorkspaceSessionStorageError(
+        'workspace session storage changed before restore completion',
+      );
+    }
+    await this.clearWorkspaceSessionStorageIntent(project, owner, intent);
+    const durable = await this.workspaceSessionStorageIdentity(project, owner);
+    if (!durable || !this.storageIdentityMatches(intent, durable)) {
+      await this.recordWorkspaceSessionStorageIntent(project, owner, intent).catch(() => undefined);
+      throw new ProjectWorkspaceSessionStorageError(
+        'workspace session storage changed while its restore intent was retired',
+      );
+    }
+  }
+
+  /** Read-only boot probe used when container reconciliation is disabled. */
+  async hasStagedWorkspaceSessionStorage(project: Project, owner: EnvironmentOwner): Promise<boolean> {
+    if (await this.readWorkspaceSessionStorageIntent(project, owner)) return true;
+    const staged = await this.pinDirectory(
+      this.workspaceSessionStorageStagingPath(project, owner),
+      'staged workspace session storage',
+    );
+    if (!staged) return false;
+    try {
+      await this.assertPinnedNamespace(staged, 'staged workspace session storage');
+      return true;
+    } finally {
+      await staged.handle?.close();
+    }
+  }
+
+  /** Remove rebuildable project bytes while leaving `<project>/.cc-web` in place. */
+  async clearWorkspaceForRebuild(
+    project: Project,
+    owner: EnvironmentOwner,
+    requireSessionStorage = false,
+    expected?: WorkspaceSessionStorageIdentity,
+  ): Promise<void> {
+    await this.withStagedWorkspaceSessionStorage(
+      project,
+      owner,
+      requireSessionStorage,
+      'project rebuild',
+      async () => {
+        const root = this.worktreePath(project, owner);
+        const pinned = await this.pinDirectory(root, 'project workspace');
+        if (!pinned) return;
+        try {
+          const entries = await this.readdirPinned(pinned, 'project workspace');
+          for (const entry of entries) {
+            // A writer can recreate this name while the real archive is staged.
+            // Never delete it: restoration will reject the conflict and keep the
+            // authoritative staged inode outside the disposable namespace.
+            if (entry === WORKSPACE_SESSION_STORAGE) continue;
+            await this.removePinnedChild(pinned, entry, 'project workspace');
+          }
+          await this.assertPinnedNamespace(pinned, 'project workspace');
+        } finally {
+          await pinned.handle?.close();
+        }
+      },
+      expected,
+    );
+  }
+
+  /** Explicit project deletion is the only lifecycle operation that removes the archive. */
+  async removeWorkspace(project: Project, owner: EnvironmentOwner): Promise<void> {
+    await this.removePinnedOwnedDirectory(
+      this.worktreePath(project, owner),
+      project.id,
+      'project workspace',
+    );
+  }
+
+  private async removePinnedOwnedDirectory(
+    root: string,
+    expectedBaseName: string,
+    label: string,
+  ): Promise<void> {
+    const parent = path.dirname(root);
+    if (path.basename(root) !== expectedBaseName || path.resolve(root) === path.resolve(parent)) {
+      throw new ProjectWorkspaceSessionStorageError(`refusing unsafe ${label} removal`);
+    }
+    const pinnedParent = await this.pinDirectory(parent, `${label} parent`);
+    if (!pinnedParent) return;
+    try {
+      const anchoredRoot = path.join(
+        await this.pinnedRootPath(pinnedParent, `${label} parent`),
+        expectedBaseName,
+      );
+      const pinnedRoot = await this.pinDirectory(anchoredRoot, label);
+      if (!pinnedRoot) return;
+      try {
+        // Explicit project deletion owns every child (including `.cc-web` in
+        // a workspace). Overlay removal reaches this path only after its
+        // owner-scoped project row has been deleted.
+        // Delete those children through the already-opened root, never by
+        // recursively resolving the mutable public directory name.
+        for (const entry of await this.readdirPinned(pinnedRoot, label)) {
+          await this.removePinnedChild(pinnedRoot, entry, label);
+        }
+        await this.assertPinnedNamespace(pinnedRoot, label);
+
+        const removalTarget = await this.pinnedChildPath(
+          pinnedParent,
+          expectedBaseName,
+          `${label} parent`,
+        );
+        await this.assertPathMatchesPinned(removalTarget, pinnedRoot, label);
+        // Never recurse at the final mutable name. If it is replaced after
+        // the identity check, a non-empty foreign directory makes rmdir fail
+        // without deleting any of its children.
+        await fsp.rmdir(removalTarget);
+        await this.assertPinnedNamespace(pinnedParent, `${label} parent`);
+      } finally {
+        await pinnedRoot.handle?.close();
+      }
+    } finally {
+      await pinnedParent.handle?.close();
+    }
+  }
+
+  private async assertSafeTree(root: string, label: string): Promise<void> {
+    const stat = await fsp.lstat(root);
+    if (stat.isSymbolicLink() || !stat.isDirectory()) {
+      throw new ProjectWorkspaceSessionStorageError(`${label} must be a real directory`);
+    }
+    const entries = await fsp.readdir(root, { withFileTypes: true });
+    for (const entry of entries) {
+      const child = path.join(root, entry.name);
+      const childStat = await fsp.lstat(child);
+      if (childStat.isSymbolicLink()) {
+        throw new ProjectWorkspaceSessionStorageError(`${label} contains a symbolic link`);
+      }
+      if (childStat.isDirectory()) {
+        await this.assertSafeTree(child, label);
+      } else if (!childStat.isFile()) {
+        throw new ProjectWorkspaceSessionStorageError(`${label} contains an unsupported filesystem entry`);
+      }
+    }
+  }
+
+  /**
+   * Open and identify a directory before a destructive lifecycle operation.
+   * The before/open/after identity checks also cover platforms without
+   * O_NOFOLLOW, where opening a symlink would otherwise follow it.
+   */
+  private async pinDirectory(directory: string, label: string): Promise<PinnedWorkspaceDirectory | null> {
+    let before;
+    try {
+      before = await fsp.lstat(directory, { bigint: true });
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+      throw new ProjectWorkspaceSessionStorageError(`could not inspect ${label}: ${(error as Error).message}`);
+    }
+    if (before.isSymbolicLink() || !before.isDirectory()) {
+      throw new ProjectWorkspaceSessionStorageError(`${label} must be a real directory`);
+    }
+    const canOpenWithoutFollowing = this.allowDirectoryHandles
+      && typeof fsConstants.O_DIRECTORY === 'number'
+      && typeof fsConstants.O_NOFOLLOW === 'number'
+      && fsConstants.O_NOFOLLOW !== 0;
+    // Platforms without safe directory FileHandle support use namespace
+    // identity revalidation. POSIX platforms still open the directory even
+    // when they lack `/proc/self/fd`, so metadata changes can use fchmod.
+    if (!canOpenWithoutFollowing) {
+      let after;
+      try {
+        after = await fsp.lstat(directory, { bigint: true });
+      } catch (error) {
+        throw new ProjectWorkspaceSessionStorageError(`could not verify ${label}: ${(error as Error).message}`);
+      }
+      if (
+        after.isSymbolicLink()
+        || !after.isDirectory()
+        || after.dev !== before.dev
+        || after.ino !== before.ino
+      ) {
+        throw new ProjectWorkspaceSessionStorageError(`${label} changed while it was being pinned`);
+      }
+      return {
+        directory,
+        handle: null,
+        dev: before.dev,
+        ino: before.ino,
+        descriptorPath: null,
+      };
+    }
+    const flags = fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW;
+    let handle: FileHandle;
+    try {
+      handle = await fsp.open(directory, flags);
+    } catch (error) {
+      throw new ProjectWorkspaceSessionStorageError(`could not pin ${label}: ${(error as Error).message}`);
+    }
+    try {
+      const [opened, after] = await Promise.all([
+        handle.stat({ bigint: true }),
+        fsp.lstat(directory, { bigint: true }),
+      ]);
+      if (
+        !opened.isDirectory()
+        || after.isSymbolicLink()
+        || !after.isDirectory()
+        || opened.dev !== before.dev
+        || opened.ino !== before.ino
+        || after.dev !== opened.dev
+        || after.ino !== opened.ino
+      ) {
+        throw new ProjectWorkspaceSessionStorageError(`${label} changed while it was being pinned`);
+      }
+      let descriptorPath: string | null = null;
+      if (this.descriptorDirectory) {
+        const candidate = path.join(this.descriptorDirectory, String(handle.fd));
+        try {
+          const descriptorStat = await fsp.stat(candidate, { bigint: true });
+          if (descriptorStat.isDirectory() && descriptorStat.dev === opened.dev && descriptorStat.ino === opened.ino) {
+            descriptorPath = candidate;
+          }
+        } catch {
+          // Portable fallback below revalidates the public path before each operation.
+        }
+      }
+      return {
+        directory,
+        handle,
+        dev: opened.dev,
+        ino: opened.ino,
+        descriptorPath,
+      };
+    } catch (error) {
+      await handle.close();
+      if (error instanceof ProjectWorkspaceSessionStorageError) throw error;
+      throw new ProjectWorkspaceSessionStorageError(`could not verify ${label}: ${(error as Error).message}`);
+    }
+  }
+
+  private async assertPinnedHandle(pinned: PinnedWorkspaceDirectory, label: string): Promise<void> {
+    if (!pinned.handle) return;
+    const opened = await pinned.handle.stat({ bigint: true });
+    if (!opened.isDirectory() || opened.dev !== pinned.dev || opened.ino !== pinned.ino) {
+      throw new ProjectWorkspaceSessionStorageError(`${label} changed after it was pinned`);
+    }
+  }
+
+  private async assertPinnedNamespace(pinned: PinnedWorkspaceDirectory, label: string): Promise<void> {
+    await this.assertPinnedHandle(pinned, label);
+    await this.assertPathMatchesPinned(pinned.directory, pinned, label);
+  }
+
+  private pinnedIdentityMatches(
+    pinned: { dev: bigint; ino: bigint },
+    candidate: { dev: bigint; ino: bigint; isDirectory(): boolean },
+  ): boolean {
+    return candidate.isDirectory()
+      && candidate.dev === pinned.dev
+      && candidate.ino === pinned.ino;
+  }
+
+  private storageIdentityMatches(
+    expected: WorkspaceSessionStorageIdentity,
+    candidate: { dev: bigint; ino: bigint },
+  ): boolean {
+    return candidate.dev === expected.dev && candidate.ino === expected.ino;
+  }
+
+  private async lstatOrNull(target: string): Promise<Awaited<ReturnType<typeof fsp.lstat>> | null> {
+    try {
+      return await fsp.lstat(target);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+      throw error;
+    }
+  }
+
+  private async lstatIdentityOrNull(target: string): Promise<BigIntStats | null> {
+    try {
+      return await fsp.lstat(target, { bigint: true });
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+      throw error;
+    }
+  }
+
+  /** Make a directory-entry mutation durable while retaining its inode binding. */
+  private async syncPinnedDirectory(
+    pinned: PinnedWorkspaceDirectory,
+    label: string,
+  ): Promise<void> {
+    await this.assertPinnedNamespace(pinned, label);
+    if (pinned.handle) {
+      try {
+        await pinned.handle.sync();
+      } catch (error) {
+        throw new ProjectWorkspaceSessionStorageError(
+          `could not make ${label} durable: ${(error as Error).message}`,
+        );
+      }
+    } else if (process.platform !== 'win32') {
+      // A POSIX path-only backend cannot make a directory rename durable while
+      // proving which inode it synced.  Refuse the destructive operation rather
+      // than claiming crash safety from a re-opened mutable pathname.
+      throw new ProjectWorkspaceSessionStorageError(
+        `${label} cannot be synchronised through a pinned directory handle`,
+      );
+    }
+    // Windows directory handles are not exposed by this backend; its rename is
+    // nevertheless protected by the platform's live-handle sharing semantics.
+    await this.assertPinnedNamespace(pinned, label);
+  }
+
+  /**
+   * Restore the deterministic crash slot without overwriting a canonical
+   * archive.  When `expected` is supplied, this process must recover the exact
+   * inode it staged before allowing the lifecycle operation to settle.
+   */
+  private async restoreStagedWorkspaceSessionStorage(
+    project: Project,
+    owner: EnvironmentOwner,
+    expected?: WorkspaceSessionStorageIdentity,
+  ): Promise<void> {
+    const rootPath = this.worktreePath(project, owner);
+    const parentPath = path.dirname(rootPath);
+    const stagingPath = this.workspaceSessionStorageStagingPath(project, owner);
+    const parent = await this.pinDirectory(parentPath, 'project workspace parent');
+    if (!parent) {
+      if (expected) {
+        throw new ProjectWorkspaceSessionStorageError(
+          'project workspace parent disappeared before session storage could be restored',
+        );
+      }
+      return;
+    }
+    let root: PinnedWorkspaceDirectory | null = null;
+    let staged: PinnedWorkspaceDirectory | null = null;
+    try {
+      const stagingAccess = await this.pinnedChildPath(
+        parent,
+        path.basename(stagingPath),
+        'project workspace parent',
+      );
+      const visibleStaging = await this.lstatOrNull(stagingAccess);
+      if (!visibleStaging) {
+        if (expected) {
+          const canonical = await this.lstatIdentityOrNull(
+            path.join(rootPath, WORKSPACE_SESSION_STORAGE),
+          );
+          if (!canonical || !this.pinnedIdentityMatches(expected, canonical)) {
+            throw new ProjectWorkspaceSessionStorageError(
+              'staged workspace session storage disappeared before restoration',
+            );
+          }
+        }
+        return;
+      }
+      if (visibleStaging.isSymbolicLink() || !visibleStaging.isDirectory()) {
+        throw new ProjectWorkspaceSessionStorageError(
+          'workspace session staging slot is not a real directory',
+        );
+      }
+      staged = await this.pinDirectory(stagingAccess, 'staged workspace session storage');
+      if (!staged) {
+        throw new ProjectWorkspaceSessionStorageError(
+          'workspace session staging slot disappeared while it was opened',
+        );
+      }
+      if (expected && !this.storageIdentityMatches(expected, staged)) {
+        throw new ProjectWorkspaceSessionStorageError(
+          'workspace session staging slot changed during project replacement',
+        );
+      }
+      await this.assertSafeTree(staged.directory, 'staged workspace session storage');
+
+      root = await this.pinDirectory(rootPath, 'project workspace');
+      if (!root) {
+        throw new ProjectWorkspaceSessionStorageError(
+          'project workspace disappeared before session storage could be restored',
+        );
+      }
+      const target = await this.pinnedChildPath(
+        root,
+        WORKSPACE_SESSION_STORAGE,
+        'project workspace',
+      );
+      if (await this.lstatOrNull(target)) {
+        throw new ProjectWorkspaceSessionStorageError(
+          'workspace session storage name was occupied before restoration',
+        );
+      }
+
+      await this.assertPinnedNamespace(parent, 'project workspace parent');
+      await this.assertPinnedNamespace(root, 'project workspace');
+      await this.assertPinnedNamespace(staged, 'staged workspace session storage');
+      await fsp.rename(staged.directory, target);
+
+      const restored = await this.lstatIdentityOrNull(target);
+      if (!restored || !this.pinnedIdentityMatches(staged, restored)) {
+        throw new ProjectWorkspaceSessionStorageError(
+          'restored workspace session storage is not the staged inode',
+        );
+      }
+      if (await this.lstatOrNull(stagingAccess)) {
+        throw new ProjectWorkspaceSessionStorageError(
+          'workspace session staging name remained after restoration',
+        );
+      }
+      await this.syncPinnedDirectory(root, 'project workspace');
+      await this.syncPinnedDirectory(parent, 'project workspace parent');
+      const durable = await this.lstatIdentityOrNull(target);
+      if (!durable || !this.pinnedIdentityMatches(staged, durable)) {
+        throw new ProjectWorkspaceSessionStorageError(
+          'workspace session storage changed while restoration became durable',
+        );
+      }
+    } finally {
+      await staged?.handle?.close();
+      await root?.handle?.close();
+      await parent.handle?.close();
+    }
+  }
+
+  /** Move the exact admitted archive outside the container-writable root. */
+  private async stageWorkspaceSessionStorage(
+    project: Project,
+    owner: EnvironmentOwner,
+    expected?: WorkspaceSessionStorageIdentity,
+  ): Promise<StagedWorkspaceSessionStorage | null> {
+    const intent = await this.readWorkspaceSessionStorageIntent(project, owner);
+    if (intent && expected && !this.storageIdentityMatches(expected, intent)) {
+      throw new ProjectWorkspaceSessionStorageError(
+        'workspace session storage intent does not match the requested inode',
+      );
+    }
+    const authority = intent || expected;
+    // Complete a prior crash recovery before creating a new staging generation.
+    await this.restoreStagedWorkspaceSessionStorage(project, owner, authority);
+
+    const rootPath = this.worktreePath(project, owner);
+    const parentPath = path.dirname(rootPath);
+    const stagingPath = this.workspaceSessionStorageStagingPath(project, owner);
+    const parent = await this.pinDirectory(parentPath, 'project workspace parent');
+    const root = await this.pinDirectory(rootPath, 'project workspace');
+    if (!root) {
+      await parent?.handle?.close();
+      return null;
+    }
+    if (!parent) {
+      await root.handle?.close();
+      throw new ProjectWorkspaceSessionStorageError(
+        'project workspace parent disappeared before session storage could be staged',
+      );
+    }
+    let storage: PinnedWorkspaceDirectory | null = null;
+    let staged: StagedWorkspaceSessionStorage | null = null;
+    try {
+      storage = await this.pinWorkspaceSessionStorage(root);
+      if (!storage) {
+        if (authority) {
+          throw new ProjectWorkspaceSessionStorageError(
+            'workspace session storage intent has no matching canonical archive',
+          );
+        }
+        return null;
+      }
+      if (authority && !this.storageIdentityMatches(authority, storage)) {
+        throw new ProjectWorkspaceSessionStorageError(
+          'workspace session storage changed after its pre-suspension identity was captured',
+        );
+      }
+      const stagingAccess = await this.pinnedChildPath(
+        parent,
+        path.basename(stagingPath),
+        'project workspace parent',
+      );
+      if (await this.lstatOrNull(stagingAccess)) {
+        throw new ProjectWorkspaceSessionStorageError(
+          'workspace session staging slot is already occupied',
+        );
+      }
+      await this.assertPinnedNamespace(parent, 'project workspace parent');
+      await this.assertPinnedNamespace(root, 'project workspace');
+      await this.assertPinnedNamespace(storage, 'workspace session storage');
+      const admittedIdentity = storage.handle
+        ? await storage.handle.stat({ bigint: true })
+        : await fsp.lstat(storage.directory, { bigint: true });
+      await fsp.rename(storage.directory, stagingAccess);
+      staged = { path: stagingPath, dev: admittedIdentity.dev, ino: admittedIdentity.ino };
+
+      const visibleStaging = await this.lstatIdentityOrNull(stagingAccess);
+      if (!visibleStaging || !this.pinnedIdentityMatches(storage, visibleStaging)) {
+        throw new ProjectWorkspaceSessionStorageError(
+          'workspace session staging slot did not receive the pinned archive',
+        );
+      }
+      if (await this.lstatOrNull(storage.directory)) {
+        throw new ProjectWorkspaceSessionStorageError(
+          'workspace session storage name was recreated during staging',
+        );
+      }
+      await this.syncPinnedDirectory(root, 'project workspace');
+      await this.syncPinnedDirectory(parent, 'project workspace parent');
+      const durable = await this.lstatIdentityOrNull(stagingAccess);
+      if (!durable || !this.pinnedIdentityMatches(storage, durable)) {
+        throw new ProjectWorkspaceSessionStorageError(
+          'workspace session staging slot changed while the move became durable',
+        );
+      }
+      return staged;
+    } catch (error) {
+      if (staged) {
+        try {
+          await this.restoreStagedWorkspaceSessionStorage(project, owner, staged);
+        } catch (restoreError) {
+          throw new ProjectWorkspaceSessionStorageError(
+            `workspace session storage staging failed and could not be restored: ${(error as Error).message}; ${(restoreError as Error).message}`,
+          );
+        }
+      }
+      throw error;
+    } finally {
+      await storage?.handle?.close();
+      await root.handle?.close();
+      await parent.handle?.close();
+    }
+  }
+
+  /** Run one destructive operation only while the archive is out of reach. */
+  private async withStagedWorkspaceSessionStorage(
+    project: Project,
+    owner: EnvironmentOwner,
+    required: boolean,
+    operationLabel: string,
+    operation: () => Promise<void>,
+    expected?: WorkspaceSessionStorageIdentity,
+  ): Promise<void> {
+    const staged = await this.stageWorkspaceSessionStorage(project, owner, expected);
+    if (required && !staged) {
+      throw new ProjectWorkspaceSessionStorageError(
+        `workspace session storage disappeared before ${operationLabel}`,
+      );
+    }
+    let operationError: unknown;
+    try {
+      await operation();
+    } catch (error) {
+      operationError = error;
+    }
+
+    let restoreError: unknown;
+    if (staged) {
+      try {
+        await this.restoreStagedWorkspaceSessionStorage(project, owner, staged);
+      } catch (error) {
+        restoreError = error;
+      }
+    }
+    if (restoreError) {
+      throw new ProjectWorkspaceSessionStorageError(
+        `${operationLabel} did not restore workspace session storage${operationError ? ` after ${(operationError as Error).message}` : ''}: ${(restoreError as Error).message}`,
+      );
+    }
+    if (operationError) throw operationError;
+  }
+
+  private async assertPathMatchesPinned(
+    target: string,
+    pinned: PinnedWorkspaceDirectory,
+    label: string,
+  ): Promise<void> {
+    let current;
+    try {
+      current = await fsp.lstat(target, { bigint: true });
+    } catch (error) {
+      throw new ProjectWorkspaceSessionStorageError(`${label} changed during lifecycle cleanup: ${(error as Error).message}`);
+    }
+    if (
+      current.isSymbolicLink()
+      || !current.isDirectory()
+      || current.dev !== pinned.dev
+      || current.ino !== pinned.ino
+    ) {
+      throw new ProjectWorkspaceSessionStorageError(`${label} changed during lifecycle cleanup`);
+    }
+  }
+
+  private async pinnedRootPath(pinned: PinnedWorkspaceDirectory, label: string): Promise<string> {
+    if (pinned.descriptorPath) {
+      await this.assertPinnedHandle(pinned, label);
+      return pinned.descriptorPath;
+    }
+    // This check deliberately sits immediately before every portable path
+    // operation. A namespace swap observed between two entries aborts before
+    // another recursive removal can be issued.
+    await this.assertPinnedNamespace(pinned, label);
+    return pinned.directory;
+  }
+
+  private async pinnedChildPath(
+    pinned: PinnedWorkspaceDirectory,
+    child: string,
+    label: string,
+  ): Promise<string> {
+    if (!child || child === '.' || child === '..' || path.basename(child) !== child) {
+      throw new ProjectWorkspaceSessionStorageError(`refusing unsafe child of ${label}`);
+    }
+    return path.join(await this.pinnedRootPath(pinned, label), child);
+  }
+
+  private async readdirPinned(pinned: PinnedWorkspaceDirectory, label: string): Promise<string[]> {
+    return fsp.readdir(await this.pinnedRootPath(pinned, label));
+  }
+
+  private async removePinnedChild(
+    pinned: PinnedWorkspaceDirectory,
+    child: string,
+    label: string,
+  ): Promise<void> {
+    const target = await this.pinnedChildPath(pinned, child, label);
+    await fsp.rm(target, { recursive: true, force: true });
+  }
+
+  private async pinWorkspaceSessionStorage(
+    pinnedWorkspace: PinnedWorkspaceDirectory,
+  ): Promise<PinnedWorkspaceDirectory | null> {
+    const storagePath = await this.pinnedChildPath(
+      pinnedWorkspace,
+      WORKSPACE_SESSION_STORAGE,
+      'project workspace',
+    );
+    const storage = await this.pinDirectory(storagePath, 'workspace session storage');
+    if (!storage) return null;
+    try {
+      await this.assertPinnedNamespace(storage, 'workspace session storage');
+      // `storage.directory` is already rooted through the pinned workspace on
+      // Linux. Unlike `/proc/self/fd/<storage-fd>` itself, its final component
+      // is the real directory rather than a procfs magic symlink, so the tree
+      // validator can keep rejecting ordinary symbolic links.
+      await this.assertSafeTree(storage.directory, 'workspace session storage');
+      await this.chmodPinnedDirectory(storage, 0o700, 'workspace session storage');
+      return storage;
+    } catch (error) {
+      await storage.handle?.close();
+      throw error;
+    }
+  }
+
+  private async chmodPinnedDirectory(
+    pinned: PinnedWorkspaceDirectory,
+    mode: number,
+    label: string,
+  ): Promise<void> {
+    await this.assertPinnedNamespace(pinned, label);
+    if (pinned.handle) {
+      await pinned.handle.chmod(mode);
+    } else {
+      await fsp.chmod(pinned.directory, mode);
+    }
+    // The FileHandle keeps chmod bound to the admitted inode. The portable
+    // path-only fallback cannot bind the syscall, so its post-check makes any
+    // observed namespace swap fail closed instead of being accepted.
+    await this.assertPinnedNamespace(pinned, label);
   }
 
   /**
@@ -262,14 +1308,42 @@ export class ProjectEnvironmentManager {
     }
   }
 
-  async clearCheckout(project: Project, owner: EnvironmentOwner): Promise<void> {
+  async clearCheckout(
+    project: Project,
+    owner: EnvironmentOwner,
+    requireSessionStorage = false,
+    expected?: WorkspaceSessionStorageIdentity,
+  ): Promise<void> {
     if (!project.repoUrl) return;
     const checkout = this.checkoutPath(project, owner);
     const root = this.worktreePath(project, owner);
-    if (!path.resolve(checkout).startsWith(`${path.resolve(root)}${path.sep}`)) {
+    const relativeCheckout = path.relative(path.resolve(root), path.resolve(checkout));
+    if (
+      !relativeCheckout
+      || path.isAbsolute(relativeCheckout)
+      || relativeCheckout === '..'
+      || relativeCheckout.startsWith(`..${path.sep}`)
+    ) {
       throw new Error('refusing unsafe partial checkout removal');
     }
-    await fsp.rm(checkout, { recursive: true, force: true });
+    await this.withStagedWorkspaceSessionStorage(
+      project,
+      owner,
+      requireSessionStorage,
+      'checkout replacement',
+      async () => {
+        const pinned = await this.pinDirectory(root, 'project workspace');
+        if (!pinned) return;
+        try {
+          const target = await this.pinnedChildPath(pinned, relativeCheckout, 'project workspace');
+          await fsp.rm(target, { recursive: true, force: true });
+          await this.assertPinnedNamespace(pinned, 'project workspace');
+        } finally {
+          await pinned.handle?.close();
+        }
+      },
+      expected,
+    );
   }
 
   async ensure(project: Project, owner: EnvironmentOwner): Promise<ProjectEnvironmentResult> {

@@ -2,6 +2,15 @@ appId: io.github.dnviti.code-agents-webcli
 productName: Code Agents Web CLI
 copyright: Copyright © Daniele Viti
 
+# Desktop clients accept update manifests only from this immutable project
+# location.  The Electron main process deliberately never accepts a feed URL
+# from the renderer or user preferences.
+publish:
+  provider: github
+  owner: dnviti
+  repo: code-agents-webcli
+  releaseType: release
+
 directories:
   output: release
   buildResources: assets
@@ -28,7 +37,18 @@ asarUnpack:
   # ASAR so AppImage's temporary SquashFS mount never has to stream a nested
   # archive entry (which Electron reports as a false ENOENT on some hosts).
   - dist/public/**/*
+# Release Linux jobs materialize the protected Flatpak repository public key in
+# this existing build directory. The filtered resource is absent from ordinary
+# native builds and mandatory/verified for the Flatpak release build.
+extraResources:
+  - from: build
+    to: .
+    filter:
+      - flatpak-update-public-key.asc
 npmRebuild: false
+# A tagged release must be signed.  Local development builds can still be
+# unpacked with `desktop:pack`; release CI supplies the platform identities.
+forceCodeSigning: true
 
 artifactName: Code-Agents-Web-CLI-${version}-${os}-${arch}.${ext}
 
@@ -44,6 +64,9 @@ linux:
 
 appImage:
   category: Development
+  # electron-builder renders the generic Linux arch macro as `x86_64` for
+  # AppImage, while this project's established public asset contract is `x64`.
+  artifactName: Code-Agents-Web-CLI-${version}-linux-x64.${ext}
   # electron-builder otherwise writes `--no-sandbox` into the desktop entry.
   # The app refuses unsandboxed packaged starts, so keep normal launcher starts
   # on Chromium's OS sandbox instead of silently weakening the renderer.
@@ -65,6 +88,9 @@ flatpak:
     - --device=dri
     - --filesystem=home
     - --talk-name=org.freedesktop.Notifications
+    # The updater uses the narrow Flatpak portal interface; it does not gain
+    # unrestricted host D-Bus or shell access.
+    - --talk-name=org.freedesktop.portal.Flatpak
 
 win:
   icon: icon.svg
@@ -83,10 +109,18 @@ nsis:
 mac:
   icon: icon.svg
   category: public.app-category.developer-tools
-  identity: null
-  hardenedRuntime: false
+  hardenedRuntime: true
+  entitlements: build/entitlements.mac.plist
+  entitlementsInherit: build/entitlements.mac.plist
+  gatekeeperAssess: false
   target:
     - dmg
+    # electron-updater uses a signed ZIP, while people continue to receive a
+    # DMG.  Release CI bakes an architecture-specific channel into each build
+    # so two native jobs cannot publish a conflicting latest-mac.yml.
+    - zip
+
+afterSign: scripts/notarize.js
 
 dmg:
   title: Code Agents Web CLI ${version}

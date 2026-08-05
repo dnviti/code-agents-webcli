@@ -305,6 +305,9 @@ function renderMessage(message: ChatMessage): string {
       case 'image':
         parts.push(`(image: ${block.alt || 'attached'})`);
         break;
+      case 'attachment':
+        parts.push(`(attached file: ${block.name})`);
+        break;
       case 'error':
         parts.push(`(error: ${block.text.trim()})`);
         break;

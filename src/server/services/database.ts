@@ -6,6 +6,17 @@ import { AuthenticatedUser } from '../types.js';
 
 export interface DatabaseOptions {
   dataDir?: string | null;
+  /**
+   * Compatibility mode for callers which still use installation-global
+   * session data directly. Production opens these tables as import-only and
+   * normalises derived values only after copying them into a workspace.
+   */
+  legacySessionBackfills?: boolean;
+}
+
+/** Resolve once so the interprocess lease and SQLite always name one root. */
+export function resolveAppDataDir(dataDir?: string | null): string {
+  return dataDir ? path.resolve(dataDir) : path.join(os.homedir(), '.code-agents-webcli');
 }
 
 export interface GitHubUserProfile {
@@ -37,16 +48,14 @@ export class AppDatabase {
   private isEligibleInstaller: ((githubId: string) => boolean) | null = null;
 
   constructor(options: DatabaseOptions = {}) {
-    this.storageDir = options.dataDir
-      ? path.resolve(options.dataDir)
-      : path.join(os.homedir(), '.code-agents-webcli');
+    this.storageDir = resolveAppDataDir(options.dataDir);
     this.dbPath = path.join(this.storageDir, 'app.sqlite');
 
     this.initializeStorage();
     this.db = openDatabase(this.dbPath);
     this.hardenDatabaseFile();
     this.configureDatabase();
-    this.runMigrations();
+    this.runMigrations(options.legacySessionBackfills !== false);
   }
 
   close(): void {
@@ -319,7 +328,7 @@ export class AppDatabase {
     this.db.pragma('synchronous = NORMAL');
   }
 
-  private runMigrations(): void {
+  private runMigrations(legacySessionBackfills: boolean): void {
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS app_settings (
         key TEXT PRIMARY KEY,
@@ -772,6 +781,14 @@ export class AppDatabase {
     // INTEGER is sufficient: positions are compact ordinals, not timestamps.
     this.addColumnIfMissing('runtime_sessions', 'tab_order', 'INTEGER');
 
+    // A branch rollback keeps this row as durable cleanup authority until all
+    // workspace artifacts have been removed and the final row deletion saves.
+    this.addColumnIfMissing(
+      'runtime_sessions',
+      'rollback_recovery_pending',
+      'INTEGER NOT NULL DEFAULT 0',
+    );
+
     // Which project — which working folder, by name — a recorded job ran in.
     // Nullable and null-by-default, and the null is load-bearing: work filed
     // before this column existed ran somewhere nobody wrote down, and the
@@ -787,10 +804,12 @@ export class AppDatabase {
     // below rather than left ambiguous: every project recorded up to that point
     // could only have been observed.
     this.addColumnIfMissing('usage_jobs', 'project_source', 'TEXT');
-    this.db.exec(`
-      UPDATE usage_jobs SET project_source = 'observed'
-        WHERE project IS NOT NULL AND project_source IS NULL;
-    `);
+    if (legacySessionBackfills) {
+      this.db.exec(`
+        UPDATE usage_jobs SET project_source = 'observed'
+          WHERE project IS NOT NULL AND project_source IS NULL;
+      `);
+    }
 
     // How many round trips to the model a turn took, where the runtime says.
     //
@@ -831,22 +850,24 @@ export class AppDatabase {
     // Idempotent, and safe to run on every boot: the WHERE clause excludes
     // every row it has already written, and a row where the runtime reported
     // nothing at all has nothing to add up and is left as the null it is.
-    this.db.exec(`
-      UPDATE usage_jobs
-         SET total_tokens = COALESCE(input_tokens, 0)
-                          + COALESCE(output_tokens, 0)
-                          + COALESCE(cache_read_tokens, 0)
-                          + COALESCE(cache_write_tokens, 0)
-       WHERE total_tokens IS NULL
-         AND (input_tokens IS NOT NULL
-           OR output_tokens IS NOT NULL
-           OR cache_read_tokens IS NOT NULL
-           OR cache_write_tokens IS NOT NULL);
+    if (legacySessionBackfills) {
+      this.db.exec(`
+        UPDATE usage_jobs
+           SET total_tokens = COALESCE(input_tokens, 0)
+                            + COALESCE(output_tokens, 0)
+                            + COALESCE(cache_read_tokens, 0)
+                            + COALESCE(cache_write_tokens, 0)
+         WHERE total_tokens IS NULL
+           AND (input_tokens IS NOT NULL
+             OR output_tokens IS NOT NULL
+             OR cache_read_tokens IS NOT NULL
+             OR cache_write_tokens IS NOT NULL);
 
-      UPDATE usage_jobs
-         SET total_tokens = reasoning_tokens
-       WHERE total_tokens IS NULL AND reasoning_tokens IS NOT NULL;
-    `);
+        UPDATE usage_jobs
+           SET total_tokens = reasoning_tokens
+         WHERE total_tokens IS NULL AND reasoning_tokens IS NOT NULL;
+      `);
+    }
   }
 
   /**

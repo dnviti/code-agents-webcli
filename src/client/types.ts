@@ -161,6 +161,8 @@ export interface SessionListItem {
   id: string;
   name: string;
   active: boolean;
+  agent?: AgentKind | null;
+  lastAgent?: AgentKind | null;
   workingDir: string;
   connectedClients: number;
   created: string;
@@ -177,11 +179,22 @@ export interface SessionListItem {
    * is the same direction every other unknown in this rule takes.
    */
   bypassPermissions?: boolean;
+  /** Read-only legacy session whose workspace migration can be retried later. */
+  persistenceUnavailable?: string;
+  /** Hidden rollback anchor; only definitive deletion is permitted. */
+  rollbackRecoveryPending?: boolean;
   /** Project identity, when this session was opened from a project workspace. */
   projectId?: string | null;
   projectName?: string | null;
   /** Namespace of workingDir for a project session; absent means host. */
   projectWorkingDirKind?: 'host' | 'container';
+  /** Present only in the installed desktop's combined multi-server list. */
+  serverId?: string;
+  serverName?: string;
+  serverStatus?: string;
+  serverInsecure?: boolean;
+  offline?: boolean;
+  lastActivity?: string | number;
 }
 
 export interface FolderData {
@@ -201,6 +214,8 @@ export interface FolderData {
 export interface WsConnectedMessage {
   type: 'connected';
   connectionId: string;
+  /** Added by the installed desktop controller's multiplexing gateway. */
+  serverId?: string;
   /**
    * Optional protocol extensions this server understands.
    *
@@ -464,6 +479,23 @@ export interface WsPongMessage {
   type: 'pong';
 }
 
+/** Desktop-controller lifecycle signal; never emitted by an ordinary server. */
+export interface WsControllerServerStatusMessage {
+  type: 'controller_server_status';
+  serverId: string;
+  serverName: string;
+  status: 'connected' | 'offline';
+  insecure?: boolean;
+  message?: string;
+  lastSuccessfulContact?: string | number;
+}
+
+export interface WsControllerErrorMessage {
+  type: 'controller_error';
+  serverId?: string;
+  message: string;
+}
+
 export interface WsUsageUpdateMessage {
   type: 'usage_update';
   sessionStats: unknown;
@@ -488,6 +520,8 @@ import type { UpdateStatus } from '../shared/update';
 export interface WsUpdateStatusMessage {
   type: 'update_status';
   status: UpdateStatus;
+  /** Added by the installed desktop gateway; absent in an ordinary browser. */
+  serverId?: string;
 }
 
 /** Installer's sockets only: npm output carries host paths. */
@@ -495,6 +529,8 @@ export interface WsUpdateOutputMessage {
   type: 'update_output';
   stream: 'stdout' | 'stderr';
   data: string;
+  /** Added by the installed desktop gateway; absent in an ordinary browser. */
+  serverId?: string;
 }
 
 export interface WsUpdateDoneMessage {
@@ -504,11 +540,27 @@ export interface WsUpdateDoneMessage {
   restarting: boolean;
   restartRequired: boolean;
   message: string;
+  /** Added by the installed desktop gateway; absent in an ordinary browser. */
+  serverId?: string;
 }
 
 /** Broadcast: a restart ends every user's agent sessions, not just the installer's. */
 export interface WsUpdateRestartingMessage {
   type: 'update_restarting';
+  /** Added by the installed desktop gateway; absent in an ordinary browser. */
+  serverId?: string;
+}
+
+/** Result of replacing one opened session's agent with its selected managed copy. */
+export interface WsRuntimeRestartResultMessage {
+  type: 'runtime_restart_result';
+  sessionId: string;
+  ok: boolean;
+  reason?: string;
+  resumed?: boolean;
+  version?: string | null;
+  /** Added by the installed desktop gateway; absent in an ordinary browser. */
+  serverId?: string;
 }
 
 /**
@@ -571,6 +623,7 @@ export type WsMessage =
   | WsUpdateOutputMessage
   | WsUpdateDoneMessage
   | WsUpdateRestartingMessage
+  | WsRuntimeRestartResultMessage
   | WsEnvironmentTierChangedMessage
   | WsProjectUpdatedMessage
   | WsProjectRemovedMessage
@@ -580,4 +633,6 @@ export type WsMessage =
   | WsChatQuestionAnswerAckMessage
   | WsChatDraftMessage
   | WsChatPageMessage
-  | WsChatPageFailedMessage;
+  | WsChatPageFailedMessage
+  | WsControllerServerStatusMessage
+  | WsControllerErrorMessage;

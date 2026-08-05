@@ -156,6 +156,8 @@ export interface WrapOptions {
   cwdKind?: 'host' | 'container';
   /** Variables the program should see. In container mode these become `-e` flags. */
   env?: Record<string, string>;
+  /** False for publisher checks/installers that must not inherit server secrets. */
+  inheritHostEnv?: boolean;
   /** Whether the wrapped process needs a TTY (`exec -t`). PTY spawns do; pipes do not. */
   tty?: boolean;
   /**
@@ -174,6 +176,8 @@ export interface WrapOptions {
  */
 export interface UserEnvironment {
   readonly kind: 'host' | 'container';
+  /** Immutable engine identity. Required for container-scoped maintenance. */
+  readonly identity?: string;
   /** Container name, or null on the host. */
   readonly name: string | null;
   /** The user's workspace root, on the host filesystem. */

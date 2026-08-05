@@ -3,6 +3,7 @@
 import type { ITerminalOptions } from '@xterm/xterm';
 import type { App } from '../app';
 import { shellStore } from '../shell/store';
+import { getControllerSnapshot } from '../controller/transport';
 import { setThemeMode } from '../shell/theme';
 import type {
   AppSettings,
@@ -351,27 +352,33 @@ export function saveSettings(app: App, next: AppSettings): void {
  * failed switch-off would be the app promising prompts it is not going to give.
  */
 async function saveApprovalPreference(app: App, value: boolean): Promise<void> {
+  const controller = getControllerSnapshot();
+  const owner = controller.enabled ? controller.selectedServerId : null;
   try {
     const response = await app.authFetch('/api/preferences', {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ preferences: { chatBypassPermissions: value } }),
-    });
+    }, owner);
     if (!response.ok) throw new Error(`the server answered ${response.status}`);
     const data = await response.json();
-    shellStore.setState({
-      chatBypassPermissions: data?.preferences?.chatBypassPermissions === true,
-    });
+    if (!controller.enabled || getControllerSnapshot().selectedServerId === owner) {
+      shellStore.setState({
+        chatBypassPermissions: data?.preferences?.chatBypassPermissions === true,
+      });
+    }
   } catch (error) {
     console.error('Failed to save the approval preference:', error);
-    shellStore.setState({ chatBypassPermissions: await readApprovalPreference(app) });
+    if (!controller.enabled || getControllerSnapshot().selectedServerId === owner) {
+      shellStore.setState({ chatBypassPermissions: await readApprovalPreference(app, owner) });
+    }
   }
 }
 
 /** What the server holds, or `false` if it cannot be asked. */
-async function readApprovalPreference(app: App): Promise<boolean> {
+async function readApprovalPreference(app: App, serverId?: string | null): Promise<boolean> {
   try {
-    const response = await app.authFetch('/api/preferences');
+    const response = await app.authFetch('/api/preferences', {}, serverId);
     if (!response.ok) return false;
     const data = await response.json();
     return data?.preferences?.chatBypassPermissions === true;

@@ -7,8 +7,30 @@ const path = require('path');
 
 const { ChatStore } = require('../dist/server/chat/store.js');
 const { ChatSession } = require('../dist/server/chat/session.js');
-const { createSessionRoutes } = require('../dist/server/routes/sessions.js');
+const {
+  createSessionRoutes,
+  retireProjectSessions,
+} = require('../dist/server/routes/sessions.js');
 const { MessageProcessor } = require('../dist/server/websocket/messages.js');
+const {
+  AttachmentStore,
+  storedAttachmentNameFromUrl,
+} = require('../dist/server/services/attachment-store.js');
+const { ProjectAwareAttachmentStore } = require('../dist/server/services/project-attachment-store.js');
+const { SessionStore } = require('../dist/server/services/session-store.js');
+const { SessionTeardownRegistry } = require('../dist/server/services/session-teardown.js');
+
+const PNG = Buffer.from(
+  'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==',
+  'base64',
+);
+
+function archiveTrustForTest() {
+  return {
+    seal: (value) => `test:${Buffer.from(value).toString('base64url')}`,
+    open: (envelope) => Buffer.from(String(envelope).replace(/^test:/, ''), 'base64url').toString(),
+  };
+}
 
 // Issue #34 asked for copy-a-turn and branch-from-a-turn together. Copy
 // shipped; branch was announced in the changelog and never built — the hooks
@@ -171,13 +193,50 @@ describe('branching a conversation from one of its turns', function () {
   let server;
   let base;
   let saves;
+  let saveResults;
+  let transcriptArtifacts;
+  let transcriptDeletes;
+  let transcriptFailure;
+  let attachmentStore;
+  let workspaceDir;
+  let routeDeps;
+  let projectEnsures;
+  let projectReleases;
 
   beforeEach(async function () {
     storageDir = fs.mkdtempSync(path.join(os.tmpdir(), 'chat-branch-'));
+    workspaceDir = path.join(storageDir, 'workspace');
+    fs.mkdirSync(workspaceDir);
     activeProfile = null;
     store = new ChatStore({ storageDir });
+    attachmentStore = new AttachmentStore();
+    attachmentStore.cloneForBranchInProjectWorkspace = async (
+      source,
+      target,
+      attachment,
+      workspaceRoot,
+    ) => {
+      const hostRef = (session) => ({
+        ...session,
+        workingDir: workspaceRoot,
+        projectId: undefined,
+        projectWorkingDirKind: undefined,
+        storageScope: {
+          ...session.storageScope,
+          workspaceRoot,
+        },
+      });
+      return attachmentStore.cloneForBranch(hostRef(source), hostRef(target), attachment);
+    };
     sessions = new Map();
     saves = 0;
+    saveResults = [];
+    transcriptArtifacts = new Set();
+    transcriptDeletes = [];
+    transcriptFailure = null;
+    projectEnsures = [];
+    projectReleases = [];
+    let projectLeaseNumber = 0;
 
     const app = express();
     app.use(express.json());
@@ -185,26 +244,49 @@ describe('branching a conversation from one of its turns', function () {
       res.locals.authContext = { user: USER, authSessionId: 'a' };
       next();
     });
-    app.use(
-      createSessionRoutes({
+    routeDeps = {
         claudeSessions: sessions,
         webSocketConnections: new Map(),
         baseFolder: '/projects',
         dev: false,
         validatePath: (target) =>
           target.startsWith('/projects') ? { valid: true, path: target } : { valid: false, error: 'outside' },
-        createSessionRecord: (params) => ({
-          ...chatRecord(params.id, params.name, params.workingDir),
-          ownerSessionId: params.ownerSessionId,
-          projectId: params.projectId,
-          projectWorkingDirKind: params.projectWorkingDirKind,
-        }),
+        createSessionRecord: (params) => {
+          const record = {
+            ...chatRecord(params.id, params.name, params.workingDir),
+            ownerSessionId: params.ownerSessionId,
+            projectId: params.projectId,
+            projectWorkingDirKind: params.projectWorkingDirKind,
+          };
+          // Only the focused attachment fixture uses workspace-local storage;
+          // the original branch tests intentionally keep their legacy paths.
+          if (params.storageRoot === workspaceDir) {
+            record.storageScope = {
+              workspaceRoot: workspaceDir,
+              ownerKey: 'stable-branch-owner',
+            };
+          }
+          return record;
+        },
         getRuntimeBridge: () => null,
         saveSessionsToDisk: async () => {
           saves += 1;
+          const result = saveResults.shift();
+          if (result instanceof Error) throw result;
+          return result;
         },
-        transcriptStore: { ensureTranscript: async () => {}, deleteTranscript: async () => {} },
-        historyStore: {},
+        transcriptStore: {
+          ensureTranscript: async (session) => {
+            transcriptArtifacts.add(session.id);
+            if (transcriptFailure) throw transcriptFailure;
+            return path.join(storageDir, `${session.id}.md`);
+          },
+          deleteTranscript: async (session) => {
+            transcriptDeletes.push(session.id);
+            transcriptArtifacts.delete(session.id);
+          },
+        },
+        historyStore: { deleteHistory: async () => {} },
         getScreenSnapshot: () => [],
         disposeRecorder: () => {},
         getSelectedWorkingDir: () => null,
@@ -216,10 +298,39 @@ describe('branching a conversation from one of its turns', function () {
           getForUser: (ownerUserId, projectId) => ownerUserId === USER.id && projectId === 'project-a'
             ? { id: projectId, name: 'Alpha project' }
             : null,
+          ensureForSession: async (ownerUserId, projectId) => {
+            const leaseId = `branch-project-${++projectLeaseNumber}`;
+            projectEnsures.push({ ownerUserId, projectId, leaseId });
+            return {
+              ok: true,
+              environment: {},
+              workingDir: workspaceDir,
+              allowedWorkingDirs: [workspaceDir],
+              leaseId,
+            };
+          },
+          releaseSessionLease: (ownerUserId, projectId, leaseId) => {
+            projectReleases.push({ ownerUserId, projectId, leaseId });
+            return true;
+          },
+          projectWorkspaceRoot: (ownerUserId, projectId) =>
+            ownerUserId === USER.id && projectId === 'project-a' ? workspaceDir : null,
+          withProjectWorkspace: async (ownerUserId, projectId, operation) => {
+            assert.strictEqual(ownerUserId, USER.id);
+            assert.strictEqual(projectId, 'project-a');
+            return operation(workspaceDir);
+          },
         },
+        attachmentStore,
         chatStore: store,
-      }),
-    );
+      };
+    const defaultTeardown = new SessionTeardownRegistry();
+    defaultTeardown.register('chat-log', (session) => store.deleteChat(session));
+    defaultTeardown.register('attachments', (session) => session.storageScope
+      ? attachmentStore.deleteSessionAttachments(session)
+      : Promise.resolve());
+    routeDeps.sessionTeardown = defaultTeardown;
+    app.use(createSessionRoutes(routeDeps));
 
     server = http.createServer(app);
     await new Promise((resolve) => {
@@ -236,11 +347,12 @@ describe('branching a conversation from one of its turns', function () {
   });
 
   async function record(id, events, name) {
-    sessions.set(id, chatRecord(id, name));
-    store.append({ id, ownerUserId: USER.id }, events);
+    const session = chatRecord(id, name);
+    sessions.set(id, session);
+    store.append(session, events);
     // Forces the store's own queue to drain, so the log is on disk before the
     // route reads it.
-    await store.stat({ id, ownerUserId: USER.id });
+    await store.stat(session);
   }
 
   async function branch(sessionId, turnId) {
@@ -255,11 +367,88 @@ describe('branching a conversation from one of its turns', function () {
   const logPath = (id) => path.join(storageDir, String(USER.id), `${id}.jsonl`);
 
   async function eventsOf(id) {
-    const page = await store.read({ id, ownerUserId: USER.id }, 1, 500);
+    const page = await store.read(sessions.get(id) || { id, ownerUserId: USER.id }, 1, 500);
     return page.events;
   }
 
+  async function streamBytes(stream) {
+    const chunks = [];
+    for await (const chunk of stream) chunks.push(Buffer.from(chunk));
+    return Buffer.concat(chunks);
+  }
+
+  async function assertFailedBranchWasRemoved() {
+    assert.deepStrictEqual(
+      [...sessions.keys()],
+      ['source'],
+      'the source record is the only session left in memory',
+    );
+    assert.deepStrictEqual(
+      await store.listSessions(USER.id),
+      ['source'],
+      'the failed branch log and index were removed without touching the source',
+    );
+    assert.deepStrictEqual(
+      [...transcriptArtifacts],
+      [],
+      'a transcript prepared by the failed branch was removed too',
+    );
+    assert.ok(
+      transcriptDeletes.length === 1 && transcriptDeletes[0] !== 'source',
+      `cleanup targeted only the generated branch: ${JSON.stringify(transcriptDeletes)}`,
+    );
+  }
+
   // -------------------------------------------------------- what is carried
+
+  it('refuses to branch a migration-blocked conversation without creating artifacts', async function () {
+    await record('source', conversation({ turns: 2, contextWindow: 200_000 }));
+    const reason = 'Workspace migration is waiting for write access';
+    sessions.get('source').persistenceUnavailable = reason;
+    const before = fs.readFileSync(logPath('source'));
+
+    const made = await branch('source', 'turn-1');
+
+    assert.strictEqual(made.status, 409);
+    assert.deepStrictEqual(made.body, {
+      error: 'session_persistence_unavailable',
+      message: reason,
+      retryable: true,
+    });
+    assert.deepStrictEqual([...sessions.keys()], ['source']);
+    assert.deepStrictEqual(await store.listSessions(USER.id), ['source']);
+    assert.deepStrictEqual(fs.readFileSync(logPath('source')), before);
+    assert.strictEqual(saves, 0);
+    assert.deepStrictEqual([...transcriptArtifacts], []);
+  });
+
+  it('gives persistence failure precedence over DELETE recovery and performs no cleanup', async function () {
+    const recovery = chatRecord('blocked-recovery', 'Blocked recovery', workspaceDir);
+    recovery.storageScope = {
+      workspaceRoot: workspaceDir,
+      ownerKey: 'stable-branch-owner',
+    };
+    recovery.rollbackRecoveryPending = true;
+    recovery.persistenceUnavailable = 'Workspace migration is waiting for write access';
+    recovery.tabOpen = false;
+    sessions.set(recovery.id, recovery);
+    const cleanup = [];
+    const teardown = new SessionTeardownRegistry();
+    teardown.register('sentinel', async () => { cleanup.push('ran'); });
+    routeDeps.sessionTeardown = teardown;
+
+    const response = await fetch(`${base}/api/sessions/${recovery.id}`, { method: 'DELETE' });
+    assert.strictEqual(response.status, 409);
+    assert.deepStrictEqual(await response.json(), {
+      error: 'session_persistence_unavailable',
+      message: recovery.persistenceUnavailable,
+      retryable: true,
+    });
+    assert.deepStrictEqual(cleanup, []);
+    assert.strictEqual(saves, 0);
+    assert.strictEqual(sessions.get(recovery.id), recovery);
+    assert.strictEqual(recovery.retiring, undefined);
+  });
 
   it('carries the turns up to and including the one branched from, and no further', async function () {
     await record('source', conversation({ turns: 5, contextWindow: 200_000 }));
@@ -282,6 +471,242 @@ describe('branching a conversation from one of its turns', function () {
     assert.ok(text.includes('answer 3'), 'the branch turn itself is carried');
     assert.ok(!text.includes('question 4'), 'the turns after it are not');
     assert.ok(!text.includes('answer 4'));
+  });
+
+  it('clones image and file bytes before commit, then survives source deletion and restart', async function () {
+    const source = chatRecord('source-attachments', 'Files', workspaceDir);
+    source.storageScope = {
+      workspaceRoot: workspaceDir,
+      ownerKey: 'stable-branch-owner',
+    };
+    sessions.set(source.id, source);
+
+    const textBytes = Buffer.from('branch-owned text bytes\n');
+    const text = await attachmentStore.save(source, {
+      filename: 'notes.txt', declaredMime: 'text/plain', bytes: textBytes,
+    });
+    const image = await attachmentStore.save(source, {
+      filename: 'pixel.png', declaredMime: 'image/png', bytes: PNG,
+    });
+    const events = conversation({ turns: 1, contextWindow: 200_000 });
+    const userEnd = events.findIndex((event) => event.t === 'msg_end' && event.msgId === 'u1');
+    events.splice(
+      userEnd,
+      0,
+      {
+        t: 'block_start', msgId: 'u1', index: 1,
+        block: {
+          kind: 'attachment',
+          url: `/api/sessions/${source.id}/chat-attachments/${text.storedName}`,
+          name: text.name,
+          mime: text.mime,
+          size: text.bytes,
+        },
+      },
+      // Uploaded images were represented this way in older durable logs. A
+      // branch must clone those bytes too, while leaving runtime image URLs be.
+      {
+        t: 'block_start', msgId: 'u1', index: 2,
+        block: {
+          kind: 'image',
+          url: `/api/sessions/${source.id}/chat-attachments/${image.storedName}`,
+          alt: image.name,
+          mime: image.mime,
+        },
+      },
+      {
+        t: 'block_start', msgId: 'u1', index: 3,
+        block: {
+          kind: 'attachment',
+          url: `/api/sessions/${source.id}/chat-attachments/${text.storedName}`,
+          name: text.name,
+          mime: text.mime,
+          size: text.bytes,
+        },
+      },
+    );
+    events.forEach((event, index) => {
+      event.seq = index + 1;
+      event.ts = index + 1;
+    });
+    await store.append(source, events);
+    await store.stat(source);
+
+    const originalClone = attachmentStore.cloneForBranch.bind(attachmentStore);
+    let cloneCalls = 0;
+    attachmentStore.cloneForBranch = async (...args) => {
+      cloneCalls += 1;
+      return originalClone(...args);
+    };
+    const made = await branch(source.id, 'turn-1');
+    assert.strictEqual(made.status, 200, JSON.stringify(made.body));
+    assert.strictEqual(cloneCalls, 2, 'a duplicate URL is copied only once');
+    const target = sessions.get(made.body.sessionId);
+    const carried = (await eventsOf(target.id))
+      .filter((event) => event.t === 'block_start')
+      .map((event) => event.block)
+      .filter((block) => block.kind === 'attachment' || block.kind === 'image');
+    assert.strictEqual(carried.length, 3);
+    assert.strictEqual(new Set(carried.map((block) => block.url)).size, 2);
+    assert.ok(
+      carried.every((block) => block.url.includes(`/sessions/${target.id}/chat-attachments/`)),
+      'every carried URL is qualified for the branch session',
+    );
+    assert.ok(carried.every((block) => !block.url.includes(source.id)));
+
+    await attachmentStore.deleteSessionAttachments(source);
+    await store.deleteChat(source);
+    sessions.delete(source.id);
+
+    // A fresh store and chat reader model a cold restart: neither can rely on
+    // source handles or process-local clone state.
+    const restartedAttachments = new AttachmentStore();
+    const restartedChat = new ChatStore({ storageDir });
+    const restartedEvents = await restartedChat.read(target, 1, 500);
+    const restartedBlocks = restartedEvents.events
+      .filter((event) => event.t === 'block_start')
+      .map((event) => event.block)
+      .filter((block) => block.kind === 'attachment' || block.kind === 'image');
+    const downloaded = [];
+    for (const block of restartedBlocks) {
+      const storedName = storedAttachmentNameFromUrl(block.url, target.id);
+      assert.ok(storedName, `branch URL remained canonical: ${block.url}`);
+      const opened = await restartedAttachments.openForDownload(target, storedName);
+      downloaded.push(await streamBytes(opened.stream));
+    }
+    assert.ok(downloaded.some((bytes) => bytes.equals(textBytes)), 'non-image bytes survived');
+    assert.ok(downloaded.some((bytes) => bytes.equals(PNG)), 'image bytes survived');
+  });
+
+  it('removes a partial attachment clone when a later branch copy fails', async function () {
+    const source = chatRecord('source-rollback', 'Files', workspaceDir);
+    source.storageScope = {
+      workspaceRoot: workspaceDir,
+      ownerKey: 'stable-branch-owner',
+    };
+    sessions.set(source.id, source);
+    const first = await attachmentStore.save(source, {
+      filename: 'one.txt', declaredMime: 'text/plain', bytes: Buffer.from('one'),
+    });
+    const second = await attachmentStore.save(source, {
+      filename: 'two.txt', declaredMime: 'text/plain', bytes: Buffer.from('two'),
+    });
+    const events = conversation({ turns: 1, contextWindow: 200_000 });
+    const userEnd = events.findIndex((event) => event.t === 'msg_end' && event.msgId === 'u1');
+    for (const [offset, stored] of [first, second].entries()) {
+      events.splice(userEnd + offset, 0, {
+        t: 'block_start', msgId: 'u1', index: offset + 1,
+        block: {
+          kind: 'attachment',
+          url: `/api/sessions/${source.id}/chat-attachments/${stored.storedName}`,
+          name: stored.name, mime: stored.mime, size: stored.bytes,
+        },
+      });
+    }
+    events.forEach((event, index) => { event.seq = index + 1; event.ts = index + 1; });
+    await store.append(source, events);
+    await store.stat(source);
+
+    const originalClone = attachmentStore.cloneForBranch.bind(attachmentStore);
+    let calls = 0;
+    let firstClone;
+    attachmentStore.cloneForBranch = async (...args) => {
+      calls += 1;
+      if (calls === 2) throw Object.assign(new Error('injected clone conflict'), { code: 'EEXIST' });
+      firstClone = await originalClone(...args);
+      return firstClone;
+    };
+
+    const made = await branch(source.id, 'turn-1');
+    assert.strictEqual(made.status, 500, JSON.stringify(made.body));
+    assert.strictEqual(made.body.error, 'branch_failed');
+    assert.strictEqual(calls, 2);
+    assert.ok(firstClone);
+    const targetId = transcriptDeletes[0];
+    const failedTarget = {
+      ...source,
+      id: targetId,
+    };
+    const storedName = storedAttachmentNameFromUrl(firstClone.url, targetId);
+    await assert.rejects(
+      () => new AttachmentStore().openForDownload(failedTarget, storedName),
+      (error) => error && error.code === 'NOT_FOUND',
+      'the first copied file is removed with the failed branch',
+    );
+    assert.ok(fs.existsSync(first.absolutePath), 'source bytes remain intact');
+    assert.ok(fs.existsSync(second.absolutePath), 'all source bytes remain intact');
+  });
+
+  it('removes every cloned attachment when append, transcript, or session commit fails', async function () {
+    const source = chatRecord('source-post-clone-rollback', 'Files', workspaceDir);
+    source.storageScope = {
+      workspaceRoot: workspaceDir,
+      ownerKey: 'stable-branch-owner',
+    };
+    sessions.set(source.id, source);
+    const originals = [];
+    for (const [index, value] of ['first', 'second'].entries()) {
+      originals.push(await attachmentStore.save(source, {
+        filename: `${value}.txt`,
+        declaredMime: 'text/plain',
+        bytes: Buffer.from(value),
+      }));
+    }
+    const events = conversation({ turns: 1, contextWindow: 200_000 });
+    const userEnd = events.findIndex((event) => event.t === 'msg_end' && event.msgId === 'u1');
+    originals.forEach((stored, offset) => events.splice(userEnd + offset, 0, {
+      t: 'block_start', msgId: 'u1', index: offset + 1,
+      block: {
+        kind: 'attachment',
+        url: `/api/sessions/${source.id}/chat-attachments/${stored.storedName}`,
+        name: stored.name, mime: stored.mime, size: stored.bytes,
+      },
+    }));
+    events.forEach((event, index) => { event.seq = index + 1; event.ts = index + 1; });
+    await store.append(source, events);
+    await store.stat(source);
+
+    for (const failure of ['append', 'transcript', 'save']) {
+      const originalClone = attachmentStore.cloneForBranch.bind(attachmentStore);
+      const clones = [];
+      attachmentStore.cloneForBranch = async (...args) => {
+        const cloned = await originalClone(...args);
+        clones.push(cloned);
+        return cloned;
+      };
+      const originalAppend = store.append.bind(store);
+      if (failure === 'append') {
+        store.append = async (ref, carried) => {
+          await originalAppend(ref, carried);
+          if (ref.id !== source.id) throw new Error('injected append failure after write');
+        };
+      } else if (failure === 'transcript') {
+        transcriptFailure = new Error('injected transcript failure after clone');
+      } else {
+        saveResults.push(false, undefined);
+      }
+
+      const made = await branch(source.id, 'turn-1');
+      store.append = originalAppend;
+      transcriptFailure = null;
+      attachmentStore.cloneForBranch = originalClone;
+
+      assert.ok([500, 503].includes(made.status), `${failure}: ${JSON.stringify(made.body)}`);
+      assert.strictEqual(clones.length, 2, `${failure}: both copies completed before failure`);
+      const targetId = decodeURIComponent(clones[0].url.split('/')[3]);
+      const failedTarget = { ...source, id: targetId };
+      for (const cloned of clones) {
+        const storedName = storedAttachmentNameFromUrl(cloned.url, targetId);
+        await assert.rejects(
+          () => new AttachmentStore().openForDownload(failedTarget, storedName),
+          (error) => error && error.code === 'NOT_FOUND',
+          `${failure}: cloned bytes were rolled back`,
+        );
+      }
+    }
+    for (const original of originals) {
+      assert.ok(fs.existsSync(original.absolutePath), 'source attachment survives every rollback');
+    }
   });
 
   it('renumbers the carried log from its own beginning and closes it with a rule', async function () {
@@ -433,6 +858,288 @@ describe('branching a conversation from one of its turns', function () {
     assert.strictEqual(sessions.get(made.body.sessionId).tabOrder, 2);
   });
 
+  it('removes a partially written log when branch stat fails', async function () {
+    await record('source', conversation({ turns: 2, contextWindow: 200_000 }));
+    const originalStat = store.stat.bind(store);
+    store.stat = async (ref) => {
+      const stats = await originalStat(ref);
+      if (ref.id !== 'source') throw new Error('injected branch stat failure');
+      return stats;
+    };
+
+    const made = await branch('source', 'turn-1');
+
+    assert.strictEqual(made.status, 500, JSON.stringify(made.body));
+    assert.strictEqual(made.body.error, 'branch_failed');
+    await assertFailedBranchWasRemoved();
+  });
+
+  it('removes the log and opening context when context persistence fails after writing', async function () {
+    await record('source', conversation({ turns: 2, contextWindow: 200_000 }));
+    const originalSetOpeningContext = store.setOpeningContext.bind(store);
+    store.setOpeningContext = async (ref, context) => {
+      await originalSetOpeningContext(ref, context);
+      throw new Error('injected opening-context failure');
+    };
+
+    const made = await branch('source', 'turn-1');
+
+    assert.strictEqual(made.status, 500, JSON.stringify(made.body));
+    assert.strictEqual(made.body.error, 'branch_failed');
+    await assertFailedBranchWasRemoved();
+    assert.strictEqual(
+      await store.openingContext({ id: transcriptDeletes[0], ownerUserId: USER.id }),
+      null,
+      'deleteChat also removed the context sidecar written before the failure',
+    );
+  });
+
+  it('removes every prepared artifact when transcript creation fails', async function () {
+    await record('source', conversation({ turns: 2, contextWindow: 200_000 }));
+    transcriptFailure = new Error('injected transcript failure');
+
+    const made = await branch('source', 'turn-1');
+
+    assert.strictEqual(made.status, 500, JSON.stringify(made.body));
+    assert.strictEqual(made.body.error, 'branch_failed');
+    assert.strictEqual(
+      saves,
+      2,
+      'a hidden recovery anchor is committed before cleanup and removed after cleanup succeeds',
+    );
+    await assertFailedBranchWasRemoved();
+  });
+
+  it('reports strict disposer failures with a recoverable branch id while running every disposer', async function () {
+    await record('source', conversation({ turns: 2, contextWindow: 200_000 }));
+    transcriptFailure = new Error('injected transcript failure');
+    const disposed = [];
+    const teardown = new SessionTeardownRegistry();
+    teardown.register('chat-log', async (session) => {
+      disposed.push(`chat:${session.id}`);
+      throw new Error('injected chat cleanup failure');
+    });
+    teardown.register('attachments', async (session) => {
+      disposed.push(`attachments:${session.id}`);
+    });
+    teardown.register('lease', async (session) => {
+      assert.ok(
+        transcriptDeletes.includes(session.id),
+        'descriptor-backed transcript cleanup finishes before the directory lease disposer',
+      );
+      disposed.push(`lease:${session.id}`);
+    });
+    routeDeps.sessionTeardown = teardown;
+
+    const made = await branch('source', 'turn-1');
+
+    assert.strictEqual(made.status, 500, JSON.stringify(made.body));
+    assert.strictEqual(made.body.error, 'branch_failed');
+    assert.strictEqual(made.body.recoveryPending, true);
+    assert.strictEqual(made.body.recoveryDurable, true);
+    assert.ok(made.body.sessionId, 'the orphan namespace is returned for deterministic recovery');
+    assert.deepStrictEqual(disposed, [
+      `chat:${made.body.sessionId}`,
+      `attachments:${made.body.sessionId}`,
+      `lease:${made.body.sessionId}`,
+    ], 'a failing disposer does not skip later cleanup owners');
+    const recovered = sessions.get(made.body.sessionId);
+    assert.ok(recovered, 'the remaining namespace retains an exact recovery record');
+    assert.strictEqual(recovered.rollbackRecoveryPending, true);
+    assert.strictEqual(recovered.tabOpen, false, 'a recovery anchor never becomes an account tab');
+    assert.strictEqual(saves, 1, 'cleanup failure publishes its recovery authority durably');
+    assert.ok(
+      (await store.listSessions(USER.id)).includes(made.body.sessionId),
+      'the failed chat cleanup remains addressable by the returned session id',
+    );
+  });
+
+  it('durably restores recovery authority when cleanup fails after a confirmed compensating save', async function () {
+    await record('source', conversation({ turns: 2, contextWindow: 200_000 }));
+    // Refuse branch commit, then confirm the hidden recovery anchor before any
+    // strict cleanup owner is allowed to mutate the workspace.
+    saveResults.push(false, undefined);
+    let attachmentCleanupAttempts = 0;
+    let failAttachmentCleanup = true;
+    const teardown = new SessionTeardownRegistry();
+    teardown.register('chat-log', (session) => store.deleteChat(session));
+    teardown.register('attachments', async () => {
+      attachmentCleanupAttempts += 1;
+      if (failAttachmentCleanup) throw new Error('injected attachment cleanup failure');
+    });
+    routeDeps.sessionTeardown = teardown;
+
+    const made = await branch('source', 'turn-1');
+
+    assert.strictEqual(made.status, 503, JSON.stringify(made.body));
+    assert.strictEqual(made.body.error, 'branch_not_saved');
+    assert.strictEqual(made.body.recoveryPending, true);
+    assert.strictEqual(made.body.recoveryDurable, true);
+    assert.ok(made.body.sessionId);
+    assert.strictEqual(saves, 2, 'commit refusal is followed by a durable pre-cleanup anchor');
+    assert.ok(sessions.has(made.body.sessionId), 'remaining quota is owned by a durable session record');
+    assert.strictEqual(attachmentCleanupAttempts, 1);
+
+    failAttachmentCleanup = false;
+    const retried = await fetch(`${base}/api/sessions/${made.body.sessionId}`, { method: 'DELETE' });
+    assert.strictEqual(retried.status, 200, await retried.text());
+    assert.strictEqual(attachmentCleanupAttempts, 2, 'the returned id supports definitive cleanup retry');
+    assert.strictEqual(sessions.has(made.body.sessionId), false);
+  });
+
+  it('cold-restores a durable recovery anchor and DELETE completes its cleanup', async function () {
+    const scope = {
+      workspaceRoot: workspaceDir,
+      ownerKey: 'stable-branch-owner',
+    };
+    const trust = archiveTrustForTest();
+    let persistent = new SessionStore({ ...scope, archiveTrust: trust });
+    try {
+      // Mark this authorised workspace fully loaded before a route save is
+      // allowed to prune rows which are absent from the shared map.
+      await persistent.loadSessions();
+      const source = chatRecord('cold-recovery-source', 'Cold recovery', workspaceDir);
+      source.storageScope = scope;
+      sessions.set(source.id, source);
+      await store.append(source, conversation({ turns: 1, contextWindow: 200_000 }));
+      await store.stat(source);
+      assert.strictEqual(await persistent.saveSessions(sessions), true);
+      routeDeps.saveSessionsToDisk = () => persistent.saveSessions(sessions);
+
+      let cleanupFails = true;
+      const teardown = new SessionTeardownRegistry();
+      teardown.register('chat-log', async (session) => {
+        if (cleanupFails) throw new Error('injected cleanup failure before restart');
+        await store.deleteChat(session);
+      });
+      teardown.register('attachments', (session) => attachmentStore.deleteSessionAttachments(session));
+      routeDeps.sessionTeardown = teardown;
+      transcriptFailure = new Error('injected prepare failure');
+
+      const made = await branch(source.id, 'turn-1');
+      assert.strictEqual(made.status, 500, JSON.stringify(made.body));
+      assert.strictEqual(made.body.recoveryPending, true);
+      assert.strictEqual(made.body.recoveryDurable, true);
+      assert.ok(made.body.sessionId);
+      persistent.database.close();
+
+      persistent = new SessionStore({ ...scope, archiveTrust: trust });
+      const restored = await persistent.loadSessions();
+      const anchor = restored.get(made.body.sessionId);
+      assert.ok(anchor, 'the recovery row is rediscovered from session-state.sqlite');
+      assert.strictEqual(anchor.rollbackRecoveryPending, true);
+      assert.strictEqual(anchor.tabOpen, false);
+      sessions.clear();
+      for (const [id, session] of restored) sessions.set(id, session);
+      routeDeps.saveSessionsToDisk = () => persistent.saveSessions(sessions);
+      transcriptFailure = null;
+      cleanupFails = false;
+
+      const retried = await fetch(`${base}/api/sessions/${anchor.id}`, { method: 'DELETE' });
+      assert.strictEqual(retried.status, 200, await retried.text());
+      assert.strictEqual(sessions.has(anchor.id), false);
+      persistent.database.close();
+
+      persistent = new SessionStore({ ...scope, archiveTrust: trust });
+      const afterRestart = await persistent.loadSessions();
+      assert.strictEqual(afterRestart.has(anchor.id), false, 'the confirmed removal survives another boot');
+      assert.strictEqual(afterRestart.has(source.id), true, 'cleanup never prunes the source conversation');
+    } finally {
+      try { persistent.database.close(); } catch { /* already closed */ }
+    }
+  });
+
+  it('compensates a failed session save and removes all branch artifacts', async function () {
+    await record('source', conversation({ turns: 2, contextWindow: 200_000 }));
+    // The first result rejects the branch commit. The next two commit the
+    // hidden pre-cleanup anchor and then its definitive removal.
+    saveResults.push(false, undefined, undefined);
+
+    const made = await branch('source', 'turn-1');
+
+    assert.strictEqual(made.status, 503, JSON.stringify(made.body));
+    assert.strictEqual(made.body.error, 'branch_not_saved');
+    assert.strictEqual(saves, 3, 'cleanup is bracketed by a durable anchor and its removal');
+    await assertFailedBranchWasRemoved();
+  });
+
+  it('preserves the branch record and artifacts when durable rollback remains ambiguous', async function () {
+    const source = chatRecord('source-ambiguous-save', 'Files', workspaceDir);
+    source.storageScope = {
+      workspaceRoot: workspaceDir,
+      ownerKey: 'stable-branch-owner',
+    };
+    sessions.set(source.id, source);
+    const original = await attachmentStore.save(source, {
+      filename: 'evidence.txt',
+      declaredMime: 'text/plain',
+      bytes: Buffer.from('preserve on ambiguous rollback'),
+    });
+    const events = conversation({ turns: 1, contextWindow: 200_000 });
+    const userEnd = events.findIndex((event) => event.t === 'msg_end' && event.msgId === 'u1');
+    events.splice(userEnd, 0, {
+      t: 'block_start',
+      msgId: 'u1',
+      index: 1,
+      block: {
+        kind: 'attachment',
+        url: `/api/sessions/${source.id}/chat-attachments/${original.storedName}`,
+        name: original.name,
+        mime: original.mime,
+        size: original.bytes,
+      },
+    });
+    events.forEach((event, index) => { event.seq = index + 1; event.ts = index + 1; });
+    await store.append(source, events);
+    await store.stat(source);
+
+    let cloned;
+    const originalClone = attachmentStore.cloneForBranch.bind(attachmentStore);
+    attachmentStore.cloneForBranch = async (...args) => {
+      cloned = await originalClone(...args);
+      return cloned;
+    };
+    const durableIds = new Set([source.id]);
+    let saveCalls = 0;
+    routeDeps.saveSessionsToDisk = async () => {
+      saveCalls += 1;
+      if (saveCalls === 1) {
+        // Model the exact ambiguous seam: SQLite committed the branch row, but
+        // the coordinator could not prove/complete its wider save.
+        for (const id of sessions.keys()) durableIds.add(id);
+      }
+      return false;
+    };
+
+    const made = await branch(source.id, 'turn-1');
+
+    assert.strictEqual(made.status, 503, JSON.stringify(made.body));
+    assert.strictEqual(made.body.recoveryPending, true);
+    assert.strictEqual(made.body.recoveryDurable, false);
+    assert.ok(made.body.sessionId);
+    assert.strictEqual(saveCalls, 2, 'commit refusal is followed by one failed anchor save');
+    assert.ok(durableIds.has(made.body.sessionId), 'the simulated database can still contain the row');
+    const recovered = sessions.get(made.body.sessionId);
+    assert.ok(recovered, 'the matching record is restored in memory');
+    assert.strictEqual(recovered.rollbackRecoveryPending, true);
+    assert.strictEqual(recovered.tabOpen, false);
+    assert.ok(transcriptArtifacts.has(recovered.id), 'its transcript is preserved');
+    assert.deepStrictEqual(transcriptDeletes, [], 'ambiguous rollback performs no teardown');
+    assert.ok((await store.stat(recovered)).cursor > 0, 'its durable chat remains readable');
+    const storedName = storedAttachmentNameFromUrl(cloned.url, recovered.id);
+    const opened = await new AttachmentStore().openForDownload(recovered, storedName);
+    assert.strictEqual((await streamBytes(opened.stream)).toString(), 'preserve on ambiguous rollback');
+
+    const retried = await fetch(`${base}/api/sessions/${recovered.id}`, { method: 'DELETE' });
+    assert.strictEqual(retried.status, 503);
+    const retryBody = await retried.json();
+    assert.strictEqual(retryBody.error, 'session_recovery_not_durable');
+    assert.strictEqual(retryBody.recoveryDurable, false);
+    assert.strictEqual(saveCalls, 3, 'DELETE performs one explicit anchor confirmation attempt');
+    assert.deepStrictEqual(transcriptDeletes, [], 'a refused confirmation still performs no teardown');
+    assert.ok(sessions.has(recovered.id));
+  });
+
   it('returns the complete project namespace identity for a new branch', async function () {
     await record('source', conversation({ turns: 2, contextWindow: 200_000 }));
     const source = sessions.get('source');
@@ -447,6 +1154,261 @@ describe('branching a conversation from one of its turns', function () {
     assert.strictEqual(made.body.projectId, 'project-a');
     assert.strictEqual(made.body.projectName, 'Alpha project');
     assert.strictEqual(made.body.projectWorkingDirKind, 'container');
+    assert.strictEqual(projectEnsures.length, 0, 'branching metadata does not start a stopped project');
+    assert.strictEqual(projectReleases.length, 0);
+  });
+
+  it('revalidates the exact project source after asynchronous no-start lifecycle admission', async function () {
+    await record('source-project-admission', conversation({ turns: 1, contextWindow: 200_000 }));
+    const source = sessions.get('source-project-admission');
+    source.projectId = 'project-a';
+    source.projectWorkingDirKind = 'host';
+    source.workingDir = workspaceDir;
+    source.storageScope = {
+      workspaceRoot: workspaceDir,
+      ownerKey: 'stable-branch-owner',
+    };
+
+    let admissionStarted;
+    const atAdmission = new Promise((resolve) => { admissionStarted = resolve; });
+    let finishAdmission;
+    const admissionMayFinish = new Promise((resolve) => { finishAdmission = resolve; });
+    routeDeps.projectsManager.withProjectWorkspace = async (ownerUserId, projectId, operation) => {
+      assert.strictEqual(ownerUserId, USER.id);
+      assert.strictEqual(projectId, 'project-a');
+      admissionStarted();
+      await admissionMayFinish;
+      return operation(workspaceDir);
+    };
+
+    const branching = branch(source.id, 'turn-1');
+    await atAdmission;
+    const replacement = { ...source, retiring: true, connections: new Set() };
+    sessions.set(source.id, replacement);
+    finishAdmission();
+    const made = await branching;
+
+    assert.strictEqual(made.status, 409, JSON.stringify(made.body));
+    assert.strictEqual(made.body.error, 'source_session_retiring');
+    assert.strictEqual(sessions.get(source.id), replacement);
+    assert.strictEqual(saves, 0, 'no branch artifact or row is attempted for a replaced source');
+    assert.deepStrictEqual([...transcriptArtifacts], []);
+    assert.strictEqual(projectEnsures.length, 0, 'branch storage never starts or admits a project runtime');
+    assert.strictEqual(projectReleases.length, 0, 'no runtime lease exists to release');
+  });
+
+  it('holds the no-start lifecycle gate through commit so rebuild and deletion wait for the branch', async function () {
+    const source = chatRecord('project-source-race', 'Project files', workspaceDir);
+    source.projectId = 'project-a';
+    source.projectWorkingDirKind = 'host';
+    source.storageScope = {
+      workspaceRoot: workspaceDir,
+      ownerKey: 'stable-branch-owner',
+    };
+    sessions.set(source.id, source);
+    const events = conversation({ turns: 1, contextWindow: 200_000 });
+    const userEnd = events.findIndex((event) => event.t === 'msg_end' && event.msgId === 'u1');
+    const storedName = '111111111111-proof.txt';
+    events.splice(userEnd, 0, {
+      t: 'block_start',
+      msgId: 'u1',
+      index: 1,
+      block: {
+        kind: 'attachment',
+        url: `/api/sessions/${source.id}/chat-attachments/${storedName}`,
+        name: 'proof.txt',
+        mime: 'text/plain',
+        size: 5,
+      },
+    });
+    events.forEach((event, index) => { event.seq = index + 1; event.ts = index + 1; });
+    await store.append(source, events);
+    await store.stat(source);
+
+    let cloneReached;
+    const atClone = new Promise((resolve) => { cloneReached = resolve; });
+    let finishClone;
+    const cloneMayFinish = new Promise((resolve) => { finishClone = resolve; });
+    attachmentStore.cloneForBranch = async (_source, target) => {
+      cloneReached();
+      await cloneMayFinish;
+      return {
+        url: `/api/sessions/${target.id}/chat-attachments/${storedName}`,
+        name: 'proof.txt',
+        mime: 'text/plain',
+        size: 5,
+        path: path.join(workspaceDir, '.cc-web', 'attachments', target.id, storedName),
+      };
+    };
+    attachmentStore.deleteSessionAttachments = async () => {};
+
+    let lifecycleTail = Promise.resolve();
+    routeDeps.projectsManager.withProjectWorkspace = async (ownerUserId, projectId, operation) => {
+      assert.strictEqual(ownerUserId, USER.id);
+      assert.strictEqual(projectId, 'project-a');
+      let releaseTurn;
+      const turn = new Promise((resolve) => { releaseTurn = resolve; });
+      const previous = lifecycleTail;
+      lifecycleTail = previous.then(() => turn);
+      await previous;
+      try {
+        return await operation(workspaceDir);
+      } finally {
+        releaseTurn();
+      }
+    };
+
+    const branching = branch(source.id, 'turn-1');
+    await atClone;
+    assert.strictEqual(projectEnsures.length, 0, 'branching a stopped project never starts its runtime');
+
+    let rebuildEntered = false;
+    const rebuild = routeDeps.projectsManager.withProjectWorkspace(
+      USER.id,
+      'project-a',
+      async () => { rebuildEntered = true; },
+    );
+    let retirementSettled = false;
+    let retirementEntered = false;
+    const retirement = routeDeps.projectsManager.withProjectWorkspace(
+      USER.id,
+      'project-a',
+      async () => {
+        retirementEntered = true;
+        const ids = await retireProjectSessions(routeDeps, 'project-a');
+        retirementSettled = true;
+        return ids;
+      },
+    );
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.strictEqual(rebuildEntered, false, 'project rebuild waits outside the held lifecycle gate');
+    assert.strictEqual(retirementEntered, false, 'project deletion waits outside the held lifecycle gate');
+    assert.strictEqual(retirementSettled, false);
+    assert.strictEqual(source.retiring, undefined, 'queued deletion cannot mutate the source mid-branch');
+
+    finishClone();
+    const made = await branching;
+    assert.strictEqual(made.status, 200, JSON.stringify(made.body));
+    await rebuild;
+    assert.strictEqual(rebuildEntered, true);
+    const retired = await retirement;
+
+    assert.ok(retired.includes(source.id));
+    assert.ok(retired.includes(made.body.sessionId), 'the post-drain rescan includes the new branch root');
+    assert.deepStrictEqual([...sessions.keys()], []);
+    assert.strictEqual(projectReleases.length, 0, 'branching never acquired a runtime lease');
+  });
+
+  it('rolls back a post-clone failure inside a non-reentrant project gate without reacquiring it', async function () {
+    const source = chatRecord('project-source-rollback', 'Project rollback', workspaceDir);
+    source.projectId = 'project-a';
+    source.projectWorkingDirKind = 'container';
+    source.storageScope = {
+      workspaceRoot: workspaceDir,
+      ownerKey: 'stable-branch-owner',
+    };
+    sessions.set(source.id, source);
+
+    const hostAttachments = new AttachmentStore();
+    const hostSource = {
+      ...source,
+      projectId: undefined,
+      projectWorkingDirKind: undefined,
+      workingDir: workspaceDir,
+    };
+    const original = await hostAttachments.save(hostSource, {
+      filename: 'rollback.txt',
+      declaredMime: 'text/plain',
+      bytes: Buffer.from('rollback bytes'),
+    });
+    const events = conversation({ turns: 1, contextWindow: 200_000 });
+    const userEnd = events.findIndex((event) => event.t === 'msg_end' && event.msgId === 'u1');
+    events.splice(userEnd, 0, {
+      t: 'block_start',
+      msgId: 'u1',
+      index: 1,
+      block: {
+        kind: 'attachment',
+        url: `/api/sessions/${source.id}/chat-attachments/${original.storedName}`,
+        name: original.name,
+        mime: original.mime,
+        size: original.bytes,
+      },
+    });
+    events.forEach((event, index) => { event.seq = index + 1; event.ts = index + 1; });
+    await store.append(source, events);
+    await store.stat(source);
+
+    let gateHeld = false;
+    let gateEntries = 0;
+    let nestedEntries = 0;
+    routeDeps.projectsManager.withProjectWorkspace = async (ownerUserId, projectId, operation) => {
+      assert.strictEqual(ownerUserId, USER.id);
+      assert.strictEqual(projectId, 'project-a');
+      if (gateHeld) {
+        nestedEntries += 1;
+        throw new Error('non-reentrant lifecycle gate');
+      }
+      gateHeld = true;
+      gateEntries += 1;
+      try {
+        return await operation(workspaceDir);
+      } finally {
+        gateHeld = false;
+      }
+    };
+
+    const projectAttachments = new ProjectAwareAttachmentStore(
+      hostAttachments,
+      routeDeps.projectsManager,
+      async () => {},
+    );
+    routeDeps.attachmentStore = projectAttachments;
+    let branchId = null;
+    const originalClone = projectAttachments.cloneForBranchInProjectWorkspace.bind(projectAttachments);
+    projectAttachments.cloneForBranchInProjectWorkspace = async (...args) => {
+      branchId = args[1].id;
+      return originalClone(...args);
+    };
+    const cleanupContexts = [];
+    const teardown = new SessionTeardownRegistry();
+    teardown.register('chat-log', (session) => store.deleteChat(session));
+    teardown.register('chat-attachments', (session, context) => {
+      cleanupContexts.push(context);
+      return projectAttachments.deleteSessionAttachments(session, {
+        projectLifecycleExclusive: context?.projectLifecycleExclusive,
+      });
+    });
+    routeDeps.sessionTeardown = teardown;
+
+    const originalAppend = store.append.bind(store);
+    store.append = async (ref, branchEvents) => {
+      await originalAppend(ref, branchEvents);
+      if (ref.id !== source.id) throw new Error('injected append failure after project clone');
+    };
+    const admissionsBefore = projectEnsures.length;
+
+    const made = await branch(source.id, 'turn-1');
+
+    assert.strictEqual(made.status, 500, JSON.stringify(made.body));
+    assert.strictEqual(made.body.error, 'branch_failed');
+    assert.strictEqual(made.body.recoveryPending, undefined, 'complete rollback needs no recovery marker');
+    assert.ok(branchId);
+    assert.strictEqual(gateEntries, 1, 'one lifecycle gate covers clone, writes, and rollback');
+    assert.strictEqual(nestedEntries, 0, 'rollback identifies the already-exclusive project context');
+    assert.deepStrictEqual(cleanupContexts, [{ projectLifecycleExclusive: true }]);
+    assert.strictEqual(projectEnsures.length, admissionsBefore, 'rollback does not start the project runtime');
+    assert.strictEqual(
+      fs.existsSync(path.join(
+        workspaceDir,
+        '.cc-web',
+        'attachments',
+        source.storageScope.ownerKey,
+        branchId,
+      )),
+      false,
+      'the cloned attachment namespace is removed before the gate is released',
+    );
   });
 
   // The window the history above was just measured against is the source's

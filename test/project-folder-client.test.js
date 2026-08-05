@@ -80,6 +80,56 @@ describe('project folder browser client namespace', function () {
     assert.doesNotMatch(requests[1], /project-only/);
   });
 
+  it('captures the confirmed new-session server and never sends another server path to it', async function () {
+    const requests = [];
+    const app = {
+      currentFolderPath: '/from/previous-server',
+      selectedWorkingDir: '/from/previous-server',
+      currentClaudeSessionId: null,
+      isCreatingNewSession: true,
+      startPromptRequested: false,
+      authFetch: async (url, options = {}, serverId = null) => {
+        requests.push({ url: String(url), options, serverId });
+        if (String(url).startsWith('/api/folders?')) {
+          return {
+            ok: true,
+            json: async () => ({
+              currentPath: '/remote/home', parentPath: '/remote', folders: [],
+              workingDirKind: 'host',
+            }),
+          };
+        }
+        return {
+          ok: true,
+          json: async () => ({
+            sessionId: 'qualified-session',
+            session: { name: 'home', workingDir: '/remote/home' },
+          }),
+        };
+      },
+      sessionTabManager: {
+        addTab() {},
+        async switchToTab() {},
+      },
+      loadSessions() {},
+    };
+    const browser = new mod.FolderBrowser(app);
+
+    mod.shellStore.setState({ activeId: null, tabs: [] });
+    await browser.show({ host: true, serverId: 'remote' });
+    assert.strictEqual(requests[0].serverId, 'remote');
+    assert.doesNotMatch(requests[0].url, /from%2Fprevious-server/);
+    assert.strictEqual(app.currentFolderPath, '/remote/home');
+
+    await browser.selectCurrentFolder();
+    assert.strictEqual(requests[1].serverId, 'remote');
+    assert.deepStrictEqual(JSON.parse(requests[1].options.body), {
+      name: 'home',
+      workingDir: '/remote/home',
+      serverId: 'remote',
+    });
+  });
+
   it('queries resumable conversations by the active tab project and namespace', function () {
     const source = fs.readFileSync(path.join(ROOT, 'src/client/shell/mount.tsx'), 'utf8');
     assert.match(source, /const active = state\.tabs\.find\(\(tab\) => tab\.id === state\.activeId\)/);

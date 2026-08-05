@@ -91,6 +91,28 @@ describe('RuntimeLauncher', function () {
     }
   });
 
+  it('keeps Cursor launchable without treating it as a managed runtime', function () {
+    const html = render(undefined, {
+      maintenance: {
+        targetName: 'This server',
+        // Deliberately inject the legacy shape: the launcher must reject it
+        // even if stale client state still contains a Cursor maintenance row.
+        statuses: {
+          agent: {
+            agentId: 'agent', state: 'missing', version: null, managedVersion: null,
+            check: 'unable_to_check', latestVersion: null, checkedAt: null,
+            canInstall: true, canManageCopy: false, requiresConfirmation: false,
+            disabledReason: null, guidance: null,
+          },
+        },
+        onInstall() {}, onRetry() {}, onCancel() {},
+      },
+    });
+    assert.match(html, />Cursor</);
+    assert.doesNotMatch(html, /Cursor Agent/);
+    assert.doesNotMatch(html, /Not installed/);
+  });
+
   it('offers a no-prompts start only for runtimes whose CLI really has one', function () {
     // Claude --dangerously-skip-permissions, Codex bypass, Grok
     // --always-approve, Qwen --yolo, Kimi --yolo, Oh My Pi --auto-approve,
@@ -136,6 +158,23 @@ describe('RuntimeLauncher', function () {
       !/approvals bypassed/i.test(manual),
       'a conversation that asks first must not be labelled as bypassed',
     );
+  });
+
+  it('shows a recovery anchor but disables resuming it', function () {
+    const html = render(undefined, {
+      conversations: [conversation({
+        rollbackRecoveryPending: true,
+        events: 0,
+        firstMessage: null,
+        canResume: false,
+      })],
+      onResume() {},
+    });
+
+    assert.match(html, /rollback cleanup pending/i);
+    assert.match(html, /disabled=""/);
+    assert.match(html, /Delete this recovery entry to retry cleanup/i);
+    assert.doesNotMatch(html, /transcript only/i);
   });
 
   it('describes what the bypass actually does, not just that it is dangerous', function () {

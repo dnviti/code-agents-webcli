@@ -2,7 +2,13 @@ const assert = require('assert');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const { PasteStore } = require('../dist/server/services/paste-store.js');
+const {
+  MAX_PASTE_MANIFEST_BYTES,
+  PasteStore,
+} = require('../dist/server/services/paste-store.js');
+const {
+  closeWorkspaceSessionDirectoryLeases,
+} = require('../dist/server/services/workspace-session-storage.js');
 
 const PNG = Buffer.from(
   'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==',
@@ -21,6 +27,7 @@ describe('PasteStore .gitignore', function () {
   });
 
   afterEach(function () {
+    closeWorkspaceSessionDirectoryLeases();
     fs.rmSync(storageDir, { recursive: true, force: true });
     fs.rmSync(workingDir, { recursive: true, force: true });
   });
@@ -132,11 +139,12 @@ describe('PasteStore cleanup', function () {
   });
 
   afterEach(function () {
+    closeWorkspaceSessionDirectoryLeases();
     fs.rmSync(storageDir, { recursive: true, force: true });
     fs.rmSync(workingDir, { recursive: true, force: true });
   });
 
-  it('removes every file it wrote, and the directories it created', async function () {
+  it('removes every file it wrote while retaining the safe shared container', async function () {
     const a = await store.save({ id: 'ok', ownerUserId: 1, workingDir }, PNG);
     const b = await store.save({ id: 'ok', ownerUserId: 1, workingDir }, PNG);
 
@@ -144,7 +152,8 @@ describe('PasteStore cleanup', function () {
 
     assert.ok(!fs.existsSync(a.absolutePath));
     assert.ok(!fs.existsSync(b.absolutePath));
-    assert.ok(!fs.existsSync(path.join(workingDir, '.cc-web')));
+    assert.ok(fs.existsSync(path.join(workingDir, '.cc-web', '.gitignore')));
+    assert.deepStrictEqual(fs.readdirSync(path.join(workingDir, '.cc-web', 'pasted')), []);
   });
 
   it('deletes files under a working directory the session has since left', async function () {
@@ -194,16 +203,13 @@ describe('PasteStore cleanup', function () {
     );
   });
 
-  it('re-ignores a directory that was cleaned up and used again', async function () {
+  it('keeps the ignore marker when a cleaned directory is used again', async function () {
     await store.save({ id: 'first', ownerUserId: 1, workingDir }, PNG);
     await store.deletePastes({ id: 'first', ownerUserId: 1 });
-    assert.ok(!fs.existsSync(path.join(workingDir, '.cc-web')));
+    assert.ok(fs.existsSync(path.join(workingDir, '.cc-web', '.gitignore')));
 
     await store.save({ id: 'second', ownerUserId: 1, workingDir }, PNG);
 
-    // The store memoises which directories it has already written a .gitignore
-    // into. Without evicting that memo on cleanup, every later paste into this
-    // project would arrive un-ignored until the process restarted.
     assert.ok(
       fs.existsSync(path.join(workingDir, '.cc-web', '.gitignore')),
       'the ignore marker must be rewritten for the new session',
@@ -254,6 +260,16 @@ describe('PasteStore cleanup', function () {
     assert.ok(fs.existsSync(saved.absolutePath));
   });
 
+  it('retires an oversized manifest without reading it into memory', async function () {
+    const saved = await store.save({ id: 'oversized', ownerUserId: 1, workingDir }, PNG);
+    const manifest = path.join(storageDir, 'pastes', '1', 'oversized.json');
+    fs.writeFileSync(manifest, Buffer.alloc(MAX_PASTE_MANIFEST_BYTES + 1, 0x20));
+
+    await assert.doesNotReject(() => store.deletePastes({ id: 'oversized', ownerUserId: 1 }));
+    assert.ok(!fs.existsSync(manifest));
+    assert.ok(fs.existsSync(saved.absolutePath), 'untrusted oversized entries are not deletion authority');
+  });
+
   it('refuses an upload that arrives after the session was deleted', async function () {
     await store.save({ id: 'ok', ownerUserId: 1, workingDir }, PNG);
     await store.deletePastes({ id: 'ok', ownerUserId: 1 });
@@ -280,5 +296,134 @@ describe('PasteStore cleanup', function () {
     // entries, which would leak the files it forgot.
     assert.strictEqual(manifest.entries.length, 3);
     assert.strictEqual(new Set(results.map((r) => r.absolutePath)).size, 3);
+  });
+
+  it('stores workspace-routed manifests beside the session, not in server storage', async function () {
+    const local = {
+      id: 'local-manifest', ownerUserId: 1, workingDir,
+      storageRoot: workingDir, ownerKey: 'stable-owner',
+    };
+    await store.save(local, PNG);
+
+    const manifest = path.join(
+      workingDir, '.cc-web', 'sessions', 'stable-owner', 'local-manifest', 'paste-manifest.json',
+    );
+    assert.ok(fs.existsSync(manifest));
+    assert.ok(!fs.existsSync(path.join(storageDir, 'pastes', '1', 'local-manifest.json')));
+  });
+
+  it('never writes a workspace manifest through a symlinked final component', async function () {
+    const local = {
+      id: 'symlinked-manifest', ownerUserId: 1, workingDir,
+      storageScope: { workspaceRoot: workingDir, ownerKey: 'stable-owner' },
+    };
+    const saved = await store.save(local, PNG);
+    const manifest = path.join(
+      workingDir, '.cc-web', 'sessions', 'stable-owner', 'symlinked-manifest', 'paste-manifest.json',
+    );
+    const canary = path.join(workingDir, 'manifest-canary.json');
+    fs.writeFileSync(canary, 'outside-sentinel');
+    fs.unlinkSync(manifest);
+    fs.symlinkSync(canary, manifest);
+    const pasteDirectory = path.dirname(saved.absolutePath);
+    const entriesBefore = fs.readdirSync(pasteDirectory).sort();
+
+    await assert.rejects(() => store.save(local, PNG), /unsafe workspace session file/i);
+
+    assert.strictEqual(fs.readFileSync(canary, 'utf8'), 'outside-sentinel');
+    assert.strictEqual(fs.lstatSync(manifest).isSymbolicLink(), true);
+    assert.deepStrictEqual(
+      fs.readdirSync(pasteDirectory).sort(),
+      entriesBefore,
+      'a paste without a durable manifest must not leave an untracked image behind',
+    );
+  });
+
+  it('never treats workspace manifest paths as deletion authority', async function () {
+    const local = {
+      id: 'tampered-manifest', ownerUserId: 1, workingDir,
+      storageScope: { workspaceRoot: workingDir, ownerKey: 'stable-owner' },
+    };
+    await store.save(local, PNG);
+    const manifest = path.join(
+      workingDir, '.cc-web', 'sessions', 'stable-owner', 'tampered-manifest', 'paste-manifest.json',
+    );
+    const canary = path.join(workingDir, 'must-survive.txt');
+    fs.writeFileSync(canary, 'user data');
+    fs.writeFileSync(manifest, JSON.stringify({
+      version: 1,
+      entries: [{ path: canary, root: canary, bytes: 9 }],
+    }));
+
+    await store.deletePastes(local);
+    assert.strictEqual(fs.readFileSync(canary, 'utf8'), 'user data');
+    assert.ok(!fs.existsSync(manifest), 'only the session-owned manifest itself is retired');
+  });
+
+  it('keeps cleanup bound to the pinned pasted directory through a transient swap', async function () {
+    if (process.platform !== 'linux' || !fs.existsSync('/proc/self/fd')) this.skip();
+    const local = {
+      id: 'transient-cleanup', ownerUserId: 1, workingDir,
+      storageScope: { workspaceRoot: workingDir, ownerKey: 'stable-owner' },
+    };
+    const saved = await store.save(local, PNG);
+    const pasted = path.join(workingDir, '.cc-web', 'pasted');
+    const parked = `${pasted}.parked`;
+    const external = fs.mkdtempSync(path.join(os.tmpdir(), 'cawc-clean-external-'));
+    const externalCanary = path.join(external, path.basename(saved.absolutePath));
+    fs.writeFileSync(externalCanary, 'external-canary', { mode: 0o600 });
+
+    const originalUnlink = fs.promises.unlink;
+    let swapped = false;
+    fs.promises.unlink = async function (file, ...rest) {
+      if (!swapped && path.basename(String(file)) === path.basename(saved.absolutePath)) {
+        swapped = true;
+        fs.renameSync(pasted, parked);
+        fs.symlinkSync(external, pasted, 'dir');
+        try {
+          return await originalUnlink.call(this, file, ...rest);
+        } finally {
+          fs.unlinkSync(pasted);
+          fs.renameSync(parked, pasted);
+        }
+      }
+      return originalUnlink.call(this, file, ...rest);
+    };
+
+    try {
+      await store.deletePastes(local);
+    } finally {
+      fs.promises.unlink = originalUnlink;
+    }
+
+    try {
+      assert.strictEqual(swapped, true, 'the test must exchange the visible parent during unlink');
+      assert.strictEqual(fs.existsSync(saved.absolutePath), false);
+      assert.strictEqual(fs.readFileSync(externalCanary, 'utf8'), 'external-canary');
+    } finally {
+      fs.rmSync(external, { recursive: true, force: true });
+    }
+  });
+
+  it('does not perform path-based cleanup on the portable fallback', async function () {
+    const local = {
+      id: 'portable-cleanup', ownerUserId: 1, workingDir,
+      storageScope: { workspaceRoot: workingDir, ownerKey: 'stable-owner' },
+    };
+    const saved = await store.save(local, PNG);
+    const manifest = path.join(
+      workingDir, '.cc-web', 'sessions', 'stable-owner', 'portable-cleanup', 'paste-manifest.json',
+    );
+    const fallback = new PasteStore({ storageDir, forcePathFallback: true });
+    const originalError = console.error;
+    console.error = () => undefined;
+    try {
+      await fallback.deletePastes(local);
+    } finally {
+      console.error = originalError;
+    }
+
+    assert.ok(fs.existsSync(saved.absolutePath), 'fallback cleanup must leave paste bytes untouched');
+    assert.ok(fs.existsSync(manifest), 'the manifest must remain available for a safe retry');
   });
 });

@@ -259,11 +259,19 @@ isolation boundary against another process with access to that runtime.
 
 ## Projects and persistent homes
 
-[Projects](projects.md) use their own containers and disposable `/workspace`
-worktrees, but each project container also mounts the same persistent home as
+[Projects](projects.md) use their own containers and mostly disposable
+`/workspace` worktrees, but preserve the root-level `.cc-web` session archive
+across rebuild/reclaim by staging its exact inode outside the container-writable
+project root and restoring it after cleanup. Project containers also mount the
+same persistent home as
 the owner's per-user environment. That is why a project container can be
 stopped, rebuilt, or reclaimed without costing the user their shell setup,
 agent sign-ins, or tooling installed in that home.
+
+After a crash, server startup reconciles and quiesces the managed runtime before
+returning a staged plaintext archive to `/workspace`. If that cannot be proved
+safe, the archive remains staged and the project is unavailable rather than
+being opened against an empty replacement.
 
 During project recipe review the user can select managed agent runtimes. Their
 pinned executables are installed into this same home, so the first project

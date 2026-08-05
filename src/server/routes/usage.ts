@@ -5,7 +5,18 @@ import { UsageFilters, UsagePeriod, UsageScope } from '../../shared/usage-record
 import { requireUser } from './helpers.js';
 
 export interface UsageRoutesDeps {
-  usageStore: UsageStore;
+  // The HTTP surface only needs the read/attribution contract.  Keeping this
+  // structural lets the workspace coordinator aggregate several owner-bound
+  // UsageStore instances without pretending to be one installation database.
+  usageStore: Pick<UsageStore,
+    | 'dashboard'
+    | 'history'
+    | 'conversations'
+    | 'job'
+    | 'attributeProject'
+    | 'facets'
+    | 'export'
+  >;
   getInstallerUserId(): number | null;
 }
 

@@ -138,6 +138,11 @@ async function list() {
   return (await response.json()).sessions;
 }
 
+async function children(id) {
+  const response = await fetch(`${base}/api/sessions/${encodeURIComponent(id)}/children`);
+  return { status: response.status, body: await response.json().catch(() => null) };
+}
+
 async function remove(id) {
   const response = await fetch(`${base}/api/sessions/${encodeURIComponent(id)}`, {
     method: 'DELETE',
@@ -182,6 +187,27 @@ describe('terminals opened inside a conversation', function () {
     const response = await fetch(`${base}/api/sessions/${created.body.sessionId}`);
     assert.strictEqual(response.status, 200);
     assert.strictEqual((await response.json()).workingDir, '/projects/alpha');
+  });
+
+  it('discovers every durable child shell from the owner-scoped server record', async function () {
+    conversation('chat-children');
+    const first = await post({ ownerSessionId: 'chat-children' });
+    const second = await post({ ownerSessionId: 'chat-children' });
+    sessions.get(first.body.sessionId).active = true;
+    sessions.get(second.body.sessionId).active = false;
+    sessions.set('foreign-child', record('foreign-child', {
+      ownerUserId: OTHER.id,
+      ownerSessionId: 'chat-children',
+      active: true,
+    }));
+
+    const owned = await children('chat-children');
+    assert.strictEqual(owned.status, 200);
+    assert.deepStrictEqual(owned.body.sessionIds, [first.body.sessionId, second.body.sessionId]);
+
+    currentUser = OTHER;
+    const hidden = await children('chat-children');
+    assert.strictEqual(hidden.status, 404, 'another account cannot use the parent as an oracle');
   });
 
   it('leaves standalone sessions exactly as they were', async function () {

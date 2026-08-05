@@ -7,6 +7,7 @@ import type {
   UsagePeriod,
   UsageScope,
 } from '../../shared/usage-records.js';
+import { controllerFetch, getControllerSnapshot } from '../controller/transport.js';
 
 /**
  * The browser's half of the usage-accounting routes.
@@ -18,7 +19,7 @@ import type {
  */
 
 async function getJson<T>(url: string): Promise<T> {
-  const response = await fetch(url, { headers: { Accept: 'application/json' }, credentials: 'same-origin' });
+  const response = await controllerFetch(url, { headers: { Accept: 'application/json' }, credentials: 'same-origin' });
 
   if (!response.ok) {
     // Same reasoning as workspace-api's getJson: a 404 that is not JSON is
@@ -197,7 +198,7 @@ export async function attributeUsageProject(
   jobId: string,
   options: { project: string | null; applyToSession?: boolean; scope: UsageScope },
 ): Promise<{ updated: number; project: string | null }> {
-  const response = await fetch(
+  const response = await controllerFetch(
     `/api/usage/jobs/${encodeURIComponent(jobId)}/project?${new URLSearchParams({ scope: options.scope }).toString()}`,
     {
       method: 'POST',
@@ -238,6 +239,8 @@ export function usageExportUrl(
   appendFilters(params, filters);
   params.set('from', from);
   params.set('to', to);
+  const selected = getControllerSnapshot().selectedServerId;
+  if (selected) params.set('serverId', selected);
   return `/api/usage/export?${params.toString()}`;
 }
 

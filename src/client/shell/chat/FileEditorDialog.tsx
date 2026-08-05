@@ -179,9 +179,10 @@ export function FileEditorDialog({
         confirmLabel: 'Discard',
         cancelLabel: 'Keep editing',
         tone: 'danger',
+        sessionId,
       });
     },
-    [],
+    [sessionId],
   );
 
   const requestClose = React.useCallback(() => {

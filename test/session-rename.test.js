@@ -21,6 +21,7 @@ let server;
 let base;
 let currentUser;
 let saves;
+let saveResult;
 
 function record(id, over = {}) {
   return {
@@ -91,7 +92,7 @@ before(async function () {
       validatePath: (target) => ({ valid: true, path: target }),
       createSessionRecord: (params) => record(params.id, params),
       getRuntimeBridge: () => null,
-      saveSessionsToDisk: async () => { saves++; },
+      saveSessionsToDisk: async () => { saves++; return saveResult; },
       transcriptStore: { ensureTranscript: async () => {}, deleteTranscript: async () => {} },
       historyStore: { deleteHistory: async () => {} },
       getScreenSnapshot: () => [],
@@ -119,6 +120,7 @@ beforeEach(function () {
   sockets.clear();
   currentUser = USER;
   saves = 0;
+  saveResult = true;
 });
 
 async function rename(id, body) {
@@ -164,6 +166,45 @@ async function list() {
       undefined,
       'a session nobody renamed reports no chosen name',
     );
+  });
+
+  it('rolls back and reports a rename that could not be saved', async function () {
+    sessions.set('s1', record('s1', { customName: 'previous' }));
+    const mine = socket('w1', USER.id);
+    sockets.set(mine.id, mine);
+    saveResult = false;
+
+    const result = await rename('s1', { name: 'false success' });
+
+    assert.strictEqual(result.status, 503);
+    assert.deepStrictEqual(result.body, {
+      error: 'session_name_not_saved',
+      message: 'The session name could not be saved',
+    });
+    assert.strictEqual(sessions.get('s1').customName, 'previous');
+    assert.strictEqual(saves, 1);
+    assert.deepStrictEqual(mine.sent, [], 'a failed rename is never broadcast as successful');
+  });
+
+  it('lists a migration-blocked reason but refuses to rename the read-only record', async function () {
+    const reason = 'The workspace is read-only; migration can be retried later';
+    sessions.set('blocked', record('blocked', { persistenceUnavailable: reason }));
+    const mine = socket('w1', USER.id);
+    sockets.set(mine.id, mine);
+
+    const rows = await list();
+    assert.strictEqual(rows.find((row) => row.id === 'blocked').persistenceUnavailable, reason);
+
+    const result = await rename('blocked', { name: 'must not stick' });
+    assert.strictEqual(result.status, 409);
+    assert.deepStrictEqual(result.body, {
+      error: 'session_persistence_unavailable',
+      message: reason,
+      retryable: true,
+    });
+    assert.strictEqual(sessions.get('blocked').customName, undefined);
+    assert.strictEqual(saves, 0);
+    assert.deepStrictEqual(mine.sent, [], 'a refused mutation is not announced as a rename');
   });
 
   it('tells every one of this user\'s sockets, and nobody else\'s', async function () {

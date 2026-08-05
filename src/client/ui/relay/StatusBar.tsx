@@ -6,9 +6,12 @@ export interface StatusBarSegment {
   color?: string;
   title?: string;
   children?: React.ReactNode;
+  /** A status can be an action without pretending that a div is a button. */
+  onClick?: () => void;
+  ariaHasPopup?: React.AriaAttributes['aria-haspopup'];
 }
 
-function Seg({ icon, dot, color, title, children }: StatusBarSegment): React.JSX.Element {
+function Seg({ icon, dot, color, title, children, onClick, ariaHasPopup }: StatusBarSegment): React.JSX.Element {
   const [h, setH] = React.useState(false);
   const segStyle: React.CSSProperties = {
     display: 'inline-flex',
@@ -28,14 +31,19 @@ function Seg({ icon, dot, color, title, children }: StatusBarSegment): React.JSX
     borderRadius: 'var(--radius-full)',
     background: dot,
   };
-  return (
-    <div title={title}
-      onMouseEnter={() => setH(true)} onMouseLeave={() => setH(false)}
-      style={segStyle}>
+  const content = <>
       {dot ? <span style={dotStyle} /> : null}
       {icon ? <span>{icon}</span> : null}
-      {children}
-    </div>
+      <span style={{ minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{children}</span>
+    </>;
+  return onClick ? (
+    <button type="button" title={title} aria-haspopup={ariaHasPopup} onClick={onClick}
+      onMouseEnter={() => setH(true)} onMouseLeave={() => setH(false)}
+      style={{ ...segStyle, border: 'none', maxWidth: 210, cursor: 'pointer', outlineOffset: -2 }}>
+      {content}
+    </button>
+  ) : (
+    <div title={title} onMouseEnter={() => setH(true)} onMouseLeave={() => setH(false)} style={segStyle}>{content}</div>
   );
 }
 

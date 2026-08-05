@@ -7,6 +7,7 @@ export type SelectSize = 'sm' | 'md' | 'lg';
 export interface SelectOption {
   value: string;
   label: React.ReactNode;
+  disabled?: boolean;
 }
 
 export interface SelectProps extends Omit<React.SelectHTMLAttributes<HTMLSelectElement>, 'style' | 'size'> {
@@ -39,7 +40,7 @@ export function Select({ options = [], size = 'md', disabled = false, style, ...
       >
         {options.map((o) => (typeof o === 'string'
           ? <option key={o} value={o}>{o}</option>
-          : <option key={o.value} value={o.value}>{o.label}</option>))}
+          : <option key={o.value} value={o.value} disabled={o.disabled}>{o.label}</option>))}
       </select>
       <span style={{ position: 'absolute', right: 9, top: '50%', transform: 'translateY(-50%)', pointerEvents: 'none', color: 'var(--muted-foreground)', fontSize: isPhone ? PHONE_TEXT.meta : 10 }}>▾</span>
     </div>

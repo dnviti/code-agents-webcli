@@ -104,6 +104,9 @@ export class WebSocketConnection {
 
           this.app.reconnectAttempts = 0;
           publishConnection('connected');
+          if (typeof this.app.handleChatConnectionRestored === 'function') {
+            this.app.handleChatConnectionRestored();
+          }
           this.startHeartbeat();
           this.clearPongTimeout();
           void this.app.loadSessions();

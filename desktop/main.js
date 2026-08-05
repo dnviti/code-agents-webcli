@@ -8,8 +8,10 @@ const path = require('node:path');
 
 const {
   app,
+  autoUpdater: nativeAutoUpdater,
   BrowserWindow,
   dialog,
+  ipcMain,
   Menu,
   screen,
   session,
@@ -17,27 +19,89 @@ const {
 } = require('electron');
 const {
   CUSTOM_TITLE_BAR_HEIGHT,
-  desktopPermissionAllowed,
   desktopWindowChrome,
-  desktopCookie,
   isSafeExternalUrl,
   loginShellPath,
   readWindowState,
-  shutdownAfterStartupFailure,
   titleBarSymbolColor,
   writeWindowState,
 } = require('./lib.js');
+const { ControllerCatalog } = require('./controller-catalog.js');
+const { readControllerPort, writeControllerPort } = require('./controller-endpoint.js');
+const { findLanServers } = require('./controller-discovery.js');
+const { createElectronControllerSessions } = require('./controller-electron.js');
+const { createControllerGateway } = require('./controller-gateway.js');
+const { createControllerRuntime, createLocalControllerTransport } = require('./controller-runtime.js');
+const { installRendererSessionPolicy } = require('./renderer-session-policy.js');
+const { createPhoneAccessService } = require('./phone-access-service.js');
+const { runPackagedWorkspacePersistenceSmoke } = require('./packaged-smoke.js');
+const {
+  migrateLegacyRendererStorage,
+  rendererPreferenceArgument,
+} = require('./legacy-renderer-preferences.js');
+const { DesktopUpdateService } = require('./updater.js');
+const { loadElectronUpdaterProvider } = require('./electron-updater-provider.js');
+const {
+  FlatpakUpdaterProvider,
+  readRunningFlatpakInfo,
+  writeJsonAtomic,
+} = require('./flatpak-updater-provider.js');
+const { CHANNELS: DESKTOP_UPDATE_CHANNELS, registerDesktopUpdateIpc } = require('./update-ipc.js');
 
 const APP_NAME = 'Code Agents Web CLI';
 const DOCUMENTATION_URL = 'https://github.com/dnviti/code-agents-webcli/blob/main/docs/desktop.md';
 const RELEASES_URL = 'https://github.com/dnviti/code-agents-webcli/releases';
 
 let embeddedServer = null;
-let localOrigin = null;
+let controllerGateway = null;
+let controllerOrigin = null;
+let trustedRendererOrigin = null;
+let controllerRuntime = null;
+let phoneAccessService = null;
 let mainWindow = null;
 let stateSaveTimer = null;
 let shutdownStarted = false;
 let shutdownComplete = false;
+let legacyRendererPreferences = {};
+let desktopUpdateService = null;
+let disposeDesktopUpdateIpc = null;
+let shutdownPromise = null;
+let updateInstallShutdown = false;
+let updateQuitAuthorized = false;
+
+const DESKTOP_UPDATE_BUSY_PHASES = new Set([
+  'downloading', 'ready', 'installing', 'restarting',
+]);
+
+function desktopUpdateBusy() {
+  return DESKTOP_UPDATE_BUSY_PHASES.has(desktopUpdateService?.snapshot()?.phase);
+}
+
+function authorizeDesktopUpdateQuit() {
+  updateQuitAuthorized = true;
+}
+
+function revokeDesktopUpdateQuit() {
+  updateQuitAuthorized = false;
+}
+
+function updateHandshakeToken(argumentName) {
+  const prefix = `--${argumentName}=`;
+  const argument = process.argv.find((value) => value.startsWith(prefix));
+  const value = argument?.slice(prefix.length) || '';
+  return /^[0-9a-f]{48}$/.test(value) ? value : null;
+}
+
+const updateRelaunchToken = updateHandshakeToken('cc-web-update-relaunch');
+const updateProbeToken = updateHandshakeToken('cc-web-update-probe');
+let rendererReady = false;
+let rendererReadyFailure = null;
+let resolveRendererReady = null;
+const rendererReadyPromise = updateRelaunchToken
+  ? new Promise((resolve) => {
+      resolveRendererReady = resolve;
+    })
+  : Promise.resolve();
 
 function serverClass() {
   return require('../dist/server/index.js').ClaudeCodeWebServer;
@@ -88,7 +152,7 @@ async function startEmbeddedServer({ dataDir, baseFolder }) {
     dataDir,
     desktop: { authToken, ...localIdentity() },
   });
-  await server.start();
+  const listener = await server.start();
 
   const url = server.localUrl;
   const auth = server.desktopAuthCookie;
@@ -102,7 +166,16 @@ async function startEmbeddedServer({ dataDir, baseFolder }) {
     throw new Error(`Refusing unsafe desktop listener ${parsed.origin}.`);
   }
 
-  return { server, url: parsed.origin, auth };
+  return {
+    server,
+    listener,
+    url: parsed.origin,
+    auth,
+    // Keep the admission root chosen for this embedded server. Deriving it
+    // back from the data directory is not equivalent inside Flatpak, where
+    // the sandbox may relocate application data independently of /tmp.
+    baseFolder: path.resolve(baseFolder),
+  };
 }
 
 function scheduleWindowStateSave(filename) {
@@ -200,15 +273,6 @@ function installMenu() {
   ]));
 }
 
-function installSessionPolicy(ses, origin) {
-  ses.setPermissionCheckHandler((_webContents, permission, requestingOrigin) =>
-    desktopPermissionAllowed(permission, requestingOrigin, origin));
-  ses.setPermissionRequestHandler((webContents, permission, callback, details) => {
-    const requestingOrigin = details?.requestingUrl || webContents.getURL();
-    callback(desktopPermissionAllowed(permission, requestingOrigin, origin));
-  });
-}
-
 function protectNavigation(win, origin) {
   const openExternal = (url) => {
     if (isSafeExternalUrl(url, origin)) void shell.openExternal(url);
@@ -231,7 +295,7 @@ function protectNavigation(win, origin) {
 }
 
 async function createWindow() {
-  if (!localOrigin || !embeddedServer) throw new Error('Desktop server is not ready.');
+  if (!controllerOrigin || !controllerGateway) throw new Error('Desktop controller is not ready.');
   if (mainWindow && !mainWindow.isDestroyed()) {
     if (mainWindow.isMinimized()) mainWindow.restore();
     mainWindow.show();
@@ -259,6 +323,8 @@ async function createWindow() {
       webSecurity: true,
       allowRunningInsecureContent: false,
       webviewTag: false,
+      preload: path.join(__dirname, 'preload.js'),
+      additionalArguments: [rendererPreferenceArgument(legacyRendererPreferences)].filter(Boolean),
     },
   });
   if (process.platform !== 'darwin') {
@@ -275,12 +341,20 @@ async function createWindow() {
   }
   if (isMaximized) mainWindow.maximize();
 
-  protectNavigation(mainWindow, localOrigin);
+  protectNavigation(mainWindow, controllerOrigin);
   mainWindow.on('resize', () => scheduleWindowStateSave(stateFile));
   mainWindow.on('move', () => scheduleWindowStateSave(stateFile));
   mainWindow.on('maximize', () => scheduleWindowStateSave(stateFile));
   mainWindow.on('unmaximize', () => scheduleWindowStateSave(stateFile));
-  mainWindow.on('close', () => {
+  mainWindow.on('close', (event) => {
+    // Removing the in-app close paths is not sufficient: native window chrome,
+    // menus, and OS shortcuts can still request a quit. Once consent starts,
+    // keep the working process alive until the verified installer/relauncher
+    // explicitly authorizes this close.
+    if (desktopUpdateBusy() && !updateQuitAuthorized) {
+      event.preventDefault();
+      return;
+    }
     clearTimeout(stateSaveTimer);
     try {
       writeWindowState(stateFile, {
@@ -292,14 +366,20 @@ async function createWindow() {
     }
   });
   mainWindow.on('closed', () => {
+    failRendererReady(Object.assign(new Error('The updated application window closed during startup.'), {
+      code: 'FLATPAK_RENDERER_NOT_READY',
+    }));
     mainWindow = null;
   });
   mainWindow.once('ready-to-show', () => mainWindow?.show());
   mainWindow.webContents.on('render-process-gone', (_event, details) => {
+    failRendererReady(Object.assign(new Error(`The updated renderer stopped (${details.reason}).`), {
+      code: 'FLATPAK_RENDERER_NOT_READY',
+    }));
     dialog.showErrorBox('The application window stopped', `Renderer reason: ${details.reason}`);
   });
 
-  await mainWindow.loadURL(localOrigin);
+  await mainWindow.loadURL(controllerOrigin);
   return mainWindow;
 }
 
@@ -356,7 +436,135 @@ async function smokeBridgeCommand(bridge, sessionId, options, marker) {
   }
 }
 
+async function runPhoneAccessSmoke(started, workingDir) {
+  const local = createLocalControllerTransport({ origin: started.url, auth: started.auth });
+  const controller = {
+    listTargets: () => [{ id: 'local', name: 'Local computer', status: 'ready' }],
+    request: (serverId, options) => {
+      if (serverId !== 'local') throw new Error('Phone smoke attempted non-local routing.');
+      return local.requestTarget(options);
+    },
+    connectWebSocket: (serverId, options) => {
+      if (serverId !== 'local') throw new Error('Phone smoke attempted a non-local WebSocket.');
+      return local.connectTargetWebSocket(options);
+    },
+  };
+  const service = createPhoneAccessService({
+    controller,
+    dataDir: path.join(workingDir, 'phone-access-smoke'),
+    localAvailable: true,
+    allowEphemeralPort: true,
+  });
+  try {
+    if (service.status().state !== 'off') throw new Error('Phone access was not initially off.');
+    const running = await service.start({ mode: 'tailscale', port: 0 });
+    if (running.state !== 'running' || !running.port || running.pairing || Object.keys(running.origins).length) {
+      throw new Error('Phone access smoke published a route before Tailscale validation.');
+    }
+    await new Promise((resolve, reject) => {
+      const socket = net.createConnection({ host: '127.0.0.1', port: running.port });
+      socket.once('connect', () => { socket.destroy(); resolve(); });
+      socket.once('error', reject);
+    });
+    await service.stop();
+    if (service.status().state !== 'off') throw new Error('Phone access did not return to off.');
+
+    // Rebinding the exact port is a stronger packaged-artifact assertion than
+    // merely observing status: it proves shutdown left no listener behind.
+    const probe = net.createServer();
+    await new Promise((resolve, reject) => {
+      probe.once('error', reject);
+      probe.listen({ host: '127.0.0.1', port: running.port, exclusive: true }, resolve);
+    });
+    await new Promise((resolve) => probe.close(resolve));
+  } finally {
+    await service.close();
+  }
+  console.log('DESKTOP_PHONE_ACCESS_SMOKE_OK off-start-stop-port-released');
+}
+
+async function smokeDeadline(label, operation, timeoutMs = 30_000) {
+  let timer = null;
+  try {
+    return await Promise.race([
+      operation,
+      new Promise((_resolve, reject) => {
+        timer = setTimeout(() => reject(new Error(`${label} timed out.`)), timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+async function runPackagedRendererSmoke(started, expectedSessionName) {
+  // A non-persist:* partition exercises Chromium and the packaged renderer
+  // without putting this qualification run's cookie, cache, or web storage in
+  // the user's default profile. Remote OAuth partitions remain untouched.
+  const partition = `desktop-smoke-${randomBytes(12).toString('hex')}`;
+  const smokeSession = session.fromPartition(partition, { cache: false });
+  await smokeSession.cookies.set({
+    url: `${started.url}/`,
+    name: started.auth.name,
+    value: started.auth.value,
+    httpOnly: true,
+    sameSite: 'strict',
+  });
+  installRendererSessionPolicy(smokeSession, started.url);
+  const win = new BrowserWindow({
+    width: 900,
+    height: 650,
+    show: false,
+    title: `${APP_NAME} packaged smoke`,
+    backgroundColor: '#0a0a0a',
+    webPreferences: {
+      partition,
+      nodeIntegration: false,
+      contextIsolation: true,
+      sandbox: true,
+      webSecurity: true,
+      allowRunningInsecureContent: false,
+      webviewTag: false,
+      devTools: false,
+      preload: path.join(__dirname, 'preload.js'),
+    },
+  });
+  ipcMain.handle(DESKTOP_UPDATE_CHANNELS.snapshot, () => ({
+    phase: 'disabled',
+    currentVersion: app.getVersion(),
+    generation: 0,
+  }));
+  protectNavigation(win, started.url);
+  let rendererFailure = null;
+  win.webContents.once('render-process-gone', (_event, details) => {
+    rendererFailure = new Error(`Packaged smoke renderer stopped (${details.reason}).`);
+  });
+  try {
+    await smokeDeadline('packaged renderer navigation', win.loadURL(started.url));
+    await smokeDeadline('packaged renderer hydration', (async () => {
+      for (;;) {
+        if (rendererFailure) throw rendererFailure;
+        if (win.isDestroyed()) throw new Error('Packaged smoke window was destroyed during hydration.');
+        const ready = await win.webContents.executeJavaScript(`(() => {
+          const root = document.getElementById('relayRoot');
+          return document.getElementById('bootTitlebar') === null
+            && Boolean(root && root.childElementCount > 0)
+            && document.body.innerText.includes(${JSON.stringify(expectedSessionName)});
+        })()`, true);
+        if (ready) return;
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+    })());
+  } finally {
+    if (!win.isDestroyed()) win.destroy();
+    ipcMain.removeHandler(DESKTOP_UPDATE_CHANNELS.snapshot);
+    await smokeSession.clearStorageData().catch(() => undefined);
+  }
+  console.log('DESKTOP_PACKAGED_RENDERER_SMOKE_OK isolated-window-hydrated');
+}
+
 async function runSmokeCheck(started) {
+  console.log('DESKTOP_SMOKE_STAGE config');
   const cookie = `${started.auth.name}=${encodeURIComponent(started.auth.value)}`;
   const headers = { Cookie: cookie };
   const page = await fetch(`${started.url}/`, { headers });
@@ -372,7 +580,22 @@ async function runSmokeCheck(started) {
   if (!config.currentUser || !Array.isArray(config.supportedShells)) {
     throw new Error('Desktop smoke config did not carry the local user and shell catalog.');
   }
-  const workingDir = path.dirname(started.server.database.storageDir);
+  const workingDir = started.baseFolder;
+  if (typeof workingDir !== 'string' || !path.isAbsolute(workingDir)) {
+    throw new Error('Desktop smoke did not retain its embedded server base folder.');
+  }
+  console.log('DESKTOP_SMOKE_STAGE workspace-attachment');
+  const persistence = await runPackagedWorkspacePersistenceSmoke({
+    started,
+    workspaceRoot: path.join(workingDir, 'workspace-smoke'),
+    dataDir: started.server.database.storageDir,
+  });
+  console.log(`DESKTOP_WORKSPACE_ATTACHMENT_SMOKE_OK bytes=${persistence.bytes} workspace-only`);
+  console.log('DESKTOP_SMOKE_STAGE packaged-renderer');
+  await runPackagedRendererSmoke(started, 'Packaged workspace persistence smoke');
+  console.log('DESKTOP_SMOKE_STAGE phone-access');
+  await runPhoneAccessSmoke(started, workingDir);
+  console.log('DESKTOP_SMOKE_STAGE terminal');
   const TerminalBridge = terminalBridgeClass();
   await smokeBridgeCommand(new TerminalBridge(), 'desktop-pty-smoke', {
     workingDir,
@@ -443,6 +666,177 @@ async function runSmokeCheck(started) {
   console.log(`DESKTOP_SMOKE_OK ${process.platform}-${process.arch} pty=${ptySource()}`);
 }
 
+function createDesktopUpdateProvider() {
+  if (!app.isPackaged || process.env.CODE_AGENTS_WEBCLI_DESKTOP_SMOKE === '1') return null;
+  if (process.env.FLATPAK_ID || fs.existsSync('/.flatpak-info')) {
+    return {
+      name: 'flatpak',
+      provider: new FlatpakUpdaterProvider({
+        executable: process.execPath,
+        manifestPublicKeyFile: path.join(process.resourcesPath, 'flatpak-update-public-key.asc'),
+        relaunchDirectory: path.join(app.getPath('userData'), 'desktop-update-relaunch'),
+        releaseSingleInstanceLock: () => app.releaseSingleInstanceLock(),
+        reacquireSingleInstanceLock: () => app.requestSingleInstanceLock(),
+      }),
+    };
+  }
+  return {
+    name: 'electron',
+    provider: loadElectronUpdaterProvider({
+      beforeInstall: authorizeDesktopUpdateQuit,
+      afterInstallFailure: revokeDesktopUpdateQuit,
+      nativeAutoUpdater,
+    }),
+  };
+}
+
+async function prepareDesktopUpdateInstall() {
+  if (shutdownComplete) return;
+  if (shutdownStarted && !updateInstallShutdown) {
+    const error = new Error('The application is already closing.');
+    error.code = 'DESKTOP_SHUTDOWN_IN_PROGRESS';
+    throw error;
+  }
+  shutdownStarted = true;
+  updateInstallShutdown = true;
+  try {
+    await shutdownDesktop({ forUpdate: true });
+    shutdownComplete = true;
+  } catch (error) {
+    shutdownStarted = false;
+    updateInstallShutdown = false;
+    throw error;
+  }
+}
+
+function relaunchFiles(token = updateRelaunchToken) {
+  const directory = path.join(app.getPath('userData'), 'desktop-update-relaunch');
+  return {
+    request: token ? path.join(directory, `${token}.request.json`) : null,
+    ack: token ? path.join(directory, `${token}.ack.json`) : null,
+  };
+}
+
+function validateUpdateHandshake(token, expectedMode) {
+  if (!token) return null;
+  const files = relaunchFiles(token);
+  const stat = fs.statSync(files.request);
+  if (!stat.isFile() || stat.size < 2 || stat.size > 8 * 1024) {
+    throw Object.assign(new Error('The Flatpak update handoff is malformed.'), {
+      code: 'FLATPAK_RELAUNCH_MISMATCH',
+    });
+  }
+  const request = JSON.parse(fs.readFileSync(files.request, 'utf8'));
+  const age = Date.now() - Date.parse(String(request.requestedAt || ''));
+  const running = readRunningFlatpakInfo();
+  if (request.schemaVersion !== 1 || request.token !== token || request.mode !== expectedMode
+    || !/^\d+\.\d+\.\d+$/.test(String(request.expectedVersion || ''))
+    || !/^[0-9a-f]{64}$/i.test(String(request.expectedCommit || ''))
+    || !Number.isFinite(age) || age < -60_000 || age > 5 * 60_000
+    || app.getVersion() !== request.expectedVersion
+    || running.commit.toLowerCase() !== request.expectedCommit.toLowerCase()) {
+    const error = new Error('The relaunched Flatpak does not match the confirmed update.');
+    error.code = 'FLATPAK_RELAUNCH_MISMATCH';
+    throw error;
+  }
+  return { files, request, running };
+}
+
+function validateUpdateRelaunch() {
+  return validateUpdateHandshake(updateRelaunchToken, 'relaunch');
+}
+
+function acknowledgeUpdateHandshake(token, mode, ok, detail = {}) {
+  if (!token) return;
+  const { ack } = relaunchFiles(token);
+  try {
+    let commit = null;
+    try { commit = readRunningFlatpakInfo().commit.toLowerCase(); } catch { /* reported below */ }
+    writeJsonAtomic(ack, {
+      schemaVersion: 1,
+      ok,
+      token,
+      mode,
+      version: app.getVersion(),
+      commit,
+      ...detail,
+    });
+  } catch (error) {
+    console.error('Could not acknowledge Flatpak relaunch:', error?.code || error?.message || error);
+  }
+}
+
+function acknowledgeUpdateRelaunch(ok, detail = {}) {
+  acknowledgeUpdateHandshake(updateRelaunchToken, 'relaunch', ok, detail);
+}
+
+function noteRendererReady() {
+  if (rendererReady) return;
+  rendererReady = true;
+  resolveRendererReady?.();
+}
+
+function failRendererReady(error) {
+  if (!updateRelaunchToken || rendererReady) return;
+  rendererReadyFailure = error;
+  resolveRendererReady?.();
+}
+
+async function waitForRendererReady(timeoutMs = 45_000) {
+  if (!updateRelaunchToken) return;
+  let timeout = null;
+  try {
+    await Promise.race([
+      rendererReadyPromise,
+      new Promise((_resolve, reject) => {
+        timeout = setTimeout(() => reject(Object.assign(
+          new Error('The updated application window did not become ready.'),
+          { code: 'FLATPAK_RENDERER_NOT_READY' },
+        )), timeoutMs);
+        timeout.unref?.();
+      }),
+    ]);
+  } finally {
+    if (timeout) clearTimeout(timeout);
+  }
+  if (rendererReadyFailure) throw rendererReadyFailure;
+  if (!rendererReady || !mainWindow || mainWindow.isDestroyed()) {
+    throw Object.assign(new Error('The updated application window is unavailable.'), {
+      code: 'FLATPAK_RENDERER_NOT_READY',
+    });
+  }
+}
+
+function initializeDesktopUpdates(userData) {
+  let selected = null;
+  try {
+    selected = createDesktopUpdateProvider();
+  } catch (error) {
+    // A packaging defect must not make the whole desktop application unusable.
+    console.error('Desktop updater could not initialize:', error?.code || error?.message || error);
+  }
+  desktopUpdateService = new DesktopUpdateService({
+    currentVersion: app.getVersion(),
+    provider: selected?.provider || null,
+    providerName: selected?.name || null,
+    enabled: Boolean(selected),
+    stateFile: path.join(userData, 'desktop-update-state.json'),
+    beginInstall: async () => { updateQuitAuthorized = false; },
+    prepareInstall: prepareDesktopUpdateInstall,
+    finishInstall: async () => {
+      authorizeDesktopUpdateQuit();
+      app.quit();
+    },
+  });
+  disposeDesktopUpdateIpc = registerDesktopUpdateIpc({
+    ipcMain,
+    service: desktopUpdateService,
+    getWindow: () => mainWindow,
+    getOrigin: () => trustedRendererOrigin,
+    onRendererReady: noteRendererReady,
+  });
+}
+
 async function boot() {
   app.setName(APP_NAME);
   if (process.platform === 'win32') app.setAppUserModelId('io.github.dnviti.code-agents-webcli');
@@ -454,15 +848,22 @@ async function boot() {
   }
 
   const smoke = process.env.CODE_AGENTS_WEBCLI_DESKTOP_SMOKE === '1';
-  const smokeRoot = smoke ? fs.mkdtempSync(path.join(os.tmpdir(), 'cc-web-electron-smoke-')) : null;
-  const started = await startEmbeddedServer({
-    dataDir: smokeRoot ? path.join(smokeRoot, 'data') : path.join(app.getPath('userData'), 'server'),
-    baseFolder: smokeRoot || app.getPath('home'),
-  });
-  embeddedServer = started.server;
-  localOrigin = started.url;
-
+  // Flatpak may expose the sandbox tmp directory through a mount alias. The
+  // server confines requested working directories lexically to its admitted
+  // base, while the persistence smoke canonicalises the child before sending
+  // it over HTTP. Canonicalise the parent once as well so both sides use the
+  // same namespace after `realpath` resolves that alias.
+  const smokeRoot = smoke
+    ? fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'cc-web-electron-smoke-')))
+    : null;
   if (smoke) {
+    console.log('DESKTOP_SMOKE_STAGE embedded-server');
+    const started = await startEmbeddedServer({
+      dataDir: path.join(smokeRoot, 'data'),
+      baseFolder: smokeRoot,
+    });
+    embeddedServer = started.server;
+    console.log('DESKTOP_SMOKE_STAGE embedded-ready');
     try {
       await runSmokeCheck(started);
     } finally {
@@ -477,60 +878,232 @@ async function boot() {
     return;
   }
 
-  const cookie = {
-    ...desktopCookie(localOrigin, started.auth.value, started.auth.name),
-    httpOnly: started.auth.httpOnly,
-    sameSite: started.auth.sameSite,
-  };
-  await session.defaultSession.cookies.set(cookie);
-  installSessionPolicy(session.defaultSession, localOrigin);
+  const userData = app.getPath('userData');
+  const controllerEndpointFile = path.join(userData, 'controller', 'gateway.json');
+  const controllerPort = readControllerPort(controllerEndpointFile);
+  const catalog = new ControllerCatalog({
+    filename: path.join(userData, 'controller', 'servers.json'),
+  });
+  const remoteSessions = createElectronControllerSessions({ session, BrowserWindow });
+  controllerRuntime = createControllerRuntime({
+    catalog,
+    electronSessions: remoteSessions,
+    findLanServers,
+  });
+  phoneAccessService = createPhoneAccessService({
+    controller: controllerRuntime,
+    dataDir: path.join(userData, 'controller'),
+    localAvailable: false,
+  });
+  controllerGateway = createControllerGateway({
+    publicDir: path.join(__dirname, '..', 'dist', 'public'),
+    controller: controllerRuntime,
+    phoneAccess: phoneAccessService,
+    port: controllerPort,
+  });
+  const controllerEndpoint = await controllerGateway.listen();
+  controllerOrigin = controllerEndpoint.origin;
+  trustedRendererOrigin = controllerEndpoint.origin;
+  if (controllerPort === 0) writeControllerPort(controllerEndpointFile, controllerEndpoint.port);
+  const controllerAuthentication = controllerGateway.authentication();
+  const controllerUrls = [
+    `${controllerAuthentication.origin}/*`,
+    `${controllerAuthentication.origin.replace('http:', 'ws:')}/*`,
+  ];
+  session.defaultSession.webRequest.onBeforeSendHeaders({ urls: controllerUrls }, (details, callback) => {
+    const requestHeaders = Object.fromEntries(Object.entries(details.requestHeaders || {}).filter(
+      ([name]) => name.toLowerCase() !== controllerAuthentication.header,
+    ));
+    requestHeaders[controllerAuthentication.header] = controllerAuthentication.value;
+    callback({ requestHeaders });
+  });
+  controllerRuntime.start();
+
+  try {
+    const started = await startEmbeddedServer({
+      dataDir: path.join(userData, 'server'),
+      baseFolder: app.getPath('home'),
+    });
+    embeddedServer = started.server;
+    controllerRuntime.attachLocal({ origin: started.url, auth: started.auth });
+    await phoneAccessService.setLocalAvailable(true);
+    started.listener.on('error', (error) => {
+      controllerRuntime?.reportLocalFailure(error);
+      void phoneAccessService?.setLocalAvailable(false, error)
+        .catch((failure) => console.error('Phone access could not stop after a Local computer failure:', failure));
+    });
+    started.listener.on('close', () => {
+      if (!shutdownStarted) {
+        const error = Object.assign(
+          new Error('The Local computer server stopped.'),
+          { code: 'LOCAL_SERVER_STOPPED' },
+        );
+        controllerRuntime?.reportLocalFailure(error);
+        void phoneAccessService?.setLocalAvailable(false, error)
+          .catch((failure) => console.error('Phone access could not stop after Local computer closed:', failure));
+      }
+    });
+  } catch (error) {
+    controllerRuntime.reportLocalFailure(error);
+    await phoneAccessService.setLocalAvailable(false, error);
+    console.error('Local computer server could not start; remote controller remains available:', error);
+  }
+
+  installRendererSessionPolicy(session.defaultSession, controllerOrigin);
   installMenu();
-  await createWindow();
-  await showFlatpakNotice();
+  initializeDesktopUpdates(userData);
+  await migrateLegacyRendererStorage(userData, session, async (preferences) => {
+    legacyRendererPreferences = preferences;
+    // The migration helper clears only defaultSession's non-cookie renderer
+    // storage and HTTP cache before this first load. It records completion only
+    // after loadURL lets the isolated preload restore the safe preferences.
+    await createWindow();
+  });
+  if (!updateRelaunchToken) await showFlatpakNotice();
+  desktopUpdateService?.start();
 }
 
-const hasLock = app.requestSingleInstanceLock();
-if (!hasLock) {
-  app.quit();
-} else {
-  app.on('second-instance', () => {
-    void createWindow().catch((error) => console.error('Could not focus desktop window:', error));
-  });
-  app.on('activate', () => {
-    if (BrowserWindow.getAllWindows().length === 0) {
-      void createWindow().catch((error) => console.error('Could not recreate desktop window:', error));
+async function shutdownDesktop({ forUpdate = false } = {}) {
+  if (shutdownPromise) return shutdownPromise;
+  const updater = desktopUpdateService;
+  const phoneAccess = phoneAccessService;
+  const runtime = controllerRuntime;
+  const gateway = controllerGateway;
+  const server = embeddedServer;
+  shutdownPromise = (async () => {
+    const failures = [];
+    const attempt = async (name, operation, completed) => {
+      try {
+        await Promise.resolve().then(operation);
+        completed?.();
+        return true;
+      } catch (error) {
+        failures.push({ name, error });
+        return false;
+      }
+    };
+    const continueAfter = (ok) => ok || !forUpdate;
+
+    let proceed = true;
+    if (!forUpdate && updater) {
+      proceed = continueAfter(await attempt('updater', () => updater.stop()));
     }
-  });
-  app.on('window-all-closed', () => {
-    if (process.platform !== 'darwin') app.quit();
-  });
-  app.on('before-quit', (event) => {
-    if (shutdownComplete || !embeddedServer) return;
-    event.preventDefault();
-    if (shutdownStarted) return;
-    shutdownStarted = true;
-    void embeddedServer.shutdown().catch((error) => {
-      console.error('Desktop server shutdown failed:', error);
-    }).finally(() => {
-      embeddedServer = null;
+    // Keep the controller gateway (and therefore the retry dialog) alive until
+    // every Local-work resource has closed successfully. Update failures stop
+    // here instead of tearing down unrelated pieces and stranding the window.
+    if (proceed && phoneAccess) {
+      proceed = continueAfter(await attempt('phone access', () => phoneAccess.close(), () => {
+        if (phoneAccessService === phoneAccess) phoneAccessService = null;
+      }));
+    }
+    if (proceed && server) {
+      proceed = continueAfter(await attempt('embedded server', () => server.shutdown(), () => {
+        if (embeddedServer === server) embeddedServer = null;
+      }));
+    }
+    if (proceed && runtime) {
+      proceed = continueAfter(await attempt('controller runtime', () => runtime.stop(), () => {
+        if (controllerRuntime === runtime) controllerRuntime = null;
+      }));
+    }
+    if (proceed && gateway) {
+      proceed = continueAfter(await attempt('controller gateway', () => gateway.close(), () => {
+        if (controllerGateway === gateway) controllerGateway = null;
+      }));
+    }
+    if (failures.length > 0) {
+      for (const failure of failures) {
+        console.error(`Desktop ${failure.name} shutdown failed:`, failure.error?.code || failure.error?.message || failure.error);
+      }
+      const error = new AggregateError(failures.map((failure) => failure.error), 'Desktop cleanup did not finish.');
+      error.code = 'DESKTOP_SHUTDOWN_FAILED';
+      error.publicMessage = 'Local computer could not close cleanly. Resolve the reported work and retry the update.';
+      throw error;
+    }
+    if (!forUpdate || !controllerGateway) controllerOrigin = null;
+  })();
+  try {
+    return await shutdownPromise;
+  } finally {
+    shutdownPromise = null;
+  }
+}
+
+if (updateProbeToken) {
+  try {
+    validateUpdateHandshake(updateProbeToken, 'probe');
+    acknowledgeUpdateHandshake(updateProbeToken, 'probe', true);
+    app.exit(0);
+  } catch (error) {
+    acknowledgeUpdateHandshake(updateProbeToken, 'probe', false, {
+      code: error?.code || 'FLATPAK_PROBE_MISMATCH',
+    });
+    app.exit(1);
+  }
+} else {
+  const hasLock = app.requestSingleInstanceLock();
+  if (!hasLock) {
+    acknowledgeUpdateRelaunch(false, { code: 'FLATPAK_RELAUNCH_LOCK_BUSY' });
+    app.quit();
+  } else {
+    app.on('second-instance', () => {
+      void createWindow().catch((error) => console.error('Could not focus desktop window:', error));
+    });
+    app.on('activate', () => {
+      if (BrowserWindow.getAllWindows().length === 0) {
+        void createWindow().catch((error) => console.error('Could not recreate desktop window:', error));
+      }
+    });
+    app.on('window-all-closed', () => {
+      // The packaged qualification owns a hidden, non-persistent window and
+      // deliberately destroys it midway through the remaining native smokes.
+      if (process.env.CODE_AGENTS_WEBCLI_DESKTOP_SMOKE !== '1' && process.platform !== 'darwin') app.quit();
+    });
+    app.on('will-quit', () => {
+      void desktopUpdateService?.stop()
+        .catch((error) => console.error('Desktop updater shutdown failed:', error?.code || error?.message || error));
+      disposeDesktopUpdateIpc?.();
+      disposeDesktopUpdateIpc = null;
+    });
+    app.on('before-quit', (event) => {
+      if (desktopUpdateBusy() && !updateQuitAuthorized) {
+        event.preventDefault();
+        return;
+      }
+      if (shutdownComplete) return;
+      event.preventDefault();
+      if (shutdownStarted) return;
+      shutdownStarted = true;
+      void shutdownDesktop()
+        .catch((error) => console.error('Desktop cleanup failed during quit:', error?.code || error?.message || error))
+        .finally(() => {
+          shutdownComplete = true;
+          app.quit();
+        });
+    });
+
+    app.whenReady().then(async () => {
+      validateUpdateRelaunch();
+      await boot();
+      await waitForRendererReady();
+      acknowledgeUpdateRelaunch(true);
+    }).catch(async (error) => {
+      console.error('Desktop startup failed:', error);
+      if (updateRelaunchToken) app.releaseSingleInstanceLock();
+      acknowledgeUpdateRelaunch(false, { code: error?.code || 'FLATPAK_RELAUNCH_START_FAILED' });
+      if (!updateRelaunchToken) {
+        dialog.showErrorBox(
+          `${APP_NAME} could not start`,
+          error instanceof Error ? error.message : String(error),
+        );
+      }
+      try {
+        await shutdownDesktop();
+      } catch (shutdownError) {
+        console.error('Desktop cleanup failed after startup error:', shutdownError?.code || shutdownError?.message || shutdownError);
+      }
       shutdownComplete = true;
       app.quit();
     });
-  });
-
-  app.whenReady().then(boot).catch(async (error) => {
-    console.error('Desktop startup failed:', error);
-    dialog.showErrorBox(
-      `${APP_NAME} could not start`,
-      error instanceof Error ? error.message : String(error),
-    );
-    if (embeddedServer) {
-      await shutdownAfterStartupFailure(embeddedServer, (shutdownError) => {
-        console.error('Desktop server shutdown after startup failure failed:', shutdownError);
-      });
-      embeddedServer = null;
-    }
-    shutdownComplete = true;
-    app.quit();
-  });
+  }
 }

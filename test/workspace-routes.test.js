@@ -131,6 +131,38 @@ after(function () {
 describe('workspace routes', function () {
   this.timeout(20000);
 
+  it('blocks every workspace operation for a recovery anchor with persistence precedence', async function () {
+    const session = sessions.get('session-1');
+    const reason = 'workspace archive is read-only';
+    try {
+      session.rollbackRecoveryPending = true;
+      session.persistenceUnavailable = reason;
+      const unavailable = await get('/api/workspace/session-1/status');
+      assert.deepStrictEqual(unavailable, {
+        status: 409,
+        body: {
+          error: 'session_persistence_unavailable',
+          message: reason,
+          retryable: true,
+        },
+      });
+
+      session.persistenceUnavailable = undefined;
+      const recovery = await get('/api/workspace/session-1/status');
+      assert.deepStrictEqual(recovery, {
+        status: 409,
+        body: {
+          error: 'session_recovery_pending',
+          message: 'This session is retained only to retry an incomplete rollback',
+          retryable: true,
+        },
+      });
+    } finally {
+      session.rollbackRecoveryPending = undefined;
+      session.persistenceUnavailable = undefined;
+    }
+  });
+
   /**
    * Issue #137. What this route must NOT answer with is as much of the point as
    * what it does: it used to serve a plan name that was a CLI flag's default, a
@@ -1164,6 +1196,151 @@ describe('uploading a file into the project', function () {
     });
     assert.strictEqual(response.status, 404);
     sessions.delete('other');
+  });
+});
+
+describe('private workspace state boundary', function () {
+  this.timeout(20000);
+
+  const privateName = 'private.txt';
+
+  beforeEach(function () {
+    fs.mkdirSync(path.join(repo, '.cc-web'), { recursive: true });
+    fs.writeFileSync(path.join(repo, '.cc-web', privateName), 'workspace-secret\n');
+  });
+
+  afterEach(function () {
+    sessions.delete('private-cwd');
+    fs.rmSync(path.join(repo, 'private-state-alias'), { force: true });
+    fs.rmSync(path.join(repo, '.cc-web-example'), { recursive: true, force: true });
+    fs.rmSync(path.join(repo, 'src', '.cc-web'), { recursive: true, force: true });
+    fs.rmSync(path.join(repo, '.cc-web'), { recursive: true, force: true });
+  });
+
+  it('hides the private namespace from listings, search and git metadata', async function () {
+    fs.mkdirSync(path.join(repo, 'src', '.cc-web'));
+    fs.writeFileSync(path.join(repo, 'src', '.cc-web', 'nested-private.txt'), 'nested secret\n');
+
+    const listed = await get('/api/workspace/session-1/files');
+    assert.strictEqual(listed.status, 200);
+    assert.ok(!listed.body.entries.some((entry) => entry.name === '.cc-web'));
+    const nested = await get('/api/workspace/session-1/files?path=src');
+    assert.ok(!nested.body.entries.some((entry) => entry.name === '.cc-web'));
+
+    const found = await get('/api/workspace/session-1/find?q=private&refresh=1');
+    assert.strictEqual(found.status, 200);
+    assert.ok(!found.body.matches.some((match) => match.includes('.cc-web')));
+
+    const changed = await get('/api/workspace/session-1/git');
+    assert.strictEqual(changed.status, 200);
+    assert.ok(!changed.body.changes.some((change) => (
+      change.path.includes('.cc-web') || (change.oldPath || '').includes('.cc-web')
+    )));
+
+    const status = await get('/api/workspace/session-1/status');
+    assert.strictEqual(status.status, 200);
+    assert.strictEqual(status.body.git.changed, changed.body.changes.length);
+  });
+
+  it('refuses listing, reading, downloading and previewing private files', async function () {
+    assert.strictEqual(
+      (await get('/api/workspace/session-1/files?path=.cc-web')).status,
+      403,
+    );
+    assert.strictEqual(
+      (await get('/api/workspace/session-1/file?path=.cc-web%2Fprivate.txt')).status,
+      403,
+    );
+    assert.strictEqual(
+      (await get('/api/workspace/session-1/file?path=src%2F.cc-web%2Fprivate.txt')).status,
+      403,
+    );
+
+    const raw = await fetch(`${base}/api/workspace/session-1/raw?path=.cc-web%2Fprivate.txt`);
+    assert.strictEqual(raw.status, 403);
+    assert.ok(!(await raw.text()).includes('workspace-secret'));
+
+    const asset = await fetch(`${base}/api/workspace/session-1/asset/.cc-web/private.txt`);
+    assert.strictEqual(asset.status, 403);
+    assert.ok(!(await asset.text()).includes('workspace-secret'));
+
+    assert.strictEqual(
+      (await get('/api/workspace/session-1/git/diff?path=.cc-web%2Fprivate.txt')).status,
+      403,
+    );
+  });
+
+  it('refuses editor writes and uploads into the private namespace', async function () {
+    const target = path.join(repo, '.cc-web', privateName);
+    const before = fs.readFileSync(target, 'utf8');
+    const stat = fs.statSync(target);
+
+    const edited = await fetch(`${base}/api/workspace/session-1/file`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        path: `.cc-web/${privateName}`,
+        content: 'overwritten\n',
+        mtimeMs: stat.mtimeMs,
+      }),
+    });
+    assert.strictEqual(edited.status, 403);
+
+    const search = new URLSearchParams({ dir: '.cc-web', name: privateName, overwrite: '1' });
+    const uploaded = await fetch(`${base}/api/workspace/session-1/upload?${search}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/octet-stream' },
+      body: Buffer.from('overwritten\n'),
+    });
+    assert.strictEqual(uploaded.status, 403);
+    assert.strictEqual(fs.readFileSync(target, 'utf8'), before);
+  });
+
+  it('filters private paths from aggregate diffs even when they are in the git index', async function () {
+    const relative = '.cc-web/private.txt';
+    git('add', '-f', relative);
+    fs.writeFileSync(path.join(repo, relative), 'changed workspace-secret\n');
+    try {
+      const { status, body } = await get('/api/workspace/session-1/git/diff');
+      assert.strictEqual(status, 200);
+      assert.ok(!body.diffs.some((diff) => diff.path.includes('.cc-web')));
+    } finally {
+      git('reset', '-q', 'HEAD', '--', relative);
+    }
+  });
+
+  it('refuses a symlink alias whose real target is the private namespace', async function () {
+    fs.symlinkSync(path.join(repo, '.cc-web'), path.join(repo, 'private-state-alias'), 'dir');
+    assert.strictEqual(
+      (await get('/api/workspace/session-1/file?path=private-state-alias%2Fprivate.txt')).status,
+      403,
+    );
+    assert.strictEqual(
+      (await get('/api/workspace/session-1/files?path=private-state-alias')).status,
+      403,
+    );
+  });
+
+  it('refuses every generic workspace route when the restored cwd is private', async function () {
+    sessions.set('private-cwd', sessionRecord({
+      id: 'private-cwd',
+      workingDir: path.join(repo, '.cc-web'),
+    }));
+
+    const listed = await get('/api/workspace/private-cwd/files');
+    assert.strictEqual(listed.status, 403);
+    assert.strictEqual(listed.body.error, 'workspace_private');
+  });
+
+  it('does not block similarly named project directories', async function () {
+    fs.mkdirSync(path.join(repo, '.cc-web-example'));
+    fs.writeFileSync(path.join(repo, '.cc-web-example', 'public.txt'), 'public\n');
+
+    const listed = await get('/api/workspace/session-1/files');
+    assert.ok(listed.body.entries.some((entry) => entry.name === '.cc-web-example'));
+    const opened = await get('/api/workspace/session-1/file?path=.cc-web-example%2Fpublic.txt');
+    assert.strictEqual(opened.status, 200);
+    assert.strictEqual(opened.body.content, 'public\n');
   });
 });
 

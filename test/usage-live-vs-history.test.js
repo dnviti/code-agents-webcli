@@ -332,6 +332,29 @@ describe('history filed before a total was derived', function () {
     );
   });
 
+  it('leaves legacy usage rows unchanged when the database is import-only', function () {
+    const first = new AppDatabase({ dataDir: dir });
+    fileOldRow(first, 'pending-import', {
+      inputTokens: 4, outputTokens: 97, cacheReadTokens: 47287, cacheWriteTokens: 16402,
+    });
+    first.raw.prepare(`UPDATE usage_jobs
+      SET project = 'legacy-project', project_source = NULL
+      WHERE id = 'pending-import'`).run();
+    first.close?.();
+
+    const importOnly = new AppDatabase({
+      dataDir: dir,
+      legacySessionBackfills: false,
+    });
+    try {
+      const row = importOnly.raw.prepare(`SELECT project_source, total_tokens
+        FROM usage_jobs WHERE id = 'pending-import'`).get();
+      assert.deepStrictEqual({ ...row }, { project_source: null, total_tokens: null });
+    } finally {
+      importOnly.close?.();
+    }
+  });
+
   it('leaves a total the runtime did report exactly as it was', function () {
     const first = new AppDatabase({ dataDir: dir });
     first.raw

@@ -1,5 +1,6 @@
 import { ChatController } from './controller.js';
 import type { ChatEvent } from '../../shared/chat-events.js';
+import { parseQualifiedSessionId } from '../controller/transport.js';
 
 /**
  * Every chat conversation this browser is watching, one controller each.
@@ -58,55 +59,44 @@ const CHAT_MESSAGE_TYPES = ChatController.MESSAGE_TYPES;
 
 export class ChatRegistry {
   private readonly controllers = new Map<string, ChatController>();
-
-  /**
-   * Whether the server on the other end can watch more than one conversation.
-   *
-   * Off until the handshake says otherwise. A server that predates this answers
-   * an unknown message with a visible error, so asking anyway would replace a
-   * quiet, working fallback — one live conversation at a time, exactly as
-   * before — with an error toast per tab.
-   */
-  private multiSession = false;
-
-  /**
-   * Whether the server carries the unsent composer between screens.
-   *
-   * Its own flag rather than a second reading of `multiSession`, because the two
-   * arrived in different versions: a server that can watch several conversations
-   * on one socket may still be one that answers `chat_draft` with "this server
-   * does not understand", which on a composer means an error toast per
-   * keystroke.
-   */
-  private draftSync = false;
-
-  /** Whether the server admits correlated app-owned workflow turns. */
-  private builtInWorkflows = false;
+  private defaultFeatures = featureProfile([]);
+  /** A controller socket has one handshake per target, so its features do too. */
+  private readonly serverFeatures = new Map<string, FeatureProfile>();
+  private gatewayConnected = true;
+  private readonly disconnectedServers = new Set<string>();
 
   constructor(private readonly options: ChatRegistryOptions) {}
 
-  /** Apply the feature list from the server's `connected` message. */
-  setFeatures(features: unknown): void {
-    const list = Array.isArray(features) ? features : [];
-    const next = list.includes('chat_subscribe');
-    const gained = next && !this.multiSession;
-    this.multiSession = next;
-    this.draftSync = list.includes('chat_draft');
-    this.builtInWorkflows = list.includes('chat_builtin_workflow');
+  /** Apply one server's feature list from its `connected` handshake. */
+  setFeatures(features: unknown, serverId?: string): void {
+    const previous = serverId ? this.serverFeatures.get(serverId) : this.defaultFeatures;
+    const next = featureProfile(features);
+    if (serverId) this.serverFeatures.set(serverId, next);
+    else this.defaultFeatures = next;
     // Told to the conversations that already exist as well as to the ones built
     // after this: the handshake arrives after a reload has restored its tabs,
     // so the controllers are routinely older than the answer.
-    for (const controller of this.controllers.values()) {
-      controller.setDraftSync(this.draftSync);
-      controller.setBuiltInWorkflowSupport(this.builtInWorkflows);
+    for (const [sessionId, controller] of this.controllers) {
+      if ((serverId || null) !== this.serverFor(sessionId)) continue;
+      controller.setDraftSync(next.draftSync);
+      controller.setBuiltInWorkflowSupport(next.builtInWorkflows);
     }
     // A reconnect to an upgraded server: pick up the conversations that were
     // opened while it could not carry them.
-    if (gained) this.resubscribeAll();
+    if (next.multiSession && !previous?.multiSession) this.resubscribeAll(serverId);
   }
 
   get supportsMultiSession(): boolean {
-    return this.multiSession;
+    return this.defaultFeatures.multiSession;
+  }
+
+  private serverFor(sessionId: string): string | null {
+    return parseQualifiedSessionId(sessionId)?.serverId || null;
+  }
+
+  private featuresFor(sessionId: string): FeatureProfile {
+    const serverId = this.serverFor(sessionId);
+    return serverId ? this.serverFeatures.get(serverId) || featureProfile([]) : this.defaultFeatures;
   }
 
   /** The controller for a session, created on first use. */
@@ -114,14 +104,19 @@ export class ChatRegistry {
     const existing = this.controllers.get(sessionId);
     if (existing) return existing;
 
+    const features = this.featuresFor(sessionId);
     const controller = new ChatController(sessionId, {
       send: this.options.send,
       onChange: () => this.options.onChange(sessionId),
       onEvent: (event) => this.options.onEvent?.(sessionId, event),
       origin: this.options.origin,
-      builtInWorkflows: this.builtInWorkflows,
+      builtInWorkflows: features.builtInWorkflows,
     });
-    controller.setDraftSync(this.draftSync);
+    controller.setDraftSync(features.draftSync);
+    const serverId = this.serverFor(sessionId);
+    if (!this.gatewayConnected || (serverId && this.disconnectedServers.has(serverId))) {
+      controller.connectionLost(false);
+    }
     this.controllers.set(sessionId, controller);
     return controller;
   }
@@ -136,6 +131,27 @@ export class ChatRegistry {
 
   ids(): string[] {
     return Array.from(this.controllers.keys());
+  }
+
+  /** Mark either the whole browser socket or one multiplexed server unavailable. */
+  connectionLost(serverId?: string): void {
+    if (serverId) this.disconnectedServers.add(serverId);
+    else this.gatewayConnected = false;
+    for (const [sessionId, controller] of this.controllers) {
+      if (serverId && this.serverFor(sessionId) !== serverId) continue;
+      controller.connectionLost();
+    }
+  }
+
+  connectionRestored(serverId?: string): void {
+    if (serverId) this.disconnectedServers.delete(serverId);
+    else this.gatewayConnected = true;
+    for (const [sessionId, controller] of this.controllers) {
+      const owner = this.serverFor(sessionId);
+      if (serverId && owner !== serverId) continue;
+      if (!this.gatewayConnected || (owner && this.disconnectedServers.has(owner))) continue;
+      controller.connectionRestored();
+    }
   }
 
   /**
@@ -171,13 +187,14 @@ export class ChatRegistry {
   /** Ask the server for live events on a session, and for its transcript. */
   subscribe(sessionId: string): void {
     const controller = this.ensure(sessionId);
-    if (this.multiSession) controller.subscribe();
+    if (this.featuresFor(sessionId).multiSession) controller.subscribe();
   }
 
   /** Re-establish every subscription, e.g. after the socket reconnected. */
-  resubscribeAll(): void {
-    if (!this.multiSession) return;
-    for (const controller of this.controllers.values()) {
+  resubscribeAll(serverId?: string): void {
+    for (const [sessionId, controller] of this.controllers) {
+      if (serverId !== undefined && this.serverFor(sessionId) !== serverId) continue;
+      if (!this.featuresFor(sessionId).multiSession) continue;
       controller.subscribe();
     }
   }
@@ -186,8 +203,23 @@ export class ChatRegistry {
   drop(sessionId: string): void {
     const controller = this.controllers.get(sessionId);
     if (!controller) return;
-    if (this.multiSession) controller.unsubscribe();
+    if (this.featuresFor(sessionId).multiSession) controller.unsubscribe();
     controller.dispose();
     this.controllers.delete(sessionId);
   }
+}
+
+interface FeatureProfile {
+  multiSession: boolean;
+  draftSync: boolean;
+  builtInWorkflows: boolean;
+}
+
+function featureProfile(features: unknown): FeatureProfile {
+  const list = Array.isArray(features) ? features : [];
+  return {
+    multiSession: list.includes('chat_subscribe'),
+    draftSync: list.includes('chat_draft'),
+    builtInWorkflows: list.includes('chat_builtin_workflow'),
+  };
 }

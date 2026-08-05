@@ -1,10 +1,12 @@
 #!/usr/bin/env node
 // Bundles the browser checks, runs them in headless Chrome, and fails the
 // process if any check reports FAIL.
-const { execFile, spawnSync } = require('child_process');
+const { execFile, spawn, spawnSync } = require('child_process');
 const fs = require('fs');
 const http = require('http');
+const os = require('os');
 const path = require('path');
+const WebSocket = require('ws');
 
 const dir = __dirname;
 const chrome = ['google-chrome', 'google-chrome-stable', 'chromium', 'chromium-browser'].find((bin) => {
@@ -185,9 +187,17 @@ const TYPES = {
 
 const server = http.createServer((request, response) => {
   const url = new URL(request.url, 'http://127.0.0.1');
+  if (url.pathname === '/auth/pair') {
+    response.writeHead(200, {
+      'Content-Type': 'text/plain; charset=utf-8',
+      'Cache-Control': 'no-store',
+    });
+    response.end('NETWORK_PHONE_PAIR_BOOTSTRAP');
+    return;
+  }
   // Normalised first and required to stay under one of the roots afterwards, so
   // a `..` in the request cannot walk out of the directories served here.
-  const relative = path.normalize(decodeURIComponent(url.pathname)).replace(/^[/\\]+/, '');
+  const relative = path.normalize(decodeURIComponent(url.pathname)).replace(/^[/\\]+/, '') || 'index.html';
   const found = ROOTS.map((root) => path.join(root, relative)).find(
     (file) =>
       ROOTS.some((root) => file.startsWith(root + path.sep)) &&
@@ -206,6 +216,154 @@ const server = http.createServer((request, response) => {
 });
 
 server.listen(0, '127.0.0.1', () => run(server.address().port));
+
+function timeout(promise, milliseconds, label) {
+  let timer;
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error(`${label} timed out.`)), milliseconds);
+    }),
+  ]).finally(() => clearTimeout(timer));
+}
+
+function devToolsEndpoint(child) {
+  return timeout(new Promise((resolve, reject) => {
+    let output = '';
+    const parse = (chunk) => {
+      output = `${output}${chunk}`.slice(-32 * 1024);
+      const match = output.match(/DevTools listening on (ws:\/\/[^\s]+)/);
+      if (match) resolve(match[1]);
+    };
+    child.stderr.on('data', parse);
+    child.once('error', reject);
+    child.once('exit', (code) => reject(new Error(`Chrome exited before DevTools was ready (${code}).`)));
+  }), 10_000, 'Chrome DevTools startup');
+}
+
+function connectCdp(endpoint) {
+  return timeout(new Promise((resolve, reject) => {
+    const socket = new WebSocket(endpoint);
+    const pending = new Map();
+    const events = [];
+    let nextId = 1;
+    socket.once('error', reject);
+    socket.once('open', () => {
+      const client = {
+        send(method, params = {}, sessionId) {
+          return new Promise((resolveCall, rejectCall) => {
+            const id = nextId++;
+            pending.set(id, { resolve: resolveCall, reject: rejectCall });
+            socket.send(JSON.stringify({ id, method, params, ...(sessionId ? { sessionId } : {}) }));
+          });
+        },
+        once(method, sessionId) {
+          return new Promise((resolveEvent) => events.push({ method, sessionId, resolve: resolveEvent }));
+        },
+        close() { socket.close(); },
+      };
+      socket.on('message', (data) => {
+        const message = JSON.parse(data.toString('utf8'));
+        if (message.id) {
+          const call = pending.get(message.id);
+          if (!call) return;
+          pending.delete(message.id);
+          if (message.error) call.reject(new Error(message.error.message || 'Chrome DevTools command failed.'));
+          else call.resolve(message.result || {});
+          return;
+        }
+        const index = events.findIndex((event) => event.method === message.method
+          && (!event.sessionId || event.sessionId === message.sessionId));
+        if (index >= 0) events.splice(index, 1)[0].resolve(message.params || {});
+      });
+      resolve(client);
+    });
+  }), 10_000, 'Chrome DevTools connection');
+}
+
+function waitForChildExit(child, milliseconds) {
+  if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve(true);
+  return new Promise((resolve) => {
+    let settled = false;
+    let timer;
+    const finish = (exited) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      child.off('exit', onExit);
+      resolve(exited);
+    };
+    const onExit = () => finish(true);
+    child.once('exit', onExit);
+    timer = setTimeout(() => finish(false), milliseconds);
+    // Close the listener-registration race if Chrome exited between the first
+    // state check and child.once().
+    if (child.exitCode !== null || child.signalCode !== null) finish(true);
+  });
+}
+
+async function runInstalledWorkerCheck(chrome, port) {
+  const profile = fs.mkdtempSync(path.join(os.tmpdir(), 'cc-web-worker-check-'));
+  const child = spawn(chrome, [
+    '--headless=new', '--no-sandbox', '--disable-dev-shm-usage',
+    '--no-first-run', '--no-default-browser-check', '--remote-debugging-port=0',
+    `--user-data-dir=${profile}`, 'about:blank',
+  ], { stdio: ['ignore', 'ignore', 'pipe'] });
+  let cdp;
+  try {
+    cdp = await connectCdp(await devToolsEndpoint(child));
+    const { targetId } = await cdp.send('Target.createTarget', { url: 'about:blank' });
+    const { sessionId } = await cdp.send('Target.attachToTarget', { targetId, flatten: true });
+    await cdp.send('Page.enable', {}, sessionId);
+    const loaded = cdp.once('Page.loadEventFired', sessionId);
+    await cdp.send('Page.navigate', { url: `http://127.0.0.1:${port}/page.html` }, sessionId);
+    await timeout(loaded, 10_000, 'worker-check page load');
+    const expression = `(async()=>{
+      const registration=await navigator.serviceWorker.register('/service-worker.js');
+      await navigator.serviceWorker.ready;
+      if(!navigator.serviceWorker.controller){
+        await new Promise(resolve=>navigator.serviceWorker.addEventListener('controllerchange',resolve,{once:true}));
+      }
+      const cacheName='phone-access-pairing-adversarial';
+      const cache=await caches.open(cacheName);
+      await cache.put('/auth/pair',new Response('<title>CACHED SHELL</title>',{headers:{'content-type':'text/html'}}));
+      const response=await fetch('/auth/pair#token=fragment-never-sent',{cache:'no-store'});
+      const body=await response.text();
+      await caches.delete(cacheName);
+      await registration.unregister();
+      return {controlled:Boolean(navigator.serviceWorker.controller),status:response.status,body};
+    })()`;
+    const evaluated = await timeout(cdp.send('Runtime.evaluate', {
+      expression, awaitPromise: true, returnByValue: true,
+    }, sessionId), 15_000, 'installed service-worker check');
+    if (evaluated.exceptionDetails) {
+      throw new Error(evaluated.exceptionDetails.exception?.description || evaluated.exceptionDetails.text || 'Worker check threw.');
+    }
+    const value = evaluated.result?.value || {};
+    if (!value.controlled || value.status !== 200
+      || value.body !== 'NETWORK_PHONE_PAIR_BOOTSTRAP' || value.body.includes('CACHED SHELL')) {
+      throw new Error(`unexpected worker result ${JSON.stringify(value)}`);
+    }
+    return 'PASS :: the installed worker keeps pairing network-only';
+  } catch (error) {
+    return `FAIL :: the installed worker keeps pairing network-only :: ${String(error?.message || error).replace(/[\r\n]+/g, ' ').slice(0, 500)}`;
+  } finally {
+    try {
+      if (cdp) await timeout(cdp.send('Browser.close'), 2_000, 'Chrome shutdown');
+    } catch {}
+    cdp?.close();
+    if (!(await waitForChildExit(child, 1_000))) {
+      try { child.kill('SIGTERM'); } catch {}
+      if (!(await waitForChildExit(child, 2_000))) {
+        try { child.kill('SIGKILL'); } catch {}
+        await waitForChildExit(child, 2_000);
+      }
+    }
+    // Chrome may finish an atomic profile write just after its parent exits.
+    // Node retries ENOTEMPTY for recursive removals when maxRetries is set.
+    fs.rmSync(profile, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 });
+  }
+}
 
 // Spawned rather than run synchronously, and this is not a style choice: the
 // page is served by the server above, in this process, so a synchronous child
@@ -242,25 +400,31 @@ function run(port) {
       `http://127.0.0.1:${port}/page.html`,
     ],
     { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 },
-    (error, out) => {
+    async (error, out) => {
       fs.rmSync(path.join(dir, 'bundle.js'), { force: true });
-      server.close();
 
       const match = String(out).match(/<pre id="results">([\s\S]*?)<\/pre>/);
       if (!match) {
+        server.close();
         console.error('Browser checks produced no results.');
         if (error) console.error(String(error.message).split('\n')[0]);
+        if (process.env.BROWSER_CHECK_TRACE) console.error(String(out).slice(-4_000));
         process.exit(1);
       }
 
-      const report = match[1]
+      const uiReport = match[1]
         .replace(/&lt;/g, '<')
         .replace(/&gt;/g, '>')
         .replace(/&quot;/g, '"')
         .replace(/&#39;/g, "'")
         .replace(/&amp;/g, '&');
+      const workerReport = await runInstalledWorkerCheck(chrome, port);
+      const report = `${uiReport}\n${workerReport}`;
+      server.close();
 
-      console.log(report);
+      console.log(process.env.BROWSER_CHECK_PHONE_ONLY
+        ? report.split('\n').filter((line) => /Tailscale|installed worker|checked Tailscale/.test(line)).join('\n')
+        : report);
       process.exit(/^FAIL/m.test(report) ? 1 : 0);
     },
   );

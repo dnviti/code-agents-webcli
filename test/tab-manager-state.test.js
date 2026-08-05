@@ -746,10 +746,10 @@ describe('session tab state', function () {
     await new Promise((resolve) => setImmediate(resolve));
 
     assert.ok(!m.tabs.has('chat'), 'the old server does not immediately resurrect the close');
-    assert.deepStrictEqual(
-      JSON.parse(stored.get('cc-web-closed-conversations')),
-      ['chat'],
-      'the old browser-local behaviour is retained only as a rollout fallback',
+    assert.strictEqual(
+      stored.get('cc-web-closed-conversations'),
+      undefined,
+      'old-server fallback remains memory-only instead of writing session ids to the profile',
     );
     assert.deepStrictEqual(
       requests.map((request) => request.init?.method ?? 'GET'),
@@ -799,7 +799,7 @@ describe('session tab state', function () {
       json: async () => { throw new Error('Unexpected token <'); },
     });
     await new Promise((resolve) => setImmediate(resolve));
-    assert.deepStrictEqual(JSON.parse(stored.get('cc-web-closed-conversations')), ['chat']);
+    assert.strictEqual(stored.get('cc-web-closed-conversations'), undefined);
     assert.ok(!m.tabs.has('chat'));
   });
 
@@ -885,10 +885,10 @@ describe('session tab state', function () {
       [{ open: false, legacy: true }, { open: false, legacy: true }],
       'every legacy ID is probed because account-closed tabs are absent from the list',
     );
-    assert.deepStrictEqual(
-      JSON.parse(stored.get('cc-web-closed-conversations')),
-      ['another-account'],
-      'an unknown ID may belong to another account using this browser',
+    assert.strictEqual(
+      stored.get('cc-web-closed-conversations'),
+      undefined,
+      'even an unknown legacy id is retired from the installation profile',
     );
   });
 
@@ -923,7 +923,7 @@ describe('session tab state', function () {
     );
   });
 
-  it('preserves legacy closed tabs when the account session list fails', async function () {
+  it('keeps legacy closed tabs only in memory when the account session list fails', async function () {
     const legacy = JSON.stringify(['closed', 'another-account']);
     stored.set('cc-web-closed-conversations', legacy);
     respondTo = () => ({ ok: false, status: 500, json: async () => ({ sessions: [] }) });
@@ -937,7 +937,7 @@ describe('session tab state', function () {
       console.error = oldError;
     }
 
-    assert.strictEqual(stored.get('cc-web-closed-conversations'), legacy);
+    assert.strictEqual(stored.get('cc-web-closed-conversations'), undefined);
     assert.strictEqual(
       requests.filter((request) => request.init?.method === 'PATCH').length,
       0,
@@ -1294,16 +1294,17 @@ describe('session tab state', function () {
     });
   });
 
-  describe('the selected tab outlives the page', function () {
-    it('remembers the tab that was switched to', async function () {
+  describe('the selected tab remains window-local', function () {
+    it('remembers the tab only in the live manager', async function () {
       const { m } = manager();
       m.addTab('a', 'a', 'idle', null, false);
       m.addTab('b', 'b', 'idle', null, false);
 
       await m.switchToTab('b');
 
-      assert.strictEqual(perWindow.get('cc-web-active-tab'), 'b', 'this window remembers it');
-      assert.strictEqual(stored.get('cc-web-active-tab'), 'b', 'and so does the browser, for the next new window');
+      assert.strictEqual(await m.initialTabId(), 'b', 'the live window remembers it');
+      assert.strictEqual(perWindow.get('cc-web-active-tab'), undefined);
+      assert.strictEqual(stored.get('cc-web-active-tab'), undefined);
     });
 
     it('does not let a second window drag this one off its tab', async function () {
@@ -1323,13 +1324,14 @@ describe('session tab state', function () {
       );
     });
 
-    it('opens on the remembered tab, and on the first one when it is gone', async function () {
+    it('purges old remembered ids and opens on the first server-owned tab', async function () {
       const { m } = manager();
       m.addTab('a', 'a', 'idle', null, false);
       m.addTab('b', 'b', 'idle', null, false);
 
       stored.set('cc-web-active-tab', 'b');
-      assert.strictEqual(await m.initialTabId(), 'b');
+      assert.strictEqual(await m.initialTabId(), 'a');
+      assert.strictEqual(stored.get('cc-web-active-tab'), undefined);
 
       // The remembered session was closed elsewhere, or ended with the server.
       stored.set('cc-web-active-tab', 'ghost');

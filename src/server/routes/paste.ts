@@ -69,6 +69,22 @@ export function createPasteRoutes(deps: PasteRoutesDeps): Router {
         res.status(404).json({ error: 'Session not found' });
         return;
       }
+      if (session.persistenceUnavailable) {
+        res.status(409).json({
+          error: 'session_persistence_unavailable',
+          message: session.persistenceUnavailable,
+          retryable: true,
+        });
+        return;
+      }
+      if (session.rollbackRecoveryPending) {
+        res.status(409).json({
+          error: 'session_recovery_pending',
+          message: 'This session is retained only to retry an incomplete rollback',
+          retryable: true,
+        });
+        return;
+      }
 
       // Project paths are not host paths, even when their strings happen to
       // match one (`/tmp` is the dangerous example). Until paste storage is
@@ -95,7 +111,12 @@ export function createPasteRoutes(deps: PasteRoutesDeps): Router {
 
       try {
         const result = await deps.pasteStore.save(
-          { id: session.id, ownerUserId: session.ownerUserId, workingDir: validation.path },
+          {
+            id: session.id,
+            ownerUserId: session.ownerUserId,
+            workingDir: validation.path,
+            storageScope: session.storageScope,
+          },
           bytes,
         );
         res.json({ path: result.absolutePath, insertText: result.insertText, bytes: result.bytes });

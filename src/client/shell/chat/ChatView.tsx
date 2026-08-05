@@ -80,6 +80,7 @@ export interface ChatViewProps {
   runtime: string;
   runtimeLabel: string;
   workingDir: string;
+  serverName?: string;
   isMobile?: boolean;
   /**
    * The account's approval preference, which is what a conversation *started*
@@ -171,6 +172,7 @@ export function ChatView({
   runtime,
   runtimeLabel,
   workingDir,
+  serverName,
   isMobile = false,
   approvalPreference = false,
   onOpenSettings,
@@ -226,10 +228,13 @@ export function ChatView({
     [transcript, version],
   );
   const exited = chatState === 'exited';
+  const transportUnavailable = !controller.connectionAvailable;
   const unavailable = controller.unavailableReason;
   const workflowUnavailableReason = !controller.builtInWorkflowsAvailable
     ? 'This server does not support guided workflows.'
-    : unavailable?.message
+    : transportUnavailable
+      ? `${serverName || 'This server'} is unavailable. Reconnect it to use server actions.`
+      : unavailable?.message
       ?? (exited
         ? 'This conversation has ended.'
         : !transcript.live
@@ -511,7 +516,7 @@ export function ChatView({
       // Named as the composer's own send, which is what empties the shared
       // draft: a turn sent again from the transcript goes through the same
       // method and must leave a half-written message alone. See sendTurn.
-      controller.sendTurn(text, attachments, { fromComposer: true });
+      if (!controller.sendTurn(text, attachments, { fromComposer: true })) return;
       // Emptied here, before the composer empties itself. It clears the text and
       // the files one after the other, and each of those is a publishable state
       // — so without this the account's other screens would watch the message
@@ -601,7 +606,7 @@ export function ChatView({
     [controller, runtime],
   );
   const upload = React.useCallback(
-    (file: File) => uploadAttachment(controller.sessionId, file),
+    (file: File, signal?: AbortSignal) => uploadAttachment(controller.sessionId, file, signal),
     [controller],
   );
   const findProjectFiles = React.useCallback(
@@ -1277,7 +1282,7 @@ export function ChatView({
                     answered={request ? undefined : transcript.answerFor(answerKey)}
                     ownWords={request ? undefined : transcript.answerTextFor(answerKey)}
                     abandoned={!request && transcript.abandonedFor(answerKey)}
-                    onAnswer={answerQuestion}
+                    onAnswer={transportUnavailable ? undefined : answerQuestion}
                   />;
                 })}
               </div>
@@ -1293,7 +1298,7 @@ export function ChatView({
                 style={{ display: 'grid', gap: 'var(--space-2)', maxHeight: '50vh', overflowY: 'auto' }}
               >
                 {pending.map((request) => (
-                  <PermissionCard key={request.requestId} request={request} onRespond={respond} />
+                  <PermissionCard key={request.requestId} request={request} onRespond={respond} busy={transportUnavailable} />
                 ))}
               </div>
             ) : null}
@@ -1307,7 +1312,7 @@ export function ChatView({
               // used to disable it too, which meant the one moment you most
               // want to type the follow-up — while the agent waits on you — was
               // the one moment you could not. It queues instead.
-              disabled={exited || Boolean(unavailable)}
+              disabled={exited || Boolean(unavailable) || transportUnavailable}
               placeholder={placeholderFor(chatState, runtimeLabel, isMobile)}
               queued={transcript.queuedTurns}
               onCancelQueued={cancelQueued}
@@ -1473,7 +1478,7 @@ export function ChatView({
         onClose={() => setEditing(null)}
         isMobile={isMobile}
       />
-      {planOpen ? <PlanDocDialog plan={controller.planDocumentValue} planMode={controller.planModeValue} disabled={planLocked} feedback={controller.planFeedback?.message || null} retryAction={controller.planFeedback?.accepted === false && controller.planFeedback.action !== 'mode' ? controller.planFeedback.action : null} onAccept={(revision) => { setPlanAction('accept'); controller.acceptPlan(revision); }} onReject={(revision) => { setPlanAction('reject'); controller.rejectPlan(revision); }} onClose={() => setPlanOpen(false)} /> : null}
+      {planOpen ? <PlanDocDialog plan={controller.planDocumentValue} planMode={controller.planModeValue} disabled={planLocked || !controller.connectionAvailable} feedback={controller.planFeedback?.message || null} retryAction={controller.planFeedback?.accepted === false && controller.planFeedback.action !== 'mode' ? controller.planFeedback.action : null} serverName={serverName} onAccept={(revision) => { setPlanAction('accept'); controller.acceptPlan(revision); }} onReject={(revision) => { setPlanAction('reject'); controller.rejectPlan(revision); }} onClose={() => setPlanOpen(false)} /> : null}
     </section>
     </PhoneContext.Provider>
   );
@@ -1581,51 +1586,21 @@ interface DraftState {
 
 const EMPTY_DRAFT: DraftState = { text: '', attachments: [] };
 
-/**
- * Read this browser's own copy of a draft back.
- *
- * Session storage rather than local: a draft is something you are in the middle
- * of, and one restored into a new window a week later is a surprise rather than
- * a convenience.
- *
- * A bare string is what every version before the shared composer wrote here, and
- * it still reads correctly — as a draft with nothing attached to it, which is
- * exactly what it was.
- */
-function readStoredDraft(key: string): DraftState {
-  let raw: string | null = null;
+/** Remove the pre-workspace browser copy without importing private text. */
+function forgetLegacyStoredDraft(key: string): void {
   try {
-    raw = sessionStorage.getItem(key);
+    sessionStorage.removeItem(key);
   } catch {
-    // Private browsing, or storage disabled. Nothing was kept.
-    return EMPTY_DRAFT;
-  }
-  if (!raw) return EMPTY_DRAFT;
-  try {
-    const parsed = JSON.parse(raw) as Partial<DraftState>;
-    // Anything that parses but is not one of these is a draft from before this
-    // was written that happened to look like JSON — `42`, `true`, `[1, 2]`. It
-    // is still what somebody typed, so it is still their draft.
-    if (!parsed || typeof parsed !== 'object' || typeof parsed.text !== 'string') {
-      return { text: raw, attachments: [] };
-    }
-    return {
-      text: parsed.text,
-      attachments: Array.isArray(parsed.attachments) ? parsed.attachments : [],
-    };
-  } catch {
-    return { text: raw, attachments: [] };
+    // Storage may be disabled. There is no new browser-side write either way.
   }
 }
 
 /**
  * The composer, shared with every other screen looking at this conversation.
  *
- * Three copies of one sentence, and each of them earns its place. The React
- * state is what the field renders from. Session storage is what survives this
- * page being reloaded, and it is the only copy left when the server has
- * restarted under an open tab. The server's own is the one the account's other
- * screens read, which is the whole point (#163).
+ * Two copies of one sentence, and each of them earns its place. The React state
+ * is what the field renders from. The server's workspace-local session record
+ * is the durable copy the account's other screens and a restarted server read.
  *
  * The rule between them is the plainest one that works: whoever typed last wins.
  * There is no merging here and there should not be — two devices belonging to
@@ -1644,7 +1619,8 @@ function useSyncedDraft(
     // time, and what it heard is newer than anything written here.
     const held = controller.draftValue;
     if (held.revision > 0) return { text: held.text, attachments: held.attachments };
-    return readStoredDraft(key);
+    forgetLegacyStoredDraft(key);
+    return EMPTY_DRAFT;
   });
 
   /** So the effect below can read the current draft without re-running on it. */
@@ -1652,14 +1628,11 @@ function useSyncedDraft(
   latest.current = draft;
 
   const remember = React.useCallback(
-    (next: DraftState) => {
-      try {
-        if (next.text || next.attachments.length) sessionStorage.setItem(key, JSON.stringify(next));
-        else sessionStorage.removeItem(key);
-      } catch {
-        // Applying it anyway is right: it works for this window, it just will
-        // not survive a reload.
-      }
+    (_next: DraftState) => {
+      // Old builds placed draft text and attachment metadata in Chromium's
+      // userData. Never write it there again, and erase the legacy key if an
+      // upgraded renderer encounters one.
+      forgetLegacyStoredDraft(key);
     },
     [key],
   );
@@ -1692,11 +1665,9 @@ function useSyncedDraft(
         remember(next);
         return;
       }
-      // The server has no composer for this conversation — it has restarted, or
-      // nothing has been typed into it since it came up. This browser may be the
-      // only thing still holding what was being written, so it offers it rather
-      // than waiting to be asked. Nothing goes out when there is nothing to
-      // offer, so an empty composer stays quiet.
+      // The server has no composer for this conversation. Browser storage is no
+      // longer a source of session data, so only this mount's live React value
+      // can be offered (normally empty, unless the subscription raced typing).
       const held = latest.current;
       if (held.text || held.attachments.length) {
         controller.publishDraft(held.text, held.attachments);

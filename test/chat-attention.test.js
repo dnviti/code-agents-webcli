@@ -246,6 +246,24 @@ describe('telling the user a conversation needs them', function () {
     assert.match(shown[0].options.body, /Finished/);
   });
 
+  it('always names each originating server when notification details are enabled', function () {
+    assert.deepStrictEqual(mod.compose([{
+      sessionId: 'qualified-one',
+      kind: 'approval',
+      name: 'Deploy',
+      detail: 'Run the release command',
+      serverName: 'Office',
+    }], true), {
+      title: 'Deploy',
+      body: 'Server: Office. Waiting for approval — Run the release command',
+    });
+
+    assert.strictEqual(mod.compose([
+      { sessionId: 'one', kind: 'finished', name: 'Web', serverName: 'Office' },
+      { sessionId: 'two', kind: 'finished', name: 'Docs', serverName: 'Lab' },
+    ], true).body, 'Web — Office, Docs — Lab');
+  });
+
   it('says nothing about the conversation on screen', async function () {
     const { app, registry } = conversation();
     app.sessionTabManager.activeTabId = 's1';
