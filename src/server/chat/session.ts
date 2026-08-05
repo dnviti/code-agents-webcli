@@ -226,6 +226,8 @@ export interface ChatUsageSink {
 
 export interface ChatSessionStartOptions {
   runtime: string;
+  /** Exact executable selected for this launch, when app-managed. */
+  command?: string;
   workingDir: string;
   /** Whether workingDir is already an absolute path inside the container. */
   cwdKind?: 'host' | 'container';
@@ -287,6 +289,10 @@ export interface PlanModeResult {
   changed: boolean;
   detail: string;
 }
+
+export type AgentUpdateRestartResult =
+  | { ok: true; resumed: boolean }
+  | { ok: false; reason: 'not_running' | 'busy' | 'cannot_resume' };
 
 export interface PlanSubmissionResult {
   accepted: boolean;
@@ -957,6 +963,84 @@ export class ChatSession {
     return this.runtime;
   }
 
+  /**
+   * The server-side restart gate. A browser snapshot is necessarily stale by
+   * the time a click arrives, so only this object can safely decide that no
+   * submitted work or interaction will be interrupted.
+   */
+  get safeForAutomaticAgentRestart(): boolean {
+    return this.live
+      && this.state === 'idle'
+      && this.adapterReady
+      && this.turnInFlightId === null
+      && this.queue.length === 0
+      && this.pending.size === 0
+      && this.questions.size === 0
+      && this.questionContinuations.size === 0
+      && this.questionDispatches.size === 0
+      && !this.questionTransitionRunning
+      && !this.restarting;
+  }
+
+  /** Whether the runtime can carry its native conversation across a process replacement. */
+  get resumableForAgentRestart(): boolean {
+    return Boolean(
+      this.nativeSessionId
+      && (this.capabilities?.resume === true || this.adapter?.capabilities.resume === true),
+    );
+  }
+
+  /**
+   * Replace only the live agent process while retaining this ChatSession and
+   * its app transcript. Manual callers may interrupt work; automatic callers
+   * must pass the atomic idle gate above. A non-resumable restart is explicit
+   * because the app transcript survives but the agent's own memory does not.
+   */
+  async restartForAgentUpdate(input: {
+    automatic: boolean;
+    allowFreshContext: boolean;
+    command?: string;
+  }): Promise<AgentUpdateRestartResult> {
+    if (!this.live || !this.lastStartOptions) return { ok: false, reason: 'not_running' };
+    if (this.restarting) return { ok: false, reason: 'busy' };
+    if (input.automatic && !this.safeForAutomaticAgentRestart) {
+      return { ok: false, reason: 'busy' };
+    }
+
+    const resumeSessionId = this.resumableForAgentRestart
+      ? this.nativeSessionId || undefined
+      : undefined;
+    if (!resumeSessionId && !input.allowFreshContext) {
+      return { ok: false, reason: 'cannot_resume' };
+    }
+
+    const options = this.lastStartOptions;
+    this.restarting = true;
+    this.adapterGeneration++;
+    let oldRuntimeStopped = false;
+    try {
+      await this.stop({ preserveHandoffs: Boolean(resumeSessionId) });
+      oldRuntimeStopped = true;
+      await this.start({
+        ...options,
+        command: input.command || options.command,
+        resumeSessionId,
+        // Starting without native context must not truncate the app transcript.
+        startFresh: false,
+      });
+    } catch (error) {
+      if (oldRuntimeStopped) {
+        this.deps.onLifecycle?.(this.ref.id, { exited: true, restarting: false });
+      }
+      throw error;
+    } finally {
+      this.restarting = false;
+    }
+
+    this.deps.onLifecycle?.(this.ref.id, { exited: false, bypassing: this.bypass });
+    return { ok: true, resumed: Boolean(resumeSessionId) };
+  }
+
   async start(options: ChatSessionStartOptions): Promise<void> {
     if (this.adapter) {
       throw new Error(`chat session ${this.ref.id} is already running`);
@@ -1273,7 +1357,7 @@ export class ChatSession {
       // Kept out of `commands`: absolute paths are launch metadata for Codex,
       // not capabilities a browser or transcript should ever receive.
       installedSkills: installed.skills,
-      command: this.deps.resolveCommand(options.runtime),
+      command: options.command || this.deps.resolveCommand(options.runtime),
       commandName: this.deps.resolveCommandName?.(options.runtime),
       environment: options.environment,
       model: options.model,
@@ -1334,7 +1418,11 @@ export class ChatSession {
     // are probed at all — everybody else either says so over their protocol or
     // has no list to give — but the check makes the precedence explicit rather
     // than incidental: what the runtime says always wins.
-    void installedModels(options.runtime, this.deps.resolveCommand(options.runtime), env)
+    void installedModels(
+      options.runtime,
+      options.command || this.deps.resolveCommand(options.runtime),
+      env,
+    )
       .then((models) => {
         if (models.length === 0) return;
         if (this.adapter !== adapter) return; // restarted since; that session owns its own menu

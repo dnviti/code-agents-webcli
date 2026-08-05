@@ -63,6 +63,13 @@ export interface StartSessionOptions {
    * passed before per-user environments existed.
    */
   environment?: UserEnvironment;
+  /**
+   * Exact executable selected for this launch.
+   *
+   * Agent maintenance resolves this from the session's execution environment
+   * immediately before spawning. Absent keeps the historical bridge lookup.
+   */
+  command?: string;
   dangerouslySkipPermissions?: boolean;
   /**
    * Free-text model id from the active runtime profile. Passed via the
@@ -238,7 +245,7 @@ export abstract class BaseBridge {
       const displayName = this.getDisplayName();
 
       console.log(`Starting ${displayName} session ${sessionId}`);
-      console.log(`Command: ${this.resolvedCommand}`);
+      console.log(`Command: ${options.command || this.resolvedCommand}`);
       console.log(`Working directory: ${workingDir}`);
       console.log(`Terminal size: ${cols}x${rows}`);
 
@@ -265,9 +272,9 @@ export abstract class BaseBridge {
       // does not exist, so the plain name is used and the image's own PATH
       // resolves it — which is also what makes the base image the place where
       // an administrator decides which agents exist.
-      const command = environment.kind === 'container'
+      const command = options.command || (environment.kind === 'container'
         ? this.getDefaultCommand()
-        : this.resolvedCommand;
+        : this.resolvedCommand);
       const launch = environment.wrap(command, args, {
         cwd: workingDir,
         cwdKind: options.cwdKind,

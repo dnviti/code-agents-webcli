@@ -91,6 +91,28 @@ describe('RuntimeLauncher', function () {
     }
   });
 
+  it('keeps Cursor launchable without treating it as a managed runtime', function () {
+    const html = render(undefined, {
+      maintenance: {
+        targetName: 'This server',
+        // Deliberately inject the legacy shape: the launcher must reject it
+        // even if stale client state still contains a Cursor maintenance row.
+        statuses: {
+          agent: {
+            agentId: 'agent', state: 'missing', version: null, managedVersion: null,
+            check: 'unable_to_check', latestVersion: null, checkedAt: null,
+            canInstall: true, canManageCopy: false, requiresConfirmation: false,
+            disabledReason: null, guidance: null,
+          },
+        },
+        onInstall() {}, onRetry() {}, onCancel() {},
+      },
+    });
+    assert.match(html, />Cursor</);
+    assert.doesNotMatch(html, /Cursor Agent/);
+    assert.doesNotMatch(html, /Not installed/);
+  });
+
   it('offers a no-prompts start only for runtimes whose CLI really has one', function () {
     // Claude --dangerously-skip-permissions, Codex bypass, Grok
     // --always-approve, Qwen --yolo, Kimi --yolo, Oh My Pi --auto-approve,

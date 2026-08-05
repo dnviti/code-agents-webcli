@@ -190,6 +190,20 @@ export interface MessageProcessorDeps {
   /** Shared with HTTP tab routes so creation cannot cross a tentative close/reorder. */
   tabCoordinator?: AccountTabCoordinatorLike;
   getRuntimeBridge(agentKind: AgentKind): BridgeInterface | null;
+  /** Select an app-managed executable for this exact session environment. */
+  resolveAgentLaunch?(
+    session: SessionRecord,
+    environment: UserEnvironment,
+    agentKind: AgentKind,
+  ): { command: string; version: string } | null;
+  /** Resolve the exact immutable environment already occupied by a live session. */
+  resolveAgentEnvironment?(session: SessionRecord): Promise<UserEnvironment>;
+  /** Probe the executable used by a successful spawn; pointer metadata is not process identity. */
+  probeAgentLaunchVersion?(
+    environment: UserEnvironment,
+    agentKind: AgentKind,
+    command?: string,
+  ): Promise<string | null>;
   saveSessionsToDisk(): Promise<boolean | void>;
   /**
    * Launch configuration for this runtime, already resolved from the active
@@ -270,6 +284,7 @@ export interface ChatManagerLike {
     record: SessionRecord,
     options: {
       runtime: string;
+      command?: string;
       workingDir: string;
       cwdKind?: 'host' | 'container';
       fileAccess?: {
@@ -364,6 +379,10 @@ export interface ChatManagerLike {
     text?: string,
   ): boolean | Promise<boolean>;
   stop(sessionId: string): Promise<void>;
+  restartForAgentUpdate?(
+    sessionId: string,
+    input: { automatic: boolean; allowFreshContext: boolean; command?: string },
+  ): Promise<{ ok: true; resumed: boolean } | { ok: false; reason: 'not_running' | 'busy' | 'cannot_resume' }>;
   readPage(
     record: SessionRecord,
     fromSeq: number,
@@ -432,6 +451,9 @@ interface IncomingMessage {
   effort?: string | null;
   planMode?: boolean;
   revision?: number;
+  /** Agent-update restart policy; the server re-checks all live state. */
+  automatic?: boolean;
+  allowFreshContext?: boolean;
 }
 
 interface HeldProjectSessionLease extends ProjectSessionLease {
@@ -468,6 +490,8 @@ export class MessageProcessor {
     string,
     { session: SessionRecord; runId: string | undefined; promise: Promise<void> }
   >();
+  /** One agent replacement per session; a second click receives Busy. */
+  private agentUpdateRestarts = new Map<string, Promise<void>>();
   /**
    * Successful workflow admissions keyed by owner, conversation and client id.
    *
@@ -564,6 +588,10 @@ export class MessageProcessor {
 
       case 'start_terminal':
         await this.startRuntime(wsId, 'terminal', data.options || {});
+        break;
+
+      case 'runtime_restart':
+        await this.handleAgentUpdateRestart(wsId, wsInfo, data);
         break;
 
       case 'start_chat':
@@ -1488,6 +1516,11 @@ export class MessageProcessor {
       return;
     }
 
+    const managedLaunch = agentKind === 'terminal'
+      ? null
+      : this.deps.resolveAgentLaunch?.(session, environment, agentKind) ?? null;
+    if (managedLaunch) safeOptions.command = managedLaunch.command;
+
     let runtimeMayBeAlive = false;
     try {
       const runtimeSession = (await bridge.startSession(sessionId, {
@@ -1603,6 +1636,18 @@ export class MessageProcessor {
       this.persistActive(session, true);
       session.agent = agentKind;
       session.lastAgent = agentKind;
+      const verifiedVersion = agentKind === 'terminal'
+        ? null
+        : await this.deps.probeAgentLaunchVersion?.(
+            environment,
+            agentKind,
+            managedLaunch?.command,
+          ) ?? null;
+      session.runningAgentVersion = verifiedVersion;
+      session.runningManagedAgentVersion = managedLaunch && verifiedVersion === managedLaunch.version
+        ? verifiedVersion
+        : null;
+      session.runtimeStartOptions = { ...safeOptions };
       session.stopRequested = false;
       session.lastActivity = new Date();
       session.runtimeLabel =
@@ -1704,6 +1749,143 @@ export class MessageProcessor {
       if (this.runtimeStops.get(sessionId) === entry) {
         this.runtimeStops.delete(sessionId);
       }
+    }
+  }
+
+  private async handleAgentUpdateRestart(
+    wsId: string,
+    wsInfo: WebSocketInfo,
+    data: IncomingMessage,
+  ): Promise<void> {
+    const sessionId = typeof data.sessionId === 'string' ? data.sessionId : '';
+    if (!sessionId) {
+      sendToWebSocket(wsInfo.ws, {
+        type: 'runtime_restart_result', sessionId, ok: false, reason: 'invalid_session',
+      });
+      return;
+    }
+    if (this.agentUpdateRestarts.has(sessionId)) {
+      sendToWebSocket(wsInfo.ws, { type: 'runtime_restart_result', sessionId, ok: false, reason: 'busy' });
+      return;
+    }
+    const attempt = this.handleAgentUpdateRestartOnce(wsId, wsInfo, data, sessionId);
+    this.agentUpdateRestarts.set(sessionId, attempt);
+    try {
+      await attempt;
+    } finally {
+      if (this.agentUpdateRestarts.get(sessionId) === attempt) {
+        this.agentUpdateRestarts.delete(sessionId);
+      }
+    }
+  }
+
+  private async handleAgentUpdateRestartOnce(
+    wsId: string,
+    wsInfo: WebSocketInfo,
+    data: IncomingMessage,
+    sessionId: string,
+  ): Promise<void> {
+    const session = this.deps.claudeSessions.get(sessionId);
+    if (!session || session.ownerUserId !== wsInfo.userId) {
+      sendToWebSocket(wsInfo.ws, { type: 'runtime_restart_result', sessionId, ok: false, reason: 'not_found' });
+      return;
+    }
+    if (wsInfo.claudeSessionId !== sessionId) {
+      sendToWebSocket(wsInfo.ws, { type: 'runtime_restart_result', sessionId, ok: false, reason: 'not_current' });
+      return;
+    }
+    if (session.projectId) {
+      sendToWebSocket(wsInfo.ws, { type: 'runtime_restart_result', sessionId, ok: false, reason: 'project_managed' });
+      return;
+    }
+    const agentKind = session.agent || session.lastAgent;
+    if (!agentKind || agentKind === 'terminal') {
+      sendToWebSocket(wsInfo.ws, { type: 'runtime_restart_result', sessionId, ok: false, reason: 'not_agent' });
+      return;
+    }
+
+    let environment: UserEnvironment;
+    try {
+      environment = this.deps.resolveAgentEnvironment
+        ? await this.deps.resolveAgentEnvironment(session)
+        : await this.userEnvironment(session.ownerUserId);
+    } catch (error) {
+      console.error(`Could not resolve the environment for agent restart ${sessionId}:`, error);
+      sendToWebSocket(wsInfo.ws, {
+        type: 'runtime_restart_result', sessionId, ok: false,
+        reason: 'environment_unavailable',
+      });
+      return;
+    }
+    const selected = this.deps.resolveAgentLaunch?.(session, environment, agentKind) ?? null;
+    if (!selected) {
+      sendToWebSocket(wsInfo.ws, { type: 'runtime_restart_result', sessionId, ok: false, reason: 'no_managed_update' });
+      return;
+    }
+
+    try {
+      if (session.surface === 'chat') {
+        const result = await this.deps.chatManager?.restartForAgentUpdate?.(sessionId, {
+          automatic: data.automatic === true,
+          allowFreshContext: data.allowFreshContext === true,
+          command: selected.command,
+        }) ?? { ok: false as const, reason: 'not_running' as const };
+        if (!result.ok) {
+          sendToWebSocket(wsInfo.ws, { type: 'runtime_restart_result', sessionId, ok: false, reason: result.reason });
+          return;
+        }
+        const verifiedVersion = await this.deps.probeAgentLaunchVersion?.(
+          environment,
+          agentKind,
+          selected.command,
+        ) ?? null;
+        if (verifiedVersion !== selected.version) {
+          sendToWebSocket(wsInfo.ws, {
+            type: 'runtime_restart_result', sessionId, ok: false,
+            reason: 'version_verification_failed',
+          });
+          return;
+        }
+        session.runningAgentVersion = verifiedVersion;
+        session.runningManagedAgentVersion = verifiedVersion;
+        sendToWebSocket(wsInfo.ws, {
+          type: 'runtime_restart_result', sessionId, ok: true,
+          resumed: result.resumed, version: selected.version,
+        });
+        return;
+      }
+
+      if (data.automatic === true) {
+        sendToWebSocket(wsInfo.ws, { type: 'runtime_restart_result', sessionId, ok: false, reason: 'manual_required' });
+        return;
+      }
+      if (wsInfo.claudeSessionId !== sessionId) {
+        sendToWebSocket(wsInfo.ws, { type: 'runtime_restart_result', sessionId, ok: false, reason: 'not_current' });
+        return;
+      }
+      await this.stopRuntime(sessionId, agentKind);
+      await this.startRuntime(wsId, agentKind, {
+        ...(session.runtimeStartOptions || {}),
+        ...(session.termCols ? { cols: session.termCols } : {}),
+        ...(session.termRows ? { rows: session.termRows } : {}),
+      });
+      if (session.runningAgentVersion !== selected.version) {
+        sendToWebSocket(wsInfo.ws, {
+          type: 'runtime_restart_result', sessionId, ok: false,
+          reason: 'version_verification_failed',
+        });
+        return;
+      }
+      sendToWebSocket(wsInfo.ws, {
+        type: 'runtime_restart_result', sessionId, ok: true,
+        resumed: false, version: selected.version,
+      });
+    } catch (error) {
+      console.error(`Could not restart agent for session ${sessionId}:`, error);
+      sendToWebSocket(wsInfo.ws, {
+        type: 'runtime_restart_result', sessionId, ok: false,
+        reason: 'restart_failed',
+      });
     }
   }
 
@@ -2310,6 +2492,12 @@ export class MessageProcessor {
       return;
     }
 
+    const managedLaunch = this.deps.resolveAgentLaunch?.(
+      session,
+      chatEnvironment,
+      agentKind as AgentKind,
+    ) ?? null;
+
     /**
      * Which model this launch actually uses — resolved once, because the record
      * has to be told what it was.
@@ -2387,6 +2575,7 @@ export class MessageProcessor {
       if (startFresh) session.chatPlanMode = false;
       const startWith = async (model: string | undefined) => manager.start(session, {
         runtime: agentKind,
+        command: managedLaunch?.command,
         environment: chatEnvironment,
         workingDir: session.workingDir,
         cwdKind: session.projectWorkingDirKind,
@@ -2482,6 +2671,15 @@ export class MessageProcessor {
       }
 
       session.active = true;
+      const verifiedVersion = await this.deps.probeAgentLaunchVersion?.(
+        chatEnvironment,
+        agentKind as AgentKind,
+        managedLaunch?.command,
+      ) ?? null;
+      session.runningAgentVersion = verifiedVersion;
+      session.runningManagedAgentVersion = managedLaunch && verifiedVersion === managedLaunch.version
+        ? verifiedVersion
+        : null;
       this.persistActive(session, true);
       session.stopRequested = false;
       session.sessionStartTime = session.sessionStartTime || new Date();

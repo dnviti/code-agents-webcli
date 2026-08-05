@@ -106,7 +106,12 @@ function findLanServers(options = {}) {
 
     socket.on('error', fail);
     socket.on('message', (message, remote) => {
-      const identity = parseResponse(message);
+      let identity;
+      try {
+        identity = parseResponse(message);
+      } catch {
+        return;
+      }
       if (!identity || typeof identity.address !== 'string') return;
       // The datagram is only a candidate, never authority. Keep the sender for
       // a useful review hint, but HTTPS verification trusts only identity.address.

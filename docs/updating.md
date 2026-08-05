@@ -3,6 +3,12 @@
 The app checks GitHub for newer commits and shows a banner when the running
 build is behind.
 
+> This page is about updating **CODE AGENTS itself**. The version row on an
+> agent's launcher card updates a managed Claude Code, Codex CLI, pi, Grok,
+> Qwen Code, Kimi, Oh My Pi, or Antigravity copy instead; see
+> [Installing and updating an agent](runtimes.md#installing-and-updating-an-agent).
+> It never turns an external package-manager install into an app update.
+
 ## How a build identifies itself
 
 Installs come from `github:dnviti/code-agents-webcli`, which resolves to whatever

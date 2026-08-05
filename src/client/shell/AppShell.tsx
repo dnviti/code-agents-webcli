@@ -51,6 +51,7 @@ import type { ConversationList, ConversationSummary } from '../../shared/convers
 import { CHAT_PANEL_ICONS, type ChatPanelId, type ChatViewSettings } from '../chat/view-settings';
 import { Toasts } from './Toasts';
 import { UpdateBannerView } from './UpdateBannerView';
+import { ActiveAgentMaintenance } from './ActiveAgentMaintenance';
 import { shellStore, type ShellState, type ShellTab } from './store';
 import {
   controllerActions,
@@ -162,6 +163,9 @@ export interface ShellActions {
   updateAction(serverId?: string): void;
   updateToggleLog(serverId?: string): void;
   updateDismiss(serverId?: string): void;
+
+  // Agent maintenance
+  restartAgent(sessionId: string, automatic: boolean, allowFreshContext: boolean): void;
 }
 
 export interface AppShellProps {
@@ -1015,6 +1019,19 @@ export function AppShell({ terminalNode, actions, launcher }: AppShellProps): Re
         onToggleLog={() => actions.updateToggleLog(state.banner?.ownerId || undefined)}
         onDismiss={() => actions.updateDismiss(state.banner?.ownerId || undefined)}
       />
+
+      {active ? (
+        <ActiveAgentMaintenance
+          key={active.id}
+          sessionId={active.id}
+          serverId={active.serverId || activeControllerServerId || 'local'}
+          targetName={active.projectName || activeControllerTarget?.name || active.serverName || 'This server'}
+          agentKind={active.kind}
+          surface={active.surface}
+          chatController={chatActive ? chatController : null}
+          restartAgent={actions.restartAgent}
+        />
+      ) : null}
 
       <div style={{ flex: 1, display: 'flex', minHeight: 0, position: 'relative' }}>
         <div

@@ -104,6 +104,14 @@ export interface SessionRecord {
   agent: AgentKind | null;
   lastAgent: AgentKind | null;
   runtimeLabel: string | null;
+  /** Version verified for the process currently attached to this record. */
+  runningAgentVersion?: string | null;
+  /** Managed version selected when that process was spawned, if any. */
+  runningManagedAgentVersion?: string | null;
+  /** Immutable maintenance target captured for the process actually running. */
+  runtimeEnvironmentKey?: string;
+  /** Sanitized options for replacing this live terminal-surface agent in place. */
+  runtimeStartOptions?: Record<string, unknown>;
   /**
    * Which surface this session runs on, fixed when the runtime is started.
    *

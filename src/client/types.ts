@@ -161,6 +161,8 @@ export interface SessionListItem {
   id: string;
   name: string;
   active: boolean;
+  agent?: AgentKind | null;
+  lastAgent?: AgentKind | null;
   workingDir: string;
   connectedClients: number;
   created: string;
@@ -545,6 +547,18 @@ export interface WsUpdateRestartingMessage {
   serverId?: string;
 }
 
+/** Result of replacing one opened session's agent with its selected managed copy. */
+export interface WsRuntimeRestartResultMessage {
+  type: 'runtime_restart_result';
+  sessionId: string;
+  ok: boolean;
+  reason?: string;
+  resumed?: boolean;
+  version?: string | null;
+  /** Added by the installed desktop gateway; absent in an ordinary browser. */
+  serverId?: string;
+}
+
 /**
  * Automatic sizing moved this user's environment.
  *
@@ -605,6 +619,7 @@ export type WsMessage =
   | WsUpdateOutputMessage
   | WsUpdateDoneMessage
   | WsUpdateRestartingMessage
+  | WsRuntimeRestartResultMessage
   | WsEnvironmentTierChangedMessage
   | WsProjectUpdatedMessage
   | WsProjectRemovedMessage

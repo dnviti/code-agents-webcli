@@ -29,6 +29,8 @@ export interface LaunchCardProps {
   meta?: React.ReactNode;
   keys?: string[];
   onClick?: () => void;
+  disabled?: boolean;
+  disabledReason?: string;
   /** Rendered at the right edge, after any keys. Its own click target. */
   action?: React.ReactNode;
   style?: React.CSSProperties;
@@ -40,6 +42,8 @@ export function LaunchCard({
   meta,
   keys,
   onClick,
+  disabled = false,
+  disabledReason,
   action,
   style,
 }: LaunchCardProps): React.JSX.Element {
@@ -47,6 +51,7 @@ export function LaunchCard({
   const [focus, setFocus] = React.useState(false);
 
   const activate = (): void => {
+    if (disabled) return;
     onClick?.();
   };
 
@@ -55,7 +60,9 @@ export function LaunchCard({
       // A real button role rather than a bare div: this is the primary way to
       // start a session, so it has to be reachable without a mouse.
       role="button"
-      tabIndex={0}
+      tabIndex={disabled ? -1 : 0}
+      aria-disabled={disabled || undefined}
+      title={disabled ? disabledReason : undefined}
       onClick={activate}
       onKeyDown={(e: React.KeyboardEvent<HTMLDivElement>) => {
         if (!activatesFromKey(e.key, e.target, e.currentTarget)) return;
@@ -71,11 +78,12 @@ export function LaunchCard({
         alignItems: 'center',
         gap: 12,
         padding: '12px 14px',
-        cursor: 'pointer',
+        cursor: disabled ? 'not-allowed' : 'pointer',
+        opacity: disabled ? 0.62 : 1,
         outline: 'none',
-        background: hover ? 'var(--accent)' : 'var(--card)',
-        border: `1px solid ${hover ? 'var(--border-strong)' : 'var(--border)'}`,
-        boxShadow: focus ? 'var(--shadow-focus)' : undefined,
+        background: hover && !disabled ? 'var(--accent)' : 'var(--card)',
+        border: `1px solid ${hover && !disabled ? 'var(--border-strong)' : 'var(--border)'}`,
+        boxShadow: focus && !disabled ? 'var(--shadow-focus)' : undefined,
         transition: 'background var(--duration-fast), border-color var(--duration-fast)',
         ...style,
       }}

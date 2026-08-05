@@ -3,6 +3,18 @@
 ## [6.1.0] - 2026-08-04
 
 ### Added
+- **Agent runtimes can now be checked, installed, and updated as verified,
+  app-owned copies** (#190). The launcher and active-session version row cover
+  Claude Code, Codex CLI, pi, Grok, Qwen Code, Kimi, Oh My Pi,
+  and Antigravity, with explicit Stable/Beta/Early beta/Preview labels,
+  target-bound status, durable progress, cancellation and retry. Existing
+  external installs remain untouched; project-recipe installs remain project
+  managed; shared-host changes require installer authority and confirmation.
+  A managed update can safely restart only an idle resumable WebUI session;
+  busy/non-resumable conversations and terminals explain and confirm their
+  consequences. This is separate from the CODE AGENTS application self-update.
+  See [Runtimes and profiles](docs/runtimes.md#installing-and-updating-an-agent).
+
 - **The installed desktop app is now one controller for Local computer and any
   practical number of saved remote CODE AGENTS servers** (#187). Sessions and
   recent conversations are combined with server labels and explicit targeting;

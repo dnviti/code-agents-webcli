@@ -213,14 +213,10 @@ describe('installed skills and commands', function () {
     assert.deepStrictEqual(names(scan('antigravity')), []);
   });
 
-  it('offers none of agy’s built-in skills, because two of the three are dead', function () {
-    // `/antigravity_guide` answers from the skill; `/permissioned-github`
-    // answers "no such skill" and `/agy-customizations` quietly opens the wrong
-    // file. Two undeliverable entries to gain one documentation skill is the
-    // trade #71 was filed over, so the directory has no row.
+  it('offers agy’s built-in skills from builtin/skills', function () {
     skill('home/.gemini/antigravity-cli/builtin/skills/antigravity_guide', 'name: antigravity-guide');
     skill('home/.gemini/antigravity-cli/builtin/skills/permissioned-github', 'name: permissioned-github');
-    assert.deepStrictEqual(names(scan('antigravity')), []);
+    assert.deepStrictEqual(names(scan('antigravity')).sort(), ['antigravity-guide', 'permissioned-github']);
   });
 
   it('leaves the shared .agents skills of other runtimes off agy’s menu', function () {

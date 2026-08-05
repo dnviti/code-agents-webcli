@@ -12,6 +12,7 @@ import {
 } from '../../../shared/chat-events.js';
 import { installedModels } from '../installed-models.js';
 import { AdapterChild, BaseChatAdapter } from '../adapter.js';
+import { mergeSlashCommands } from '../../../shared/slash-commands.js';
 
 /**
  * Antigravity CLI (`agy`) driven headlessly: `--print --output-format stream-json`.
@@ -322,11 +323,14 @@ export class AntigravityChatAdapter extends BaseChatAdapter {
     // because without them a machine with no skills installed has an empty menu
     // — and an empty list does not merely show an empty menu, it takes the
     // button that opens it off the composer entirely.
-    commands: [
-      { name: 'clear', description: 'Start a new conversation, forgetting everything above' },
-      { name: 'new', description: 'Start a new conversation — the same thing as /clear' },
-      { name: 'reset', description: 'Start a new conversation — the same thing as /clear' },
-    ],
+    commands: mergeSlashCommands(
+      [
+        { name: 'clear', description: 'Start a new conversation, forgetting everything above' },
+        { name: 'new', description: 'Start a new conversation — the same thing as /clear' },
+        { name: 'reset', description: 'Start a new conversation — the same thing as /clear' },
+      ],
+      this.options.installedCommands,
+    ),
   };
 
   private turnCounter = 0;

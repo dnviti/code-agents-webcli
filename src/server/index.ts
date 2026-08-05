@@ -104,6 +104,57 @@ import { UsageReader } from './services/usage-reader.js';
 import { UsageAnalytics } from './services/usage-analytics.js';
 import { readCachedClaudeAccount } from './services/claude-account.js';
 import { UserPreferenceStore } from './services/user-preferences.js';
+import {
+  AgentMaintenanceService,
+  agentMaintenanceExecutionKey,
+  type AgentMaintenanceTarget,
+  managedVersionRoot,
+} from './services/agent-maintenance.js';
+import {
+  EnvironmentAgentRuntime,
+  JsonFileAgentMaintenanceStore,
+  OfficialAgentReleaseSource,
+  OfficialScriptAgentInstaller,
+  childProcessRunner,
+  officialFetch,
+  type AgentCommandRunner,
+} from './services/agent-maintenance-runtime.js';
+import {
+  AGENT_MAINTENANCE_IDS,
+  agentCatalogEntry,
+  type AgentArchitecture,
+  type AgentMaintenanceId,
+  type AgentPlatform,
+} from '../shared/agent-maintenance.js';
+
+/** Probe exactly the launch executable without inheriting server/provider secrets. */
+export async function probeLaunchedAgentVersion(
+  environment: UserEnvironment,
+  agentKind: AgentKind,
+  selectedCommand?: string,
+  runner: AgentCommandRunner = childProcessRunner,
+): Promise<string | null> {
+  if (agentKind === 'terminal') return null;
+  const entry = agentCatalogEntry(agentKind);
+  if (!entry) return null;
+  const command = selectedCommand || entry.binary;
+  try {
+    const wrapped = environment.wrap(command, [...entry.versionArgs], {
+      inheritHostEnv: false,
+    });
+    const result = await runner.run(wrapped.command, wrapped.args, {
+      env: wrapped.env,
+      timeoutMs: 2_000,
+      inheritEnv: false,
+    });
+    const match = `${result.stdout}\n${result.stderr}`
+      .replace(/\x1b\[[0-?]*[ -/]*[@-~]/gu, '')
+      .match(/v?([0-9]+(?:\.[0-9A-Za-z.+-]+)+)/u);
+    return match?.[1] ?? null;
+  } catch {
+    return null;
+  }
+}
 
 /**
  * Fold what a chat session learned about itself into the record that outlives it.
@@ -228,6 +279,11 @@ export class ClaudeCodeWebServer {
   private selfUpdate: SelfUpdateRunner;
   private updateMode: UpdateModeResult | null;
   private interruptedUpdate: InterruptedUpdate | null;
+  private agentMaintenance: AgentMaintenanceService;
+  private agentMaintenanceRuntime: EnvironmentAgentRuntime;
+  /** Exact environments captured by target resolution; operations outlive requests. */
+  private agentMaintenanceEnvironments: Map<string, UserEnvironment>;
+  private agentMaintenanceArchitectures: Map<string, AgentArchitecture>;
 
   private app: express.Express;
   private server: http.Server | https.Server | null;
@@ -431,6 +487,35 @@ export class ClaudeCodeWebServer {
       engines: this.deployTargetMaps.engines,
       configs: this.deployTargetMaps.configs,
       activeKey: this.deployTargetMaps.activeKey,
+    });
+    this.agentMaintenanceEnvironments = new Map();
+    this.agentMaintenanceArchitectures = new Map();
+    this.agentMaintenanceRuntime = new EnvironmentAgentRuntime({
+      dataDir: this.database.storageDir,
+      environmentFor: async (target) => {
+        const environment = this.agentMaintenanceEnvironments.get(target.key);
+        if (!environment) throw new Error('The selected execution environment is no longer available.');
+        return environment;
+      },
+    });
+    const maintenanceInstaller = new OfficialScriptAgentInstaller({
+      runtime: this.agentMaintenanceRuntime,
+      fetcher: officialFetch,
+    });
+    this.agentMaintenance = new AgentMaintenanceService({
+      store: new JsonFileAgentMaintenanceStore(
+        path.join(this.database.storageDir, 'agent-maintenance'),
+      ),
+      probe: this.agentMaintenanceRuntime,
+      releases: new OfficialAgentReleaseSource(officialFetch),
+      installer: maintenanceInstaller,
+      rootFor: (target, agent, version) => {
+        const environment = this.agentMaintenanceEnvironments.get(target.key);
+        const base = target.scope === 'private' && environment
+          ? path.join(environment.homeDir, '.code-agents')
+          : this.database.storageDir;
+        return managedVersionRoot(base, target, agent, version);
+      },
     });
     this.sessionStore = new SessionStore({ database: this.database });
     this.transcriptStore = new TranscriptStore({ storageDir: this.database.storageDir });
@@ -726,6 +811,11 @@ export class ClaudeCodeWebServer {
       createSessionRecord: (params) => this.createSessionRecord(params),
       tabCoordinator: this.tabCoordinator,
       getRuntimeBridge: (agentKind: AgentKind) => this.getRuntimeBridge(agentKind),
+      resolveAgentLaunch: (session, environment, agentKind) =>
+        this.resolveManagedAgentLaunch(session, environment, agentKind),
+      resolveAgentEnvironment: (session) => this.agentMaintenanceEnvironmentForSession(session),
+      probeAgentLaunchVersion: (environment, agentKind, command) =>
+        this.probeAgentLaunchVersion(environment, agentKind, command),
       saveSessionsToDisk: () => this.saveSessionsToDisk(),
       resolveRuntimeProfile: (agentKind: AgentKind, workingDir: string) =>
         this.resolveRuntimeProfile(agentKind, workingDir),
@@ -976,6 +1066,163 @@ export class ClaudeCodeWebServer {
       console.error(`Could not prepare an environment for ${owner.githubLogin}:`, error);
       throw error;
     }
+  }
+
+  private agentMaintenanceKey(session: SessionRecord, environment: UserEnvironment): string {
+    if (session.projectId) return `project:${session.ownerUserId}:${session.projectId}`;
+    return agentMaintenanceExecutionKey(session.ownerUserId, environment);
+  }
+
+  private agentMaintenancePlatform(environment: UserEnvironment): AgentPlatform {
+    if (environment.kind === 'container') return 'linux';
+    if (process.platform === 'darwin' || process.platform === 'linux' || process.platform === 'win32') {
+      return process.platform;
+    }
+    return 'unsupported';
+  }
+
+  private async agentMaintenanceArchitecture(
+    key: string,
+    environment: UserEnvironment,
+  ): Promise<AgentArchitecture> {
+    const cached = this.agentMaintenanceArchitectures.get(key);
+    if (cached) return cached;
+    let raw: string = process.arch;
+    if (environment.kind === 'container') {
+      try {
+        const wrapped = environment.wrap('uname', ['-m']);
+        const result = await childProcessRunner.run(wrapped.command, wrapped.args, {
+          env: wrapped.env,
+          timeoutMs: 2_000,
+        });
+        raw = result.stdout.trim();
+      } catch {
+        raw = '';
+      }
+    }
+    const architecture: AgentArchitecture = /^(?:arm64|aarch64)$/iu.test(raw)
+      ? 'arm64'
+      : /^(?:x64|x86_64|amd64)$/iu.test(raw) ? 'x64' : 'unsupported';
+    this.agentMaintenanceArchitectures.set(key, architecture);
+    return architecture;
+  }
+
+  private async agentMaintenanceTarget(
+    session: SessionRecord,
+    environment?: UserEnvironment,
+  ): Promise<AgentMaintenanceTarget> {
+    const resolvedEnvironment = environment || await this.agentMaintenanceEnvironmentForSession(session);
+    const key = this.agentMaintenanceKey(session, resolvedEnvironment);
+    const runningAgentId = session.agent
+      && (AGENT_MAINTENANCE_IDS as readonly string[]).includes(session.agent)
+      ? session.agent as AgentMaintenanceId
+      : null;
+    if (!session.projectId) this.agentMaintenanceEnvironments.set(key, resolvedEnvironment);
+    const resolved: AgentMaintenanceTarget = {
+      key,
+      platform: this.agentMaintenancePlatform(resolvedEnvironment),
+      architecture: await this.agentMaintenanceArchitecture(key, resolvedEnvironment),
+      scope: resolvedEnvironment.kind === 'container' ? 'private' : 'shared',
+      ownerUserId: resolvedEnvironment.kind === 'container' ? session.ownerUserId : null,
+      projectManaged: Boolean(session.projectId),
+      ...(runningAgentId
+        ? {
+            runningAgentId,
+            ...(session.runningAgentVersion !== undefined
+              ? { runningVersion: session.runningAgentVersion }
+              : {}),
+          }
+        : {}),
+    };
+    // A process started before version capture existed cannot be identified by
+    // probing the command now: the active pointer or PATH may have changed in
+    // the meantime. Unknown is the only truthful answer until that process is
+    // restarted and its launch path is verified.
+    if (
+      !session.projectId
+      && session.active
+      && runningAgentId
+      && session.runningAgentVersion === undefined
+    ) {
+      session.runningAgentVersion = null;
+      session.runningManagedAgentVersion = null;
+      resolved.runningAgentId = runningAgentId;
+      resolved.runningVersion = null;
+    }
+    return resolved;
+  }
+
+  private async agentMaintenanceEnvironmentForSession(
+    session: SessionRecord,
+  ): Promise<UserEnvironment> {
+    if (session.active) {
+      if (session.runtimeEnvironmentKey) {
+        const captured = this.agentMaintenanceEnvironments.get(session.runtimeEnvironmentKey);
+        if (!captured) {
+          throw new Error('The original execution environment is no longer available.');
+        }
+        return captured;
+      }
+      const current = await this.ensureEnvironment(session.ownerUserId);
+      if (current.kind === 'container') {
+        throw new Error('The running process has no captured immutable environment identity.');
+      }
+      return current;
+    }
+    return this.ensureEnvironment(session.ownerUserId);
+  }
+
+  private async probeAgentLaunchVersion(
+    environment: UserEnvironment,
+    agentKind: AgentKind,
+    selectedCommand?: string,
+  ): Promise<string | null> {
+    const bridge = this.getRuntimeBridge(agentKind) as BridgeInterface & {
+      command?: string;
+      defaultCommand?: string;
+    };
+    const actualCommand = selectedCommand || (environment.kind === 'container'
+      ? bridge?.defaultCommand
+      : bridge?.command);
+    return probeLaunchedAgentVersion(environment, agentKind, actualCommand);
+  }
+
+  private async resolveAgentMaintenanceTarget(input: {
+    userId: number;
+    targetId: string;
+  }): Promise<AgentMaintenanceTarget | null> {
+    const session = this.claudeSessions.get(input.targetId);
+    if (!session || session.ownerUserId !== input.userId) return null;
+    // Project composition is the authority. Status needs no environment and
+    // must not start a dormant project merely because its picker was opened.
+    if (session.projectId) {
+      const environment = this.environments.host();
+      return this.agentMaintenanceTarget(session, environment);
+    }
+    return this.agentMaintenanceTarget(session);
+  }
+
+  private resolveManagedAgentLaunch(
+    session: SessionRecord,
+    environment: UserEnvironment,
+    agentKind: AgentKind,
+  ): { command: string; version: string } | null {
+    if (session.projectId || agentKind === 'terminal') return null;
+    const entry = agentCatalogEntry(agentKind);
+    if (!entry) return null;
+    const key = this.agentMaintenanceKey(session, environment);
+    this.agentMaintenanceEnvironments.set(key, environment);
+    session.runtimeEnvironmentKey = key;
+    const target: AgentMaintenanceTarget = {
+      key,
+      platform: this.agentMaintenancePlatform(environment),
+      architecture: this.agentMaintenanceArchitectures.get(key)
+        || (process.arch === 'arm64' ? 'arm64' : process.arch === 'x64' ? 'x64' : 'unsupported'),
+      scope: environment.kind === 'container' ? 'private' : 'shared',
+      ownerUserId: environment.kind === 'container' ? session.ownerUserId : null,
+    };
+    const selected = this.agentMaintenanceRuntime.resolveManagedCommand(target, entry, environment);
+    return selected?.version ? { command: selected.command, version: selected.version } : null;
   }
 
   private isPathWithinBase(targetPath: string, userId?: number): boolean {
@@ -1608,6 +1855,8 @@ export class ClaudeCodeWebServer {
       selfUpdate: this.selfUpdate,
       getUpdateMode: () => this.getUpdateMode(),
       getInstallerUserId: () => this.database.getInstallerUserId(),
+      maintenance: this.agentMaintenance,
+      resolveTarget: (input) => this.resolveAgentMaintenanceTarget(input),
       deployTargetsEnabled: this.containerizedEnvironmentsEnabled,
       deployTargets: this.deployTargets,
       deployTargetDataDir: this.database.storageDir,
