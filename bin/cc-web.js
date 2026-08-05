@@ -309,6 +309,10 @@ async function main() {
     // the port and this process must not bind it too.
     const shouldRunHere = await appServer.runSetupIfNeeded();
     if (!shouldRunHere) {
+      // The constructor owns the installation data-directory lease before it
+      // opens SQLite. A setup flow which hands execution to systemd must close
+      // those writers and release the lease before the service starts.
+      await appServer.shutdown();
       process.exit(0);
     }
 

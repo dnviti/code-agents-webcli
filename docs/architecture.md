@@ -5,8 +5,9 @@ How the pieces fit together, for anyone changing the code.
 ## Shape
 
 One Node process. It serves the client bundle over HTTPS, terminates WebSocket
-connections, spawns agent CLIs into pseudo-terminals, and keeps everything in a
-single SQLite file.
+connections, and spawns agent CLIs into pseudo-terminals. Installation state
+lives in one global SQLite file; session and usage state lives in one SQLite
+file per authorised workspace.
 
 ```text
 browser ──HTTPS──▶ express ──▶ routes, static bundle, /ca.crt
@@ -15,7 +16,9 @@ browser ──HTTPS──▶ express ──▶ routes, static bundle, /ca.crt
                                           ├─▶ bridges/*  ─▶ pty ─▶ agent CLI
                                           ├─▶ ChatStore   (headless CLI protocols)
                                           ├─▶ ScrollbackRecorder ─▶ HistoryStore
-                                          └─▶ SessionStore ─▶ node:sqlite
+                                          └─▶ SessionStore ─▶ workspace .cc-web/session-state.sqlite
+
+express ──▶ auth/settings/projects ──▶ global app.sqlite
 ```
 
 ## Layout
@@ -73,10 +76,23 @@ it to reconstruct scrollback.
 
 ## Storage
 
-One SQLite file, `app.sqlite`, holding settings, users, auth sessions and
-runtime-session records. Bulk data does not go in it — scrollback, chat events
-and transcripts are append-only files with fixed-width indexes, so paging into a
-week-old session is a couple of positioned reads rather than a scan.
+`app.sqlite` holds installation-wide settings, users, auth sessions, runtime
+profiles, deploy targets, credentials, projects, and a path-only catalog of
+authorised workspace roots. It is not used for new runtime-session or usage
+writes.
+
+Each workspace has `.cc-web/session-state.sqlite`, with owner-scoped session/tab
+records, composer drafts and usage tables. Chat events, transcripts, terminal history and paste
+metadata are files under `.cc-web/sessions/<owner-key>/<session-id>/`; their
+append-only logs use fixed-width indexes, so paging into a week-old session is a
+couple of positioned reads rather than a scan. Stores receive the session's
+immutable workspace scope, while coordinators open and aggregate the authorised
+workspace databases needed by account-wide views.
+
+The path-only discovery catalog admits a canonical workspace root for exactly
+one immutable account identity. A conflicting or legacy-ambiguous assignment
+fails closed before the local database or any session artifact is opened. The
+opaque owner key then prevents session-id collisions inside that archive.
 
 See [Configuration](configuration.md#where-state-lives) for the full layout.
 
@@ -84,7 +100,10 @@ See [Configuration](configuration.md#where-state-lives) for the full layout.
 
 There is one boundary, and it is the allow-list. Anyone who can sign in can run
 commands as the OS user running the server. Sessions are isolated *from each
-other* by owner — every route filters on it — but not from the filesystem.
+other* by owner — every route filters on it, and a plaintext workspace archive
+cannot be catalogued by two accounts — but unrestricted host commands are not
+isolated from the filesystem. Use per-user environments or distinct OS-level
+deployments when mutually untrusted accounts require a filesystem boundary.
 
 The parts that get specific care:
 

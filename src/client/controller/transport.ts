@@ -1,4 +1,4 @@
-import type { DiscoveredServerCandidate, ServerTarget } from './types';
+import type { DiscoveredServerCandidate, PhoneAccessStatus, ServerTarget } from './types';
 
 const TARGET_HEADER = 'x-controller-server-id';
 const LAST_SERVER_KEY = 'code-agents-controller-last-server';
@@ -250,7 +250,80 @@ async function controllerAction(
   return result;
 }
 
+function string(value: unknown): string | undefined { return typeof value === 'string' && value ? value : undefined; }
+function phoneAccessStatus(value: unknown): PhoneAccessStatus {
+  const source = value && typeof value === 'object' ? value as Record<string, unknown> : {};
+  const state = source.state;
+  const interfaces = Array.isArray(source.interfaces) ? source.interfaces.flatMap((item) => {
+    const row = item && typeof item === 'object' ? item as Record<string, unknown> : {};
+    const name = string(row.name); const address = string(row.address);
+    return name && address ? [{ name, address, family: string(row.family), origin: string(row.origin) }] : [];
+  }) : [];
+  const devices = Array.isArray(source.devices) ? source.devices.flatMap((item) => {
+    const row = item && typeof item === 'object' ? item as Record<string, unknown> : {};
+    const id = string(row.id); return id ? [{ id, label: string(row.label), origin: string(row.origin), lastSeen: typeof row.lastSeen === 'string' || typeof row.lastSeen === 'number' ? row.lastSeen : undefined }] : [];
+  }) : [];
+  const originsValue = source.origins && typeof source.origins === 'object' ? source.origins as Record<string, unknown> : {};
+  const pairingValue = source.pairing && typeof source.pairing === 'object' ? source.pairing as Record<string, unknown> : {};
+  const caValue = source.ca && typeof source.ca === 'object' ? source.ca as Record<string, unknown> : {};
+  const tailscaleValue = source.tailscale && typeof source.tailscale === 'object' ? source.tailscale as Record<string, unknown> : {};
+  return {
+    state: state === 'off' || state === 'starting' || state === 'running' || state === 'error' ? state : 'unavailable',
+    available: source.available === true,
+    mode: source.mode === 'lan' || source.mode === 'tailscale' || source.mode === 'both' ? source.mode : undefined,
+    port: typeof source.port === 'number' && Number.isInteger(source.port) && source.port > 0 && source.port < 65536 ? source.port : undefined,
+    interfaces, origins: { lan: string(originsValue.lan), tailscale: string(originsValue.tailscale) },
+    pairing: string(pairingValue.url) ? { url: string(pairingValue.url)!, expiresAt: typeof pairingValue.expiresAt === 'string' || typeof pairingValue.expiresAt === 'number' ? pairingValue.expiresAt : undefined, origin: string(pairingValue.origin) } : undefined,
+    devices, ca: string(caValue.downloadUrl) || string(caValue.fingerprint) ? { downloadUrl: string(caValue.downloadUrl), fingerprint: string(caValue.fingerprint) } : undefined,
+    tailscale: Object.keys(tailscaleValue).length ? { installed: tailscaleValue.installed === true, online: tailscaleValue.online === true, serve: tailscaleValue.serve === true, funnel: tailscaleValue.funnel === true, origin: string(tailscaleValue.origin), message: string(tailscaleValue.message) } : undefined,
+    error: string(source.error) || string((source.error as Record<string, unknown> | undefined)?.message),
+  };
+}
+
+async function phoneAction(path: string, method: 'POST' | 'DELETE' = 'POST', body: Record<string, unknown> = {}): Promise<PhoneAccessStatus> {
+  const result = await controllerAction(path, method, body);
+  // New controller builds return the whole status here. Older builds return a
+  // small acknowledgement (for example `{ revoked: true }`), so refresh rather
+  // than replacing a useful running view with an invented unavailable state.
+  if (result.phoneAccess || typeof result.state === 'string') return phoneAccessStatus(result.phoneAccess ?? result);
+  return readPhoneAccessStatus();
+}
+
+async function readPhoneAccessStatus(): Promise<PhoneAccessStatus> {
+  const response = await fetch('/api/controller/phone-access', { credentials: 'same-origin', cache: 'no-store', headers: { Accept: 'application/json' } });
+  const result = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error('Phone access status could not be read.');
+  return phoneAccessStatus(result);
+}
+
+async function exportPhoneAccessCa(): Promise<void> {
+  const response = await fetch('/api/controller/phone-access/ca', {
+    credentials: 'same-origin', cache: 'no-store', headers: { Accept: 'application/x-x509-ca-cert' },
+  });
+  if (!response.ok) {
+    const result = await response.json().catch(() => ({})) as Record<string, unknown>;
+    throw new Error(typeof result.message === 'string' ? result.message : 'The CA certificate could not be exported.');
+  }
+  const href = URL.createObjectURL(await response.blob());
+  const link = document.createElement('a');
+  link.href = href;
+  link.download = 'code-agents-webcli-ca.crt';
+  link.style.display = 'none';
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  window.setTimeout(() => URL.revokeObjectURL(href), 0);
+}
+
 export const controllerActions = {
+  phoneAccessStatus: readPhoneAccessStatus,
+  startPhoneAccess: (value: { mode: 'lan' | 'tailscale' | 'both'; address?: string; port: number }) => phoneAction('/api/controller/phone-access/start', 'POST', value),
+  createPhonePairing: (origin?: string) => phoneAction('/api/controller/phone-access/pairing', 'POST', origin ? { origin } : {}),
+  revokePhoneDevice: (id: string) => phoneAction(`/api/controller/phone-access/devices/${encodeURIComponent(id)}`, 'DELETE'),
+  stopPhoneAccess: () => phoneAction('/api/controller/phone-access', 'DELETE'),
+  exportPhoneAccessCa,
+  checkTailscale: () => phoneAction('/api/controller/phone-access/tailscale/check'),
+  setTailscaleOrigin: (origin: string) => phoneAction('/api/controller/phone-access/tailscale-origin', 'POST', { origin }),
   test: (value: { name?: string; origin?: string; serverId?: string }) => controllerAction('/api/controller/targets/test', 'POST', value),
   add: (value: { name: string; origin: string }) => controllerAction('/api/controller/targets', 'POST', value),
   update: (serverId: string, value: { name: string; origin?: string }) => controllerAction(`/api/controller/targets/${encodeURIComponent(serverId)}`, 'PATCH', value),

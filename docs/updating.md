@@ -1,7 +1,13 @@
 # Updating
 
-The app checks GitHub for newer commits and shows a banner when the running
-build is behind.
+CODE AGENTS has two deliberately separate update systems. A normal browser/CLI
+server compares its baked Git commit with `main` and shows a server-owned
+banner. The installed desktop controller compares its semantic application
+version through platform-specific trusted feeds: signed Windows/macOS packages,
+a GPG-signed Flatpak repository, and checksum-verified AppImages from the fixed
+GitHub release feed. It uses the full-window proposal and status-bar reminder
+described in [Desktop updates](desktop.md#updates). A Local embedded server
+never creates the server-owned banner.
 
 > This page is about updating **CODE AGENTS itself**. The version row on an
 > agent's launcher card updates a managed Claude Code, Codex CLI, pi, Grok,
@@ -9,7 +15,7 @@ build is behind.
 > [Installing and updating an agent](runtimes.md#installing-and-updating-an-agent).
 > It never turns an external package-manager install into an app update.
 
-## How a build identifies itself
+## How a server build identifies itself
 
 Installs come from `github:dnviti/code-agents-webcli`, which resolves to whatever
 `main`'s HEAD is at the time. The package version therefore says very little —
@@ -20,7 +26,7 @@ GitHub is polled at most every 15 minutes however often anyone presses **Check**
 The unauthenticated API allows 60 requests an hour per IP, and no credentials are
 ever sent.
 
-## Applying an update
+## Applying a server update
 
 Everyone signed in sees the banner. Only the
 [installer account](github-oauth.md#the-installer-account) can apply it.
@@ -50,7 +56,7 @@ reinstalling is the recovery:
 npm i -g --allow-git=all github:dnviti/code-agents-webcli
 ```
 
-## Installs that cannot update themselves
+## Server installs that cannot update themselves
 
 These say so, rather than offering a button that would do nothing.
 
@@ -75,14 +81,81 @@ docker build \
 
 ## Release flow
 
-`main` is the release branch. A release fires when `package.json`'s version
-changes on `main` and no matching tag exists yet.
+`main` is the release branch. A maintainer creates a matching `v<version>` tag
+only after the `package.json` version is on `main`; the tagged workflow rejects
+any tag outside that history or with a different version.
 
 - `.github/workflows/ci.yml` — typecheck, tests on Node 22 and 24, a container
   build, and a full install verification on a clean runner.
 - `.github/workflows/release-on-main.yml` — tags `v<version>`, cuts a GitHub
-  release, and pushes the image to GHCR.
+  release, pushes the image to GHCR, and stages trusted desktop update feeds.
 
-The project is not published to npm, so the workflow needs no npm account or
-token. Pushing to GHCR uses the `GITHUB_TOKEN` Actions provides automatically,
-so there is nothing to configure for a release to work.
+The project is not published to npm. Pushing to GHCR uses the `GITHUB_TOKEN`
+Actions provides automatically. Desktop promotion is deliberately stricter: a
+protected `release` environment must provide the Windows signing identity and
+expected publisher, macOS Developer ID plus App Store Connect notarization API
+key, and the Flatpak repository GPG key. GitHub Pages must use the
+`github-pages` environment at the repository's stable `/flatpak/` URL. The
+workflow fails before publishing a stable package feed when any required
+identity, platform signature, notarization ticket, updater metadata/checksum,
+or Flatpak summary signature is missing or invalid. Never add those credentials
+to source control.
+
+Every candidate also needs a protected installed-package qualification. Run the
+old-to-new path on signed NSIS, a writable AppImage, repository-installed
+Flatpak through the portal, and signed/notarized Intel and Apple Silicon macOS
+applications. Each run must exercise discovery, explicit confirmation,
+verified replacement, graceful Local shutdown, and relaunch. Then dispatch
+`Desktop updater installed qualification` at the candidate tag with the five
+successful Actions run URLs. Every run must upload
+`desktop-updater-evidence-<package>/desktop-updater-evidence.json`, naming the
+base/target versions and exact tested updater payload: EXE, AppImage, signed
+macOS ZIP, or signed Flatpak summary/commit. The protected attestation rejects
+missing, duplicate, or hash-mismatched evidence.
+
+Set `DESKTOP_UPDATER_QUALIFICATION_RUN_ID` in the protected
+`desktop-updater-qualification` environment to that attestation run, then
+approve the waiting job. The tagged workflow remains alive and holds the
+stable-feed lock while trials run. It rechecks the complete private draft,
+versioned Pages candidate, public version tip, and current signed Flatpak tip
+immediately before promotion. The first bridge release needs purpose-built
+private/staged base packages because older public binaries have no updater.
+
+The protected release configuration uses these exact names:
+
+| Platform | Protected secrets | Protected variables |
+| --- | --- | --- |
+| Windows | `WINDOWS_CSC_LINK`, `WINDOWS_CSC_KEY_PASSWORD` | `WINDOWS_CERT_SUBJECT` |
+| macOS | `MACOS_CSC_LINK`, `MACOS_CSC_KEY_PASSWORD`, `APPLE_API_KEY_BASE64`, `APPLE_API_KEY_ID`, `APPLE_API_ISSUER` | `MACOS_TEAM_ID`, `MACOS_CERT_AUTHORITY` |
+| Flatpak | `FLATPAK_GPG_PRIVATE_KEY`, `FLATPAK_GPG_PASSPHRASE`, `FLATPAK_GPG_KEY_ID` | `FLATPAK_UPDATER_BRIDGE_TAG` only for the first remote-less bridge |
+| All desktop packages (`desktop-updater-qualification` environment) | — | `DESKTOP_UPDATER_QUALIFICATION_RUN_ID` for the current candidate tag |
+
+`FLATPAK_GPG_KEY_ID` is the full 40-hex primary-key fingerprint. The workflow
+derives the public key, embeds it in the Flatpak, publishes it in the repository
+descriptors, and verifies the signed commit/version manifest over the deployed
+HTTPS origin. Private keys and passphrases are available only to the protected
+tagged-release environment, never pull requests or forks.
+
+Flatpak publication is two-phase. The workflow first deploys the candidate at a
+versioned `/flatpak-candidates/vX.Y.Z/` path while keeping the old signed ref at
+`/flatpak/` and copying the complete `docs/` site into the same Pages artifact.
+Only after that candidate is read and verified over HTTPS does it expose the
+native GitHub Release and activate the byte-identical repository at `/flatpak/`.
+After activation it verifies the exact signed ref over HTTPS. If that fails,
+the workflow restores the previous Pages ref and returns the native release to
+its byte-identical draft. Retry failed jobs in the same workflow so the retained
+canonical artifacts are reused; a fresh signed/notarized rebuild is not assumed
+to be byte-identical.
+
+Treat identity rotation as a release migration, not a secret replacement.
+Verify a new Windows certificate keeps the configured publisher subject and a
+new Apple certificate keeps the configured Team ID before changing protected
+values. The current single-key pipeline deliberately does not rotate a Flatpak
+trust root in place: replacing the secret would make the old repository
+unverifiable. Build and qualify a dedicated old-key-signed, dual-trust bridge
+before changing the protected key; until that bridge exists, key rotation is a
+release blocker with a documented manual reinstall fallback. Keep the old key
+and repository history available through that window.
+Revoke the old identity only after installed old-to-new tests pass, then record
+the old/new fingerprint, date, operator, and recovery release in the protected
+environment's rotation log. Never overwrite assets for a public version.

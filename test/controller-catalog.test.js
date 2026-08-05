@@ -126,6 +126,13 @@ describe('desktop controller catalog', function () {
     const target = instance.add({ name: 'Office', address: 'https://office.example' });
     instance.setAuthMarker(target.id);
     instance.setOfflineMetadata(target.id, { sessions });
+    const persisted = JSON.parse(fs.readFileSync(filename, 'utf8'));
+    assert.strictEqual(
+      Object.hasOwn(persisted.targets[0], 'offlineMetadataCache'),
+      false,
+      'session metadata must remain memory-only and never enter servers.json',
+    );
+    assert.strictEqual(catalog().get(target.id).offlineMetadataCache, undefined);
     assert.strictEqual(instance.removalWarning(target.id), true);
     const result = instance.remove(target.id);
     assert.strictEqual(result.warning, true);
@@ -140,5 +147,29 @@ describe('desktop controller catalog', function () {
     const signedOut = instance.signOut(signedOutTarget.id);
     assert.ok(!Object.hasOwn(signedOut, 'authMarker'));
     assert.ok(!Object.hasOwn(signedOut, 'offlineMetadataCache'));
+  });
+
+  it('removes a legacy persisted session cache without losing target configuration', function () {
+    const first = catalog();
+    const target = first.add({ name: 'Legacy cache', address: 'https://legacy.example' });
+    first.setAuthMarker(target.id);
+    const legacy = JSON.parse(fs.readFileSync(filename, 'utf8'));
+    legacy.targets[0].offlineMetadataCache = {
+      sessions: [{
+        id: 'private-session-id',
+        name: 'Private title',
+        runtime: 'codex',
+        lastActivity: '2026-08-05T12:00:00.000Z',
+      }],
+    };
+    fs.writeFileSync(filename, `${JSON.stringify(legacy, null, 2)}\n`, { mode: 0o600 });
+
+    const restarted = catalog();
+    assert.strictEqual(restarted.get(target.id).offlineMetadataCache, undefined);
+    assert.strictEqual(restarted.get(target.id).authMarker, true);
+    assert.strictEqual(restarted.get(target.id).origin, 'https://legacy.example');
+    const cleaned = JSON.parse(fs.readFileSync(filename, 'utf8'));
+    assert.strictEqual(Object.hasOwn(cleaned.targets[0], 'offlineMetadataCache'), false);
+    assert.doesNotMatch(fs.readFileSync(filename, 'utf8'), /private-session-id|Private title/);
   });
 });

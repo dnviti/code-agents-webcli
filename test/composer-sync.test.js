@@ -69,7 +69,7 @@ function socket(id, userId, watching = []) {
 
 const typed = (info, type) => info.sent.filter((message) => message.type === type);
 
-function build(infos, records, managerOverrides = {}) {
+function build(infos, records, managerOverrides = {}, depsOverrides = {}) {
   const sends = [];
   const chatManager = {
     has: () => true,
@@ -134,6 +134,7 @@ function build(infos, records, managerOverrides = {}) {
     getUserPreferences: () => ({ chatBypassPermissions: false }),
     usageReader: {},
     usageAnalytics: {},
+    ...depsOverrides,
   });
 
   return { processor, sends, chatManager };
@@ -162,6 +163,42 @@ describe('carrying an unsent message between somebody’s screens', function () 
     assert.strictEqual(draftOf(arrived[0]).text, 'summarise the release notes');
     assert.strictEqual(draftOf(arrived[0]).revision, 1);
     assert.strictEqual(arrived[0].sessionId, 'chat-1');
+  });
+
+  it('makes a draft durable before announcing it to another screen', async function () {
+    const laptop = socket('w1', 7, ['chat-1']);
+    const phone = socket('w2', 7, ['chat-1']);
+    let release;
+    const persisted = new Promise((resolve) => { release = resolve; });
+    const { processor } = build([laptop, phone], [sessionRecord()], {}, {
+      saveSessionsToDisk: () => persisted,
+    });
+
+    const handling = processor.handleMessage('w1', {
+      type: 'chat_draft', sessionId: 'chat-1', text: 'durable words', attachments: [],
+    });
+    await new Promise(setImmediate);
+    assert.deepStrictEqual(typed(phone, 'chat_draft'), []);
+    release(true);
+    await handling;
+    assert.strictEqual(draftOf(typed(phone, 'chat_draft')[0]).text, 'durable words');
+  });
+
+  it('rolls a draft back and reports a refused workspace save', async function () {
+    const laptop = socket('w1', 7, ['chat-1']);
+    const phone = socket('w2', 7, ['chat-1']);
+    const record = sessionRecord();
+    const { processor } = build([laptop, phone], [record], {}, {
+      saveSessionsToDisk: () => Promise.resolve(false),
+    });
+
+    await processor.handleMessage('w1', {
+      type: 'chat_draft', sessionId: 'chat-1', text: 'not durable', attachments: [],
+    });
+
+    assert.strictEqual(record.chatDraft, undefined);
+    assert.deepStrictEqual(typed(phone, 'chat_draft'), []);
+    assert.match(typed(laptop, 'error')[0].message, /draft could not be saved/i);
   });
 
   it('names the screen it came from, so that one is not typed over by its own echo', async function () {

@@ -6,8 +6,8 @@ import path from 'node:path';
 import { languageForFile } from '../../shared/file-language.js';
 import { rankFilePaths } from '../../shared/file-match.js';
 import { looksLikeSvg, sniffMediaType } from '../../shared/media-sniff.js';
-import { ATTACHMENT_DIR } from '../services/attachment-store.js';
 import { PathValidation, SessionRecord } from '../types.js';
+import { isWorkspacePrivatePath } from '../services/workspace-private-path.js';
 import { parseGitStatus, parseUnifiedDiff } from '../../shared/git-status.js';
 import {
   crossReferencesOf,
@@ -138,6 +138,14 @@ const GH_CACHE_MS = 30_000;
  * to edit.
  */
 const MAX_EDIT_BYTES = 2 * 1024 * 1024;
+
+/** Keep app-owned state out of git-backed workspace views at every depth. */
+const PRIVATE_GIT_PATHSPECS = [
+  ':(exclude).cc-web',
+  ':(exclude).cc-web/**',
+  ':(exclude,glob)**/.cc-web',
+  ':(exclude,glob)**/.cc-web/**',
+];
 
 /**
  * The largest file the browser may put into the project.
@@ -446,10 +454,20 @@ async function confineWorkspace(
   res: Response,
   requested: string,
 ): Promise<ConfinedContainerPath> {
+  if (isWorkspacePrivatePath(session.workingDir) || isWorkspacePrivatePath(requested)) {
+    return { path: null, base: session.workingDir, missing: false };
+  }
   const container = projectContainerFiles(res);
-  return container
+  const confined = await (container
     ? container.confineExisting(requested)
-    : confineReal(session.workingDir, requested);
+    : confineReal(session.workingDir, requested));
+  if (
+    isWorkspacePrivatePath(confined.base)
+    || (confined.path !== null && isWorkspacePrivatePath(confined.path))
+  ) {
+    return { path: null, base: confined.base, missing: false };
+  }
+  return confined;
 }
 
 async function statWorkspace(res: Response, target: string): Promise<WorkspaceStat | null> {
@@ -604,6 +622,22 @@ function sessionFor(deps: WorkspaceRoutesDeps, req: Request, res: Response): Ses
     res.status(404).json({ error: 'Session not found' });
     return null;
   }
+  if (session.persistenceUnavailable) {
+    res.status(409).json({
+      error: 'session_persistence_unavailable',
+      message: session.persistenceUnavailable,
+      retryable: true,
+    });
+    return null;
+  }
+  if (session.rollbackRecoveryPending) {
+    res.status(409).json({
+      error: 'session_recovery_pending',
+      message: 'This session is retained only to retry an incomplete rollback',
+      retryable: true,
+    });
+    return null;
+  }
 
   if (!session.projectId && !deps.validatePath(session.workingDir, session.ownerUserId).valid) {
     // The allowed base can be narrowed between runs, and a restored session
@@ -672,7 +706,14 @@ function withProjectWorkspace(
             cwd.workingDir,
           );
         }
-        manager.touchActivity(session.projectId);
+      }
+
+      // `.cc-web` is an application state namespace, never a project root. A
+      // stale/restored cwd inside it must not turn every relative browser path
+      // into an implicit way around the per-path guard below.
+      if (isWorkspacePrivatePath(session.workingDir)) {
+        res.status(403).json({ error: 'workspace_private' });
+        return;
       }
 
       await handler(req, res);
@@ -740,7 +781,7 @@ function workspaceCacheKey(session: SessionRecord): string {
  * exists for.
  */
 const WALK_SKIP = new Set([
-  '.git', 'node_modules', '.venv', 'venv', '__pycache__', '.mypy_cache', '.pytest_cache',
+  '.git', '.cc-web', 'node_modules', '.venv', 'venv', '__pycache__', '.mypy_cache', '.pytest_cache',
   'dist', 'build', 'out', 'target', '.next', '.nuxt', '.svelte-kit', '.turbo', '.cache',
   'coverage', '.gradle', '.idea', '.tox', 'vendor', '.terraform', 'Pods', 'DerivedData',
 ]);
@@ -769,7 +810,7 @@ const FIND_CACHE_MS = 10_000;
  * your own exhaust.
  */
 function isProjectFile(relativePath: string): boolean {
-  return !relativePath.startsWith(`${ATTACHMENT_DIR}/`);
+  return !isWorkspacePrivatePath(relativePath);
 }
 
 async function buildFileIndex(
@@ -880,19 +921,23 @@ export function createWorkspaceRoutes(deps: WorkspaceRoutesDeps): Router {
         const container = projectContainerFiles(res);
         if (container) {
           const listed = await container.list(target, MAX_ENTRIES);
+          const entries = listed.entries.filter(
+            (entry) => !isWorkspacePrivatePath(entry.name) && !isWorkspacePrivatePath(entry.path),
+          );
           res.json({
             root: session.workingDir,
             path: target,
             truncated: listed.truncated,
-            entries: listed.entries,
+            entries,
             projectWorkingDirKind: 'container',
             lifetime: container.lifetime(target),
           });
           return;
         }
         const found = await fsp.readdir(target, { withFileTypes: true });
+        const visible = found.filter((entry) => !isWorkspacePrivatePath(entry.name));
         const entries = await Promise.all(
-          found.slice(0, MAX_ENTRIES).map(async (entry) => {
+          visible.slice(0, MAX_ENTRIES).map(async (entry) => {
             const full = path.join(target, entry.name);
             // Size is best-effort: a broken symlink or a file removed between
             // the readdir and the stat must not fail the whole listing.
@@ -915,7 +960,7 @@ export function createWorkspaceRoutes(deps: WorkspaceRoutesDeps): Router {
         res.json({
           root: session.workingDir,
           path: target,
-          truncated: found.length > MAX_ENTRIES,
+          truncated: visible.length > MAX_ENTRIES,
           entries,
           ...(session.projectId
             ? { projectWorkingDirKind: session.projectWorkingDirKind || 'host' }
@@ -1098,7 +1143,16 @@ export function createWorkspaceRoutes(deps: WorkspaceRoutesDeps): Router {
         // `-- .` scopes the listing to this session's own directory. Without it
         // a session opened in a subdirectory lists the whole repository —
         // including files it is not allowed to open.
-        run('git', ['status', '--porcelain=v1', '-z', '--branch', '--', '.'], session.workingDir, environment, container),
+        run(
+          'git',
+          [
+            'status', '--porcelain=v1', '-z', '--branch', '--', '.',
+            ...PRIVATE_GIT_PATHSPECS,
+          ],
+          session.workingDir,
+          environment,
+          container,
+        ),
         run('git', ['remote', 'get-url', 'origin'], session.workingDir, environment, container),
         run('git', ['log', '-1', '--format=%h%x00%s%x00%an%x00%aI'], session.workingDir, environment, container),
         run('git', ['rev-parse', '--show-toplevel'], session.workingDir, environment, container),
@@ -1122,14 +1176,21 @@ export function createWorkspaceRoutes(deps: WorkspaceRoutesDeps): Router {
       const toSession = (value: string): string =>
         paths.relative(session.workingDir, paths.resolve(repoRoot, value)) || '.';
 
-      res.json({
-        repo: true,
-        ...parsed,
-        changes: parsed.changes.map((change) => ({
+      const changes = parsed.changes
+        .map((change) => ({
           ...change,
           path: toSession(change.path),
           ...(change.oldPath ? { oldPath: toSession(change.oldPath) } : {}),
-        })),
+        }))
+        .filter(
+          (change) => !isWorkspacePrivatePath(change.path)
+            && (!change.oldPath || !isWorkspacePrivatePath(change.oldPath)),
+        );
+
+      res.json({
+        repo: true,
+        ...parsed,
+        changes,
         repoRoot,
         remoteUrl: remote.ok ? remote.stdout.trim() : null,
         head: head.ok && sha
@@ -1177,6 +1238,7 @@ export function createWorkspaceRoutes(deps: WorkspaceRoutesDeps): Router {
       if (staged) args.push('--cached');
       // `--` terminates options, so a file literally named `--cached` is a path.
       if (relative) args.push('--', relative);
+      else args.push('--', '.', ...PRIVATE_GIT_PATHSPECS);
 
       const environment = await environmentFor(deps, session, res);
       const container = projectContainerFiles(res);
@@ -1186,7 +1248,8 @@ export function createWorkspaceRoutes(deps: WorkspaceRoutesDeps): Router {
         return;
       }
 
-      let diffs = parseUnifiedDiff(result.stdout);
+      let diffs = parseUnifiedDiff(result.stdout)
+        .filter((diff) => !isWorkspacePrivatePath(diff.path));
 
       // An untracked file has no diff at all — git does not know about it — so
       // asking for one returns nothing and the panel would show a changed file
@@ -1528,7 +1591,10 @@ export function createWorkspaceRoutes(deps: WorkspaceRoutesDeps): Router {
 
       const status = await run(
         'git',
-        ['status', '--porcelain=v1', '-z', '--branch'],
+        [
+          'status', '--porcelain=v1', '-z', '--branch', '--', '.',
+          ...PRIVATE_GIT_PATHSPECS,
+        ],
         session.workingDir,
         await environmentFor(deps, session, res),
         projectContainerFiles(res),
@@ -1646,6 +1712,10 @@ export function createWorkspaceRoutes(deps: WorkspaceRoutesDeps): Router {
 
       const container = projectContainerFiles(res);
       let target = container ? path.posix.join(folder, name) : path.join(folder, name);
+      if (isWorkspacePrivatePath(target)) {
+        res.status(403).json({ error: 'workspace_private' });
+        return;
+      }
       if (insideGitDir(base, target)) {
         res.status(403).json({ error: 'Files inside .git are not writable here' });
         return;

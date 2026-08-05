@@ -179,6 +179,10 @@ export interface SessionListItem {
    * is the same direction every other unknown in this rule takes.
    */
   bypassPermissions?: boolean;
+  /** Read-only legacy session whose workspace migration can be retried later. */
+  persistenceUnavailable?: string;
+  /** Hidden rollback anchor; only definitive deletion is permitted. */
+  rollbackRecoveryPending?: boolean;
   /** Project identity, when this session was opened from a project workspace. */
   projectId?: string | null;
   projectName?: string | null;

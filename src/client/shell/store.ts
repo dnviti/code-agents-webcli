@@ -208,6 +208,23 @@ export interface BannerView {
   log: string;
 }
 
+/** A renderer-safe snapshot of the main-process desktop updater. */
+export interface DesktopUpdateView {
+  phase: 'disabled' | 'idle' | 'checking' | 'available' | 'downloading' | 'ready' | 'installing' | 'restarting' | 'up_to_date' | 'error';
+  provider: 'electron' | 'flatpak' | null;
+  currentVersion: string;
+  targetVersion: string | null;
+  summary: string | null;
+  releaseDate: string | null;
+  progress: number | null;
+  errorCode: string | null;
+  error: string | null;
+  retryable: boolean;
+  generation: number;
+  /** True only for the first proposal for a newly discovered release. */
+  promptOpen: boolean;
+}
+
 export type InstallState =
   | 'installed'
   | 'available'
@@ -255,8 +272,8 @@ export interface ShellState {
    */
   confirm: ConfirmRequest | null;
   banner: BannerView | null;
-  /** Installed desktop package update, independent of the selected server notice. */
-  desktopBanner: BannerView | null;
+  /** Native desktop-package update, independent of selected-server notices. */
+  desktopUpdate: DesktopUpdateView | null;
   /** GitHub login of the signed-in user, when the server reports one. */
   user: string | null;
   /** Sign-out URL, when the deployment has auth enabled. */
@@ -365,7 +382,7 @@ const INITIAL: ShellState = {
   sessionList: [],
   confirm: null,
   banner: null,
-  desktopBanner: null,
+  desktopUpdate: null,
   user: null,
   logoutUrl: null,
   containerizedEnvironmentsEnabled: false,

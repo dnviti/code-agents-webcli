@@ -19,7 +19,8 @@ before(function () {
   const contents = [
     `export { renderToStaticMarkup } from 'react-dom/server';`,
     `export * as React from 'react';`,
-    `export { Composer, placeByPickOrder } from ${JSON.stringify(path.join(ROOT, 'src/client/shell/chat/Composer'))};`,
+    `export { Composer, AttachmentChip, AttachmentUploadGuard, attachmentFileFingerprint, canSendComposerMessage, classifyComposerClipboardFiles, placeByPickOrder } from ${JSON.stringify(path.join(ROOT, 'src/client/shell/chat/Composer'))};`,
+    `export { MAX_ATTACHMENT_BYTES, uploadAttachment } from ${JSON.stringify(path.join(ROOT, 'src/client/chat/attachments-api'))};`,
     `export { PlanDocDialog } from ${JSON.stringify(path.join(ROOT, 'src/client/shell/chat/PlanDocDialog'))};`,
   ].join('\n');
 
@@ -69,6 +70,17 @@ function render(props) {
   return renderToStaticMarkup(
     React.createElement(Composer, Object.assign({ onSend() {}, onInterrupt() {}, busy: false, capabilities: caps({}) }, props)),
   );
+}
+
+function renderAttachmentChip(props) {
+  const { renderToStaticMarkup, React, AttachmentChip } = mod;
+  return renderToStaticMarkup(React.createElement(AttachmentChip, {
+    name: 'screenshot.png',
+    size: 4096,
+    mime: 'image/png',
+    onRemove() {},
+    ...props,
+  }));
 }
 
 function renderPlan(props) {
@@ -160,6 +172,22 @@ describe('Composer', function () {
       );
     });
 
+    it('offers the completed server copy as a download', function () {
+      const html = render({ attachments: [shot], onAttachmentsChange() {} });
+      assert.ok(html.includes(`href="${shot.url}"`));
+      assert.ok(html.includes('download="abc123-shot.png"'));
+      assert.ok(html.includes('aria-label="Download abc123-shot.png"'));
+    });
+
+    it('does not turn an unsafe draft URL into a link', function () {
+      const html = render({
+        attachments: [{ ...shot, url: 'javascript:alert(1)' }],
+        onAttachmentsChange() {},
+      });
+      assert.ok(html.includes('abc123-shot.png'));
+      assert.ok(!html.includes('href='));
+    });
+
     it('offers to take it off the message, by name', function () {
       const html = render({ attachments: [shot], onAttachmentsChange() {} });
       assert.ok(html.includes('aria-label="Remove abc123-shot.png"'));
@@ -177,6 +205,178 @@ describe('Composer', function () {
     it('can send with nothing typed, as long as something is attached', function () {
       const html = render({ attachments: [shot], onAttachmentsChange() {} });
       assert.ok(!html.includes('aria-label="Send message" disabled'), 'a screenshot on its own is a message');
+    });
+
+    it('does not send around an attachment that is still uploading or failed', function () {
+      assert.strictEqual(
+        mod.canSendComposerMessage(false, [{ status: 'uploading' }], 'explain this', 0),
+        false,
+        'an upload in flight must reach a terminal state first',
+      );
+      assert.strictEqual(
+        mod.canSendComposerMessage(false, [{ status: 'error' }], 'explain this', 0),
+        false,
+        'a failed file must be retried or explicitly removed, never silently omitted',
+      );
+      assert.strictEqual(mod.canSendComposerMessage(false, [], 'explain this', 0), true);
+    });
+
+    it('offers explicit retry and remove controls on a failed upload chip', function () {
+      const html = renderAttachmentChip({ status: 'error', error: 'Connection lost', onRetry() {} });
+      assert.ok(html.includes('aria-label="Retry screenshot.png"'));
+      assert.ok(html.includes('aria-label="Remove screenshot.png"'));
+      assert.ok(html.includes('title="Connection lost"'), 'the original error remains available on the chip');
+    });
+
+    it('uses the canonical 20 MiB attachment limit for clipboard images', function () {
+      assert.strictEqual(mod.MAX_ATTACHMENT_BYTES, 20 * 1024 * 1024);
+      const atLimit = mod.classifyComposerClipboardFiles([
+        { type: 'image/png', size: mod.MAX_ATTACHMENT_BYTES },
+      ]);
+      const overLimit = mod.classifyComposerClipboardFiles([
+        { type: 'image/png', size: mod.MAX_ATTACHMENT_BYTES + 1 },
+      ]);
+      assert.deepStrictEqual(atLimit.accepted, [0]);
+      assert.deepStrictEqual(atLimit.oversize, []);
+      assert.deepStrictEqual(overLimit.accepted, []);
+      assert.deepStrictEqual(overLimit.oversize, [0]);
+    });
+
+    describe('local upload race guards', function () {
+      const file = (overrides = {}) => ({
+        name: 'shot.png',
+        size: 1234,
+        type: 'image/png',
+        lastModified: 42,
+        ...overrides,
+      });
+
+      it('deduplicates the same File object without conflating metadata-equivalent files', function () {
+        const guard = new mod.AttachmentUploadGuard();
+        const picked = file();
+        const distinct = file();
+
+        const [reserved] = guard.reserve([picked]);
+        assert.ok(reserved);
+        assert.strictEqual(guard.reserve([picked]).length, 0);
+        assert.strictEqual(
+          guard.reserve([distinct]).length,
+          1,
+          'equal browser metadata is not proof that two files have equal bytes',
+        );
+
+        guard.release(reserved.fingerprint);
+        assert.strictEqual(guard.reserve([picked]).length, 1, 'explicit removal permits attaching it again');
+      });
+
+      it('deduplicates repeated object references within one batch without dropping distinct files', function () {
+        const guard = new mod.AttachmentUploadGuard();
+        const repeated = file();
+        const reserved = guard.reserve([
+          repeated,
+          repeated,
+          file(),
+          file({ name: 'other.png' }),
+        ]);
+        assert.deepStrictEqual(
+          reserved.map((entry) => entry.file.name),
+          ['shot.png', 'shot.png', 'other.png'],
+        );
+      });
+
+      it('aborts and tombstones a removed upload so its late completion is stale', function () {
+        const guard = new mod.AttachmentUploadGuard();
+        const [reserved] = guard.reserve([file()]);
+        const signal = guard.begin('picked:1');
+        assert.ok(signal);
+        assert.strictEqual(guard.cancel('picked:1'), true);
+        assert.strictEqual(signal.aborted, true, 'the built-in fetch can stop transferring bytes');
+        assert.strictEqual(
+          guard.settle('picked:1', signal),
+          false,
+          'a handler which ignored abort cannot publish its late result',
+        );
+        guard.release(reserved.fingerprint);
+      });
+
+      it('passes the guard signal through the built-in attachment request', async function () {
+        const originalFetch = global.fetch;
+        const controller = new AbortController();
+        let requestSignal;
+        global.fetch = async (_url, init) => {
+          requestSignal = init.signal;
+          return {
+            ok: true,
+            async json() {
+              return {
+                url: '/api/sessions/session-1/chat-attachments/stored-shot.png',
+                name: 'shot.png', mime: 'image/png', size: 1234,
+              };
+            },
+          };
+        };
+        try {
+          await mod.uploadAttachment('session-1', file(), controller.signal);
+          assert.strictEqual(requestSignal, controller.signal);
+        } finally {
+          global.fetch = originalFetch;
+        }
+      });
+
+      it('rejects absolute, cross-session, and already-qualified upload capabilities', async function () {
+        const originalFetch = global.fetch;
+        const unsafeUrls = [
+          'http://127.0.0.1:9999/private',
+          '/api/sessions/other/chat-attachments/stored-shot.png',
+          '/api/sessions/ccs1.attacker/chat-attachments/stored-shot.png',
+          '/api/sessions/session-1/chat-attachments/stored-shot.png?server=other',
+        ];
+        try {
+          for (const url of unsafeUrls) {
+            global.fetch = async () => ({
+              ok: true,
+              async json() {
+                return { url, name: 'shot.png', mime: 'image/png', size: 1234 };
+              },
+            });
+            await assert.rejects(
+              () => mod.uploadAttachment('session-1', file()),
+              /unsafe attachment URL|invalid response/i,
+            );
+          }
+        } finally {
+          global.fetch = originalFetch;
+        }
+      });
+
+      it('keeps desktop and workspace upload failures actionable', async function () {
+        const originalFetch = global.fetch;
+        const cases = [
+          [{ error: 'write_failed', reason: 'disk_full' }, 500, /not enough disk space/i],
+          [{ error: 'unsafe_attachment_dir' }, 403, /folder is unsafe|folder.*changed/i],
+          [{ error: 'target_server_unavailable', server: { name: 'Studio' } }, 503, /Studio.*unavailable/i],
+          [{ error: 'wrong_target_server' }, 400, /match this conversation to its server/i],
+          [{ error: 'session_persistence_unavailable', message: 'Workspace is read-only.' }, 409, /Workspace is read-only/],
+        ];
+        try {
+          for (const [body, status, expected] of cases) {
+            global.fetch = async () => ({ ok: false, status, async json() { return body; } });
+            await assert.rejects(() => mod.uploadAttachment('session-1', file()), expected);
+          }
+        } finally {
+          global.fetch = originalFetch;
+        }
+      });
+
+      it('permits one retry at a time after a failed attempt settles', function () {
+        const guard = new mod.AttachmentUploadGuard();
+        const first = guard.begin('picked:1');
+        assert.ok(first);
+        assert.strictEqual(guard.begin('picked:1'), null, 'double-click must not duplicate a request');
+        assert.strictEqual(guard.settle('picked:1', first), true);
+        const retry = guard.begin('picked:1');
+        assert.ok(retry && retry !== first, 'manual retry gets a fresh abortable attempt');
+      });
     });
 
     // Uploads run at the same time, so a small file overtakes a large one. What

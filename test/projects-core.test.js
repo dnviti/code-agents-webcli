@@ -1,12 +1,16 @@
 const assert = require('assert');
 const fs = require('fs');
+const fsp = require('fs/promises');
 const os = require('os');
 const path = require('path');
 const { execFileSync } = require('child_process');
 
 const { EnvironmentManager, createContainerConfig, projectContainerName } = require('../dist/server/services/environments/index.js');
 const { ProjectManager } = require('../dist/server/services/projects/manager.js');
-const { localProjectWorkspaceRoot } = require('../dist/server/services/projects/environment.js');
+const {
+  localProjectWorkspaceRoot,
+  ProjectEnvironmentManager,
+} = require('../dist/server/services/projects/environment.js');
 const { checkRepositoryAccess, cloneRepository } = require('../dist/server/services/projects/clone.js');
 const { preserveProjectWork } = require('../dist/server/services/projects/preserve.js');
 const { ProjectStore } = require('../dist/server/services/projects/store.js');
@@ -137,6 +141,12 @@ function setup(initial = [], options = {}) {
     preflightTimeoutMs: options.preflightTimeoutMs,
     cloneTimeoutMs: options.cloneTimeoutMs,
     hasLiveProjectWork: options.hasLiveProjectWork,
+    beforeWorkspaceReplacement: options.beforeWorkspaceReplacement,
+    afterWorkspaceRestored: options.afterWorkspaceRestored,
+    beforeWorkspaceDeletion: options.beforeWorkspaceDeletion,
+    hasLegacyProjectSessions: options.hasLegacyProjectSessions,
+    hasIncompleteProjectSessionMigration: options.hasIncompleteProjectSessionMigration,
+    localWorkspaceRoot: options.localWorkspaceRoot || path.join(dir, 'host-projects'),
   });
   return { dir, e, s, manager, environments, cfg };
 }
@@ -821,7 +831,7 @@ describe('project core lifecycle', function () {
     assert.ok(!e.calls.some((call) => call.op === 'stop'), 'an unproven replacement is never stopped');
   });
 
-  it('reclaims a clean checkout by removing its container and workspace', async function () {
+  it('deletes a clean project workspace only through explicit project removal', async function () {
     const p = project('one', 'running', 'https://example.test/a.git'); p.container = { name: 'saved' };
     const { manager, e, dir } = setup([p]);
     const workspace = path.join(dir, 'projects', 'one'); fs.mkdirSync(workspace, { recursive: true });
@@ -830,6 +840,142 @@ describe('project core lifecycle', function () {
     // A test double cannot describe `saved`, so strict ownership validation
     // leaves the absent runtime alone while reclaiming the host workspace.
     assert.ok(!fs.existsSync(workspace));
+  });
+
+  it('removes durable session storage only when the project itself is deleted', async function () {
+    const p = project('one', 'running');
+    const lifecycle = [];
+    let storage;
+    const { manager, s, dir } = setup([p], {
+      beforeWorkspaceReplacement: () => { lifecycle.push('flush'); },
+      afterWorkspaceRestored: () => { lifecycle.push('reopen'); },
+      beforeWorkspaceDeletion: () => {
+        lifecycle.push('close-for-delete');
+        assert.strictEqual(fs.readFileSync(path.join(storage, 'session-state.sqlite'), 'utf8'), 'session database');
+      },
+    });
+    const workspace = path.join(dir, 'projects', 'one');
+    storage = path.join(workspace, '.cc-web');
+    fs.mkdirSync(storage, { recursive: true });
+    fs.writeFileSync(path.join(storage, 'session-state.sqlite'), 'session database');
+
+    assert.deepStrictEqual(await manager.remove(1, 'one'), { ok: true });
+
+    assert.strictEqual(s.getProject('one'), null);
+    assert.ok(!fs.existsSync(workspace));
+    assert.ok(!fs.existsSync(path.join(dir, 'project-overlays', 'one')));
+    assert.deepStrictEqual(lifecycle, ['flush', 'reopen', 'close-for-delete']);
+  });
+
+  it('never reopens a suspended scope when replacement cannot verify the archive restore', async function () {
+    for (const operation of ['clearCheckout', 'wipe']) {
+      const p = project('one', 'stopped', 'https://example.test/a.git');
+      let reopened = 0;
+      const { manager, dir } = setup([p], {
+        beforeWorkspaceReplacement: () => true,
+        afterWorkspaceRestored: () => { reopened += 1; },
+      });
+      manager.projects.restoreWorkspaceSessionStorage = async () => false;
+      manager.projects.clearCheckout = async () => { throw new Error('checkout cleanup failed'); };
+      manager.projects.clearWorkspaceForRebuild = async () => { throw new Error('workspace cleanup failed'); };
+
+      await assert.rejects(
+        () => operation === 'clearCheckout'
+          ? manager.clearCheckout(p, { id: 1, githubLogin: 'ada' })
+          : manager.wipe(p),
+        /workspace session storage could not be restored/,
+      );
+      assert.strictEqual(reopened, 0, `${operation} must not publish an unverified archive`);
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('never reopens a safe replacement swapped in immediately before archive staging', async function () {
+    if (process.platform === 'win32') this.skip();
+
+    for (const operation of ['clearCheckout', 'wipe']) {
+      const p = project('one', 'stopped', 'https://example.test/a.git');
+      let suspended = 0;
+      let reopened = 0;
+      let manager;
+      const setupResult = setup([p], {
+        beforeWorkspaceReplacement: async () => {
+          suspended += 1;
+          const owner = { id: 1, githubLogin: 'ada' };
+          const identity = await manager.projects.workspaceSessionStorageIdentity(p, owner);
+          await manager.projects.recordWorkspaceSessionStorageIntent(p, owner, identity);
+          return { required: true, identity };
+        },
+        afterWorkspaceRestored: () => { reopened += 1; },
+      });
+      ({ manager } = setupResult);
+      const { dir } = setupResult;
+      const workspace = path.join(dir, 'projects', 'one');
+      const storage = path.join(workspace, '.cc-web');
+      const authoritative = path.join(workspace, '.cc-web-authoritative');
+      const replacement = path.join(dir, `replacement-${operation}`);
+      fs.mkdirSync(path.join(workspace, 'a', '.git'), { recursive: true });
+      fs.mkdirSync(storage);
+      fs.writeFileSync(path.join(storage, 'session-state.sqlite'), 'authoritative archive');
+      fs.mkdirSync(replacement);
+      fs.writeFileSync(path.join(replacement, 'session-state.sqlite'), 'replacement archive');
+
+      const originalOpen = fsp.open;
+      let storageChmods = 0;
+      let swapped = false;
+      fsp.open = async (...args) => {
+        const handle = await originalOpen(...args);
+        if (path.basename(String(args[0])) === '.cc-web') {
+          const originalChmod = handle.chmod.bind(handle);
+          handle.chmod = async (mode) => {
+            storageChmods += 1;
+            if (storageChmods === 3) {
+              swapped = true;
+              fs.renameSync(storage, authoritative);
+              fs.renameSync(replacement, storage);
+            }
+            return originalChmod(mode);
+          };
+        }
+        return handle;
+      };
+      try {
+        await assert.rejects(
+          () => operation === 'clearCheckout'
+            ? manager.clearCheckout(p, { id: 1, githubLogin: 'ada' })
+            : manager.wipe(p),
+          /pre-suspension|could not be restored|changed during lifecycle cleanup/,
+        );
+      } finally {
+        fsp.open = originalOpen;
+      }
+
+      assert.strictEqual(swapped, true, `${operation} exercises the pre-stage identity race`);
+      assert.strictEqual(suspended, 1, `${operation} captures authority before suspending`);
+      assert.strictEqual(reopened, 0, `${operation} must not reopen the replacement inode`);
+      assert.strictEqual(
+        fs.readFileSync(path.join(authoritative, 'session-state.sqlite'), 'utf8'),
+        'authoritative archive',
+      );
+      assert.strictEqual(
+        fs.readFileSync(path.join(storage, 'session-state.sqlite'), 'utf8'),
+        'replacement archive',
+      );
+      assert.ok(fs.existsSync(path.join(workspace, 'a', '.git')), 'cleanup never starts after the identity swap');
+      await assert.rejects(
+        () => manager.projects.restoreWorkspaceSessionStorage(p, { id: 1, githubLogin: 'ada' }),
+        /pre-suspension|staged workspace session storage disappeared|intent/,
+        'a later generic retry remains bound to the durable original inode',
+      );
+      const coldManager = new ProjectEnvironmentManager(setupResult.environments);
+      coldManager.worktreePath = () => workspace;
+      await assert.rejects(
+        () => coldManager.restoreWorkspaceSessionStorage(p, { id: 1, githubLogin: 'ada' }),
+        /pre-suspension|staged workspace session storage disappeared|intent/,
+        'a cold retry also reads the durable inode intent',
+      );
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   it('blocks a failed preservation and lets an explicit discard release it', async function () {
@@ -883,10 +1029,45 @@ describe('project core lifecycle', function () {
     const workspace = path.join(dir, 'projects', 'one');
     fs.mkdirSync(workspace, { recursive: true });
     fs.writeFileSync(path.join(workspace, 'discarded.txt'), 'transient');
+    const sessionStorage = path.join(workspace, '.cc-web');
+    fs.mkdirSync(path.join(sessionStorage, 'sessions', 'owner', 'session-one'), { recursive: true });
+    fs.writeFileSync(path.join(sessionStorage, 'session-state.sqlite'), 'session database');
+    fs.writeFileSync(path.join(sessionStorage, 'sessions', 'owner', 'session-one', 'chat.jsonl'), 'chat history');
 
     assert.deepStrictEqual(await manager.release(1, 'one'), { ok: true });
     assert.strictEqual(s.getProject('one').state, 'stopped');
-    assert.ok(!fs.existsSync(workspace));
+    assert.ok(fs.existsSync(workspace));
+    assert.ok(fs.existsSync(sessionStorage));
+
+    assert.deepStrictEqual(await manager.start(1, 'one'), { ok: true, state: 'building' });
+    await manager.waitForBuild('one');
+    assert.strictEqual(s.getProject('one').state, 'running');
+    assert.strictEqual(fs.readFileSync(path.join(sessionStorage, 'session-state.sqlite'), 'utf8'), 'session database');
+    assert.strictEqual(
+      fs.readFileSync(path.join(sessionStorage, 'sessions', 'owner', 'session-one', 'chat.jsonl'), 'utf8'),
+      'chat history',
+    );
+    assert.ok(!fs.existsSync(path.join(workspace, 'discarded.txt')));
+  });
+
+  it('blocks reclaim rather than following a symlink inside workspace session storage', async function () {
+    const p = project('one', 'reclaiming');
+    p.rebuildRequired = true;
+    const { manager, s, dir } = setup([p]);
+    const workspace = path.join(dir, 'projects', 'one');
+    const sessionStorage = path.join(workspace, '.cc-web');
+    const outside = path.join(dir, 'outside-history');
+    fs.mkdirSync(sessionStorage, { recursive: true });
+    fs.mkdirSync(outside);
+    fs.writeFileSync(path.join(outside, 'history.log'), 'must not be copied or removed');
+    fs.symlinkSync(outside, path.join(sessionStorage, 'escape'));
+
+    const result = await manager.release(1, 'one', { discard: true });
+
+    assert.strictEqual(result.reason, 'preserve_failed');
+    assert.strictEqual(s.getProject('one').state, 'blocked');
+    assert.strictEqual(fs.readFileSync(path.join(outside, 'history.log'), 'utf8'), 'must not be copied or removed');
+    assert.ok(fs.lstatSync(path.join(sessionStorage, 'escape')).isSymbolicLink());
   });
 
   it('lets an explicit discard recover a terminal reclaiming project', async function () {
@@ -903,7 +1084,8 @@ describe('project core lifecycle', function () {
       { ok: true },
     );
     assert.strictEqual(s.getProject('one').state, 'stopped');
-    assert.ok(!fs.existsSync(workspace));
+    assert.ok(fs.existsSync(workspace));
+    assert.ok(!fs.existsSync(path.join(workspace, 'a')));
   });
 
   it('never stops a known foreign container when reclaim preparation rejects it', async function () {
@@ -1628,6 +1810,10 @@ describe('project core lifecycle', function () {
     const checkout = path.join(harness.dir, 'projects', 'one', 'a');
     fs.mkdirSync(path.join(checkout, '.git'), { recursive: true });
     fs.writeFileSync(path.join(checkout, 'uncommitted.txt'), 'only copy');
+    const sessionStorage = path.join(harness.dir, 'projects', 'one', '.cc-web');
+    fs.mkdirSync(path.join(sessionStorage, 'sessions', 'owner', 'session-one'), { recursive: true });
+    fs.writeFileSync(path.join(sessionStorage, 'session-state.sqlite'), 'session database');
+    fs.writeFileSync(path.join(sessionStorage, 'sessions', 'owner', 'session-one', 'history.log'), 'terminal history');
     harness.e.exec = async (spec, command, args) => {
       harness.e.calls.push({ op: 'exec', spec, command, args });
       if (args.includes('status')) return { stdout: ' M uncommitted.txt\n', stderr: '' };
@@ -1652,6 +1838,11 @@ describe('project core lifecycle', function () {
     assert.strictEqual(harness.s.getProject('one').state, 'running');
     assert.deepStrictEqual(operations, ['push', 'clone']);
     assert.strictEqual(harness.s.getProject('one').lastPreservedCommit, 'wip-commit');
+    assert.strictEqual(fs.readFileSync(path.join(sessionStorage, 'session-state.sqlite'), 'utf8'), 'session database');
+    assert.strictEqual(
+      fs.readFileSync(path.join(sessionStorage, 'sessions', 'owner', 'session-one', 'history.log'), 'utf8'),
+      'terminal history',
+    );
   });
 
   it('wipes a no-repository workspace when its stopped Docker runtime disappeared live', async function () {
@@ -1786,9 +1977,84 @@ describe('project core lifecycle', function () {
     e.ensure = async (next) => { spec = next; const created = !present; present = true; return { created }; };
     e.remove = async () => { present = false; };
     const workspace = path.join(dir, 'projects', 'one'); fs.mkdirSync(workspace, { recursive: true }); fs.writeFileSync(path.join(workspace, 'discard.txt'), 'gone');
+    const sessionStorage = path.join(workspace, '.cc-web');
+    fs.mkdirSync(sessionStorage);
+    fs.writeFileSync(path.join(sessionStorage, 'session-state.sqlite'), 'keep session state');
     await manager.start(1, 'one'); await manager.waitForBuild('one');
     assert.strictEqual(s.getProject('one').state, 'running');
     assert.ok(!fs.existsSync(path.join(workspace, 'discard.txt')));
+    assert.strictEqual(fs.readFileSync(path.join(sessionStorage, 'session-state.sqlite'), 'utf8'), 'keep session state');
+  });
+
+  it('blocks a true rebuild before removing runtime or secondary legacy migration bytes', async function () {
+    const p = project('one');
+    p.rebuildRequired = true;
+    p.container = { name: 'saved' };
+    let guardCalls = 0;
+    const { manager, s, e, dir } = setup([p], {
+      hasIncompleteProjectSessionMigration: async (candidate) => {
+        guardCalls += 1;
+        assert.strictEqual(candidate.id, 'one');
+        return true;
+      },
+    });
+    const secondary = path.join(dir, 'projects', 'one', 'checkout');
+    const rollback = path.join(
+      secondary,
+      '.cc-web',
+      'attachments',
+      '.legacy.bin.ccweb-session-migration.bak',
+    );
+    fs.mkdirSync(path.dirname(rollback), { recursive: true });
+    fs.writeFileSync(rollback, 'must remain until binary confirm');
+
+    assert.deepStrictEqual(await manager.start(1, 'one'), { ok: true, state: 'building' });
+    await manager.waitForBuild('one');
+
+    assert.ok(guardCalls > 0);
+    assert.strictEqual(s.getProject('one').state, 'blocked');
+    assert.match(s.getProject('one').stateDetail, /migration is incomplete/);
+    assert.strictEqual(fs.readFileSync(rollback, 'utf8'), 'must remain until binary confirm');
+    assert.ok(!e.calls.some((call) => call.op === 'remove'));
+  });
+
+  it('allows an ordinary non-destructive start while binary cleanup is pending', async function () {
+    const p = project('one');
+    p.container = { name: 'saved' };
+    const { manager, s, dir } = setup([p], {
+      hasIncompleteProjectSessionMigration: () => true,
+      engine: {
+        async describe(name) {
+          return {
+            name,
+            identity: `${name}-identity`,
+            status: 'stopped',
+            image: 'img',
+            labels: {
+              'com.code-agents-webcli.managed': 'true',
+              'com.code-agents-webcli.project': 'one',
+              'com.code-agents-webcli.user-id': '1',
+              'com.code-agents-webcli.target': 'legacy',
+            },
+          };
+        },
+        async ensure() { return { created: false }; },
+      },
+    });
+    const secondary = path.join(dir, 'projects', 'one', 'checkout');
+    const rollback = path.join(secondary, '.cc-web', 'pending.bak');
+    fs.mkdirSync(path.dirname(rollback), { recursive: true });
+    fs.writeFileSync(rollback, 'available after ordinary start');
+
+    assert.deepStrictEqual(await manager.start(1, 'one'), { ok: true, state: 'building' });
+    await manager.waitForBuild('one');
+
+    assert.strictEqual(
+      s.getProject('one').state,
+      'running',
+      s.getProject('one').stateDetail || 'ordinary start unexpectedly failed',
+    );
+    assert.strictEqual(fs.readFileSync(rollback, 'utf8'), 'available after ordinary start');
   });
 
   it('blocks a created replacement without wiping bytes when old-checkout preservation fails', async function () {
@@ -1814,6 +2080,77 @@ describe('project core lifecycle', function () {
     const result = await manager.remove(1, 'one');
     assert.strictEqual(result.reason, 'invalid_state');
     assert.ok(!e.calls.some((c) => c.op === 'remove'), 'container remains until session retirement succeeds');
+  });
+
+  it('blocks explicit project deletion while legacy session rows still need migration', async function () {
+    const p = project('one', 'running'); p.container = { name: 'saved' };
+    let retired = false;
+    const { manager, s, e, dir } = setup([p], {
+      hasLegacyProjectSessions: (projectId, ownerUserId) => {
+        assert.strictEqual(projectId, 'one');
+        assert.strictEqual(ownerUserId, 1);
+        return true;
+      },
+      deleteProjectSessions: () => { retired = true; },
+    });
+    const workspace = path.join(dir, 'projects', 'one');
+    const storage = path.join(workspace, '.cc-web');
+    fs.mkdirSync(storage, { recursive: true });
+    fs.writeFileSync(path.join(storage, 'session-state.sqlite'), 'legacy destination');
+
+    const result = await manager.remove(1, 'one');
+
+    assert.strictEqual(result.reason, 'preserve_failed');
+    assert.match(result.detail, /migration is incomplete/);
+    assert.strictEqual(s.getProject('one').state, 'running');
+    assert.match(s.getProject('one').stateDetail, /migration is incomplete/);
+    assert.strictEqual(retired, false);
+    assert.strictEqual(fs.readFileSync(path.join(storage, 'session-state.sqlite'), 'utf8'), 'legacy destination');
+    assert.ok(!e.calls.some((call) => call.op === 'remove'));
+  });
+
+  it('releases an idle reclaim claim when legacy project sessions block migration', async function () {
+    const p = project('one', 'stopped');
+    p.lastActivityAt = new Date(0).toISOString();
+    const { manager, s, dir } = setup([p], {
+      now: () => new Date('2026-08-01T12:00:00.000Z'),
+      hasLegacyProjectSessions: () => true,
+    });
+    const workspace = path.join(dir, 'projects', 'one');
+    const storage = path.join(workspace, '.cc-web');
+    fs.mkdirSync(storage, { recursive: true });
+    fs.writeFileSync(path.join(storage, 'session-state.sqlite'), 'legacy destination');
+
+    await manager.sweepOnce();
+
+    assert.strictEqual(s.getProject('one').state, 'stopped');
+    assert.strictEqual(s.getProject('one').rebuildRequired, false);
+    assert.match(s.getProject('one').stateDetail, /migration is incomplete/);
+    assert.strictEqual(fs.readFileSync(path.join(storage, 'session-state.sqlite'), 'utf8'), 'legacy destination');
+  });
+
+  it('preserves host-project session storage during idle reclaim', async function () {
+    const p = project('one', 'stopped');
+    p.executionKind = 'host';
+    p.lastActivityAt = new Date(0).toISOString();
+    const hostRoot = root();
+    const { manager, s } = setup([p], {
+      now: () => new Date('2026-08-01T12:00:00.000Z'),
+      localWorkspaceRoot: hostRoot,
+    });
+    const workspace = path.join(hostRoot, 'one');
+    const storage = path.join(workspace, '.cc-web');
+    fs.mkdirSync(storage, { recursive: true });
+    fs.writeFileSync(path.join(storage, 'session-state.sqlite'), 'host session database');
+    fs.writeFileSync(path.join(workspace, 'scratch.txt'), 'discard me');
+
+    await manager.sweepOnce();
+
+    assert.strictEqual(s.getProject('one').state, 'stopped');
+    assert.ok(fs.existsSync(workspace));
+    assert.ok(!fs.existsSync(path.join(workspace, 'scratch.txt')));
+    assert.strictEqual(fs.readFileSync(path.join(storage, 'session-state.sqlite'), 'utf8'), 'host session database');
+    fs.rmSync(hostRoot, { recursive: true, force: true });
   });
 
   it('refuses deletion with active work before preservation or session retirement', async function () {
@@ -2160,9 +2497,16 @@ describe('project lifecycle transaction and preservation recovery', function () 
     const old = projects.createProject({ ownerUserId: userId, name: 'old' });
     const next = projects.createProject({ ownerUserId: userId, name: 'next' });
     projects.setState(old.id, 'running');
+    projects.touchActivity(old.id, new Date(0));
+    const lifecycleActivity = projects.getProject(old.id).lastActivityAt;
 
     const lease = projects.tryAcquireSessionLease(old.id, userId);
     assert.strictEqual(lease.ok, true);
+    assert.strictEqual(
+      projects.getProject(old.id).lastActivityAt,
+      lifecycleActivity,
+      'session admission must not persist conversation-derived activity in the global catalog',
+    );
     assert.strictEqual(projects.tryClaimStop({ projectId: old.id, ownerUserId: userId }).reason, 'active_work');
     const busySwap = projects.tryStartCounted({ projectId: next.id, ownerUserId: userId, toState: 'building', fromStates: ['stopped'], limit: 1, stopProjectId: old.id });
     assert.strictEqual(busySwap.reason, 'stop_candidate_busy');
@@ -2170,6 +2514,11 @@ describe('project lifecycle transaction and preservation recovery', function () 
     assert.strictEqual(projects.getProject(next.id).state, 'stopped');
     assert.strictEqual(projects.releaseSessionLease(old.id, userId, lease.leaseId), true);
     assert.strictEqual(projects.releaseSessionLease(old.id, userId, lease.leaseId), false);
+    assert.strictEqual(
+      projects.getProject(old.id).lastActivityAt,
+      lifecycleActivity,
+      'session release must not persist conversation-derived activity in the global catalog',
+    );
 
     const swap = projects.tryStartCounted({ projectId: next.id, ownerUserId: userId, toState: 'building', fromStates: ['stopped'], limit: 1, stopProjectId: old.id });
     assert.strictEqual(swap.ok, true);

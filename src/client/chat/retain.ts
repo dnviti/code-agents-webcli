@@ -155,6 +155,10 @@ function blockWeight(block: ChatBlock): number {
       return block.text.length + (block.detail?.length ?? 0);
     case 'image':
       return IMAGE_COST;
+    case 'attachment':
+      return block.mime.startsWith('image/')
+        ? IMAGE_COST
+        : block.name.length + block.mime.length + block.url.length;
     case 'plan':
       return block.items.reduce((sum, item) => sum + item.text.length, 0);
     case 'question':

@@ -1,5 +1,6 @@
 'use strict';
 
+const { randomBytes } = require('node:crypto');
 const fs = require('node:fs');
 const path = require('node:path');
 
@@ -25,7 +26,31 @@ const JSON_PREFERENCE_KEYS = new Set([
 const MAX_FILE_SCAN_BYTES = 32 * 1024 * 1024;
 const MAX_TOTAL_SCAN_BYTES = 64 * 1024 * 1024;
 const MAX_VALUE_BYTES = 16 * 1024;
-const COMPLETE_MARKER = 'legacy-renderer-preferences-v1.json';
+const MAX_STATE_BYTES = 128 * 1024;
+// v1 only copied preferences. v2 additionally proves that the persistent
+// defaultSession storage and HTTP cache were cleared before the new renderer
+// was allowed to load.
+const COMPLETE_MARKER = 'legacy-renderer-storage-v2.json';
+const PENDING_STATE = 'legacy-renderer-storage-v2.pending.json';
+const MIGRATION_SCHEMA_VERSION = 2;
+const LEGACY_STORAGE_TYPES = Object.freeze([
+  'filesystem',
+  'indexdb',
+  'localstorage',
+  'shadercache',
+  'serviceworkers',
+  'cachestorage',
+]);
+const LEGACY_DATA_TYPES = Object.freeze([
+  'backgroundFetch',
+  'cache',
+  'downloads',
+  'fileSystems',
+  'indexedDB',
+  'localStorage',
+  'serviceWorkers',
+  'webSQL',
+]);
 
 function isObject(value) {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
@@ -116,6 +141,16 @@ function normalizedPreference(key, raw) {
   if (key === 'cc-web-relay-theme') return raw === 'dark' || raw === 'light' ? raw : null;
   if (key === 'cc-web-selection-hint') return raw === '1' ? raw : null;
   return sanitizedJsonPreference(key, raw);
+}
+
+function sanitizedPreferences(preferences) {
+  const safe = {};
+  if (!isObject(preferences)) return safe;
+  for (const [key, value] of Object.entries(preferences)) {
+    const normalized = normalizedPreference(key, value);
+    if (normalized !== null) safe[key] = normalized;
+  }
+  return safe;
 }
 
 function legacyOriginPrecedes(bytes, offset) {
@@ -244,57 +279,190 @@ function readLegacyRendererPreferences(userData, options = {}) {
   return result;
 }
 
+function migrationFiles(userData) {
+  const directory = path.join(userData, 'controller');
+  return {
+    directory,
+    complete: path.join(directory, COMPLETE_MARKER),
+    pending: path.join(directory, PENDING_STATE),
+  };
+}
+
+function readMigrationState(filename, filesystem) {
+  let stat;
+  try {
+    stat = filesystem.lstatSync(filename);
+  } catch (error) {
+    if (error?.code === 'ENOENT') return null;
+    throw error;
+  }
+  if (!stat.isFile() || stat.isSymbolicLink() || stat.size < 2 || stat.size > MAX_STATE_BYTES) {
+    const error = new Error(`Unsafe legacy renderer migration state: ${filename}`);
+    error.code = 'LEGACY_RENDERER_MIGRATION_STATE_INVALID';
+    throw error;
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(filesystem.readFileSync(filename, 'utf8'));
+  } catch (cause) {
+    const error = new Error(`Invalid legacy renderer migration state: ${filename}`, { cause });
+    error.code = 'LEGACY_RENDERER_MIGRATION_STATE_INVALID';
+    throw error;
+  }
+  if (!isObject(parsed) || parsed.schemaVersion !== MIGRATION_SCHEMA_VERSION) {
+    const error = new Error(`Unsupported legacy renderer migration state: ${filename}`);
+    error.code = 'LEGACY_RENDERER_MIGRATION_STATE_INVALID';
+    throw error;
+  }
+  return parsed;
+}
+
+function syncDirectory(directory, filesystem) {
+  if (typeof filesystem.fsyncSync !== 'function' || typeof filesystem.openSync !== 'function') return;
+  let descriptor = null;
+  try {
+    descriptor = filesystem.openSync(directory, 'r');
+    filesystem.fsyncSync(descriptor);
+  } catch {
+    // Directory fsync is not available on every Electron platform. The file
+    // itself is still fsynced before the atomic rename.
+  } finally {
+    if (descriptor !== null) {
+      try { filesystem.closeSync(descriptor); } catch { /* best effort */ }
+    }
+  }
+}
+
+function writeMigrationState(filename, value, filesystem) {
+  const directory = path.dirname(filename);
+  filesystem.mkdirSync(directory, { recursive: true, mode: 0o700 });
+  const temporary = `${filename}.${process.pid}.${randomBytes(8).toString('hex')}.tmp`;
+  let descriptor = null;
+  try {
+    descriptor = filesystem.openSync(temporary, 'wx', 0o600);
+    filesystem.writeFileSync(descriptor, `${JSON.stringify(value)}\n`, 'utf8');
+    filesystem.fsyncSync?.(descriptor);
+    filesystem.closeSync(descriptor);
+    descriptor = null;
+    filesystem.renameSync(temporary, filename);
+    filesystem.chmodSync(filename, 0o600);
+    syncDirectory(directory, filesystem);
+  } finally {
+    if (descriptor !== null) {
+      try { filesystem.closeSync(descriptor); } catch { /* best effort */ }
+    }
+    try { filesystem.unlinkSync(temporary); } catch (error) {
+      if (error?.code !== 'ENOENT') throw error;
+    }
+  }
+}
+
 function prepareLegacyRendererPreferences(userData, options = {}) {
   const filesystem = options.fs || fs;
-  const marker = path.join(userData, 'controller', COMPLETE_MARKER);
-  try {
-    if (filesystem.existsSync(marker)) return { pending: false, preferences: {} };
-  } catch {
+  const files = migrationFiles(userData);
+  const complete = readMigrationState(files.complete, filesystem);
+  if (complete) {
+    if (complete.status !== 'complete') {
+      const error = new Error('Legacy renderer completion marker is not complete.');
+      error.code = 'LEGACY_RENDERER_MIGRATION_STATE_INVALID';
+      throw error;
+    }
     return { pending: false, preferences: {} };
   }
 
-  return { pending: true, preferences: readLegacyRendererPreferences(userData, { fs: filesystem }) };
+  const staged = readMigrationState(files.pending, filesystem);
+  if (staged) {
+    if (staged.status !== 'pending' || !isObject(staged.preferences)) {
+      const error = new Error('Legacy renderer pending state is invalid.');
+      error.code = 'LEGACY_RENDERER_MIGRATION_STATE_INVALID';
+      throw error;
+    }
+    return { pending: true, preferences: sanitizedPreferences(staged.preferences) };
+  }
+
+  const preferences = sanitizedPreferences(readLegacyRendererPreferences(userData, { fs: filesystem }));
+  // The source LevelDB is about to be deleted. Persist only the whitelist so a
+  // crash or renderer-load failure cannot lose the settings on the retry.
+  writeMigrationState(files.pending, {
+    schemaVersion: MIGRATION_SCHEMA_VERSION,
+    status: 'pending',
+    preparedAt: new Date().toISOString(),
+    preferences,
+  }, filesystem);
+  return { pending: true, preferences };
 }
 
 function completeLegacyRendererPreferences(userData, options = {}) {
   const filesystem = options.fs || fs;
-  const marker = path.join(userData, 'controller', COMPLETE_MARKER);
-  // The old origin is no longer addressable. Mark even an empty attempt so a
-  // deliberately cleared new preference cannot be silently resurrected later.
+  const files = migrationFiles(userData);
   try {
-    filesystem.mkdirSync(path.dirname(marker), { recursive: true, mode: 0o700 });
-    filesystem.writeFileSync(marker, `${JSON.stringify({ completedAt: new Date().toISOString() })}\n`, {
-      mode: 0o600,
-      flag: 'wx',
-    });
-    filesystem.chmodSync(marker, 0o600);
+    const existing = readMigrationState(files.complete, filesystem);
+    if (!existing) {
+      writeMigrationState(files.complete, {
+        schemaVersion: MIGRATION_SCHEMA_VERSION,
+        status: 'complete',
+        completedAt: new Date().toISOString(),
+      }, filesystem);
+    } else if (existing.status !== 'complete') {
+      return false;
+    }
+    try { filesystem.unlinkSync(files.pending); } catch (error) {
+      if (error?.code !== 'ENOENT') {
+        // The durable complete marker is authoritative; a leftover staged file
+        // is ignored next launch and contains only whitelisted preferences.
+      }
+    }
+    return true;
   } catch {
-    // A read-only profile may scan again next launch; it is still bounded and
-    // cannot alter existing values because the preload fills only absent keys.
+    // A read-only profile retries the idempotent cleanup next launch. Never
+    // claim completion unless the marker is durable.
+    return false;
   }
 }
 
-function takeLegacyRendererPreferences(userData, options = {}) {
+async function clearLegacyRendererStorage(electronSession) {
+  if (!electronSession || typeof electronSession.clearStorageData !== 'function'
+    || typeof electronSession.clearCache !== 'function') {
+    const error = new TypeError('Electron defaultSession storage cleanup is unavailable.');
+    error.code = 'LEGACY_RENDERER_CLEANUP_UNAVAILABLE';
+    throw error;
+  }
+
+  // This function receives only session.defaultSession. Server OAuth sessions
+  // live in their own persist:* partitions and are never enumerated here.
+  // Cookies and the HTTP auth cache are intentionally absent from both calls.
+  // sessionStorage is process-memory scoped; before the first BrowserWindow is
+  // created there is no live renderer storage to retain across this restart.
+  if (typeof electronSession.clearData === 'function') {
+    await electronSession.clearData({ dataTypes: [...LEGACY_DATA_TYPES] });
+  }
+  await electronSession.clearStorageData({ storages: [...LEGACY_STORAGE_TYPES] });
+  await electronSession.clearCache();
+}
+
+async function migrateLegacyRendererStorage(userData, electronSessions, loadRenderer, options = {}) {
+  if (typeof loadRenderer !== 'function') throw new TypeError('A renderer loader is required.');
   const prepared = prepareLegacyRendererPreferences(userData, options);
+  // Select the default partition here so callers cannot accidentally enumerate
+  // or purge the persist:* partitions used for remote-server OAuth.
+  if (prepared.pending) await clearLegacyRendererStorage(electronSessions?.defaultSession);
+  const result = await loadRenderer(prepared.preferences);
   if (prepared.pending) completeLegacyRendererPreferences(userData, options);
-  const preferences = prepared.preferences;
-  return preferences;
+  return result;
 }
 
 function rendererPreferenceArgument(preferences) {
-  const safe = {};
-  for (const [key, value] of Object.entries(preferences || {})) {
-    if (normalizedPreference(key, value) !== null) safe[key] = value;
-  }
+  const safe = sanitizedPreferences(preferences);
   if (Object.keys(safe).length === 0) return null;
   return `--cc-web-legacy-preferences=${Buffer.from(JSON.stringify(safe), 'utf8').toString('base64url')}`;
 }
 
 module.exports = {
+  clearLegacyRendererStorage,
   completeLegacyRendererPreferences,
   extractFilePreferences,
+  migrateLegacyRendererStorage,
   prepareLegacyRendererPreferences,
   readLegacyRendererPreferences,
   rendererPreferenceArgument,
-  takeLegacyRendererPreferences,
 };

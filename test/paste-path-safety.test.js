@@ -2,7 +2,13 @@ const assert = require('assert');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const { PasteStore, sniffImageType, shellQuote, insertTextFor } = require('../dist/server/services/paste-store.js');
+const {
+  MAX_PASTE_MANIFEST_BYTES,
+  PasteStore,
+  sniffImageType,
+  shellQuote,
+  insertTextFor,
+} = require('../dist/server/services/paste-store.js');
 
 // A real 1x1 PNG. Every positive case writes actual image bytes, so a test
 // cannot pass against a sniffer that accepts anything.
@@ -203,6 +209,15 @@ describe('PasteStore path safety', function () {
     assert.deepStrictEqual(listFiles(workingDir), []);
   });
 
+  it('rejects non-numeric or unsafe configured byte limits', function () {
+    for (const sessionQuotaBytes of ['200', NaN, -1, Number.MAX_SAFE_INTEGER + 1]) {
+      assert.throws(() => new PasteStore({ storageDir, sessionQuotaBytes }), /safe integer/i);
+    }
+    for (const maxBytes of ['10', NaN, 0, Number.MAX_SAFE_INTEGER + 1]) {
+      assert.throws(() => new PasteStore({ storageDir, maxBytes }), /safe integer/i);
+    }
+  });
+
   it('never clobbers an existing file when names collide', async function () {
     // Freeze the clock and the random suffix so the second save produces
     // exactly the same name as the first.
@@ -229,6 +244,39 @@ describe('PasteStore path safety', function () {
       () => tight.save({ id: 'ok', ownerUserId: 1, workingDir }, PNG),
       /quota/i,
     );
+  });
+
+  it('rejects an oversized manifest before accepting another paste', async function () {
+    const first = await store.save({ id: 'huge-manifest', ownerUserId: 1, workingDir }, PNG);
+    const manifest = path.join(storageDir, 'pastes', '1', 'huge-manifest.json');
+    fs.writeFileSync(manifest, Buffer.alloc(MAX_PASTE_MANIFEST_BYTES + 1, 0x20));
+    const filesBefore = fs.readdirSync(path.dirname(first.absolutePath)).sort();
+
+    await assert.rejects(
+      () => store.save({ id: 'huge-manifest', ownerUserId: 1, workingDir }, PNG),
+      (error) => error && error.code === 'INVALID_PASTE_MANIFEST',
+    );
+    assert.deepStrictEqual(fs.readdirSync(path.dirname(first.absolutePath)).sort(), filesBefore);
+  });
+
+  it('does not let non-numeric or negative manifest bytes neutralize the quota', async function () {
+    const tight = new PasteStore({ storageDir, sessionQuotaBytes: PNG.length });
+    const first = await tight.save({ id: 'invalid-quota', ownerUserId: 1, workingDir }, PNG);
+    const manifest = path.join(storageDir, 'pastes', '1', 'invalid-quota.json');
+
+    for (const invalidBytes of ['0', -1]) {
+      fs.writeFileSync(manifest, JSON.stringify({
+        version: 1,
+        entries: [{ path: first.absolutePath, root: path.dirname(first.absolutePath), bytes: invalidBytes }],
+      }));
+      await assert.rejects(
+        () => tight.save({ id: 'invalid-quota', ownerUserId: 1, workingDir }, PNG),
+        (error) => error && error.code === 'INVALID_PASTE_MANIFEST',
+      );
+    }
+
+    assert.deepStrictEqual(fs.readFileSync(first.absolutePath), PNG);
+    assert.strictEqual(fs.readdirSync(path.dirname(first.absolutePath)).filter((name) => name.endsWith('.png')).length, 1);
   });
 
   it('accepts the UUIDs the server actually generates', async function () {

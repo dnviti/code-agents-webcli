@@ -13,7 +13,17 @@ import {
   PlanModeResult,
 } from './session.js';
 import { ModelCapacityLookup } from './model-capacity.js';
-import { ChatStore, ChatTurnIndex } from './store.js';
+import { ChatSessionRef, ChatStore, ChatTurnIndex } from './store.js';
+
+/** Keep every durable chat operation on the immutable workspace chosen at creation. */
+function storageRef(record: SessionRecord): ChatSessionRef {
+  return {
+    id: record.id,
+    ownerUserId: record.ownerUserId,
+    storageRoot: record.storageScope?.workspaceRoot,
+    ownerKey: record.storageScope?.ownerKey,
+  };
+}
 
 /**
  * Owns the live chat sessions.
@@ -52,6 +62,8 @@ export interface ChatManagerDeps {
   chatBypassPreference?: (userId: number) => boolean;
   /** Passed through to every session; see ChatSessionDeps.usage. */
   usage?: ChatUsageSink;
+  /** Workspace-aware composition can bind accounting to this exact record. */
+  usageFor?: (record: SessionRecord) => ChatUsageSink;
   /**
    * The folder a given user is allowed to browse, and now the outer edge of
    * what a conversation of theirs may read and write. See `confine`.
@@ -114,7 +126,7 @@ export class ChatSessionManager {
     }
 
     const session = new ChatSession(
-      { id: record.id, ownerUserId: record.ownerUserId },
+      storageRef(record),
       {
         store: this.deps.store,
         socketDir: path.join(this.deps.storageDir, 'cs'),
@@ -136,7 +148,7 @@ export class ChatSessionManager {
         // conversation it is.
         resolveBypass: () =>
           this.deps.chatBypassPreference?.(record.ownerUserId) === true,
-        usage: this.deps.usage,
+        usage: this.deps.usageFor?.(record) ?? this.deps.usage,
         capacity: this.capacity,
       },
     );
@@ -263,7 +275,7 @@ export class ChatSessionManager {
     // No live session: the log is still the truth, so a browser rejoining a
     // finished conversation reads it exactly as it was left.
     const snapshot = await this.deps.store.snapshot(
-      { id: record.id, ownerUserId: record.ownerUserId },
+      storageRef(record),
       {
         // The mode comes from the record because nothing else here remembers it:
         // the log holds what was said, not how the conversation was set up. Left
@@ -284,7 +296,7 @@ export class ChatSessionManager {
     if (!nativeSessionId) {
       nativeSessionId =
         (await this.deps.store
-          .nativeSessionId({ id: record.id, ownerUserId: record.ownerUserId })
+          .nativeSessionId(storageRef(record))
           .catch(() => null)) || undefined;
       if (nativeSessionId) {
         this.deps.onLifecycle?.(record.id, { nativeSessionId });
@@ -296,10 +308,7 @@ export class ChatSessionManager {
       runtime: snapshot.runtime || record.lastAgent || '',
       nativeSessionId,
       planMode: record.chatPlanMode === true,
-      planDocument: (await this.deps.store.planDocument?.({
-        id: record.id,
-        ownerUserId: record.ownerUserId,
-      })) ?? null,
+      planDocument: (await this.deps.store.planDocument?.(storageRef(record))) ?? null,
     };
   }
 
@@ -312,15 +321,13 @@ export class ChatSessionManager {
    * useless in exactly the conversations long enough to need one (#86).
    */
   async turnIndex(record: SessionRecord): Promise<ChatTurnIndex> {
-    const index = await this.deps.store.turnIndex({
-      id: record.id,
-      ownerUserId: record.ownerUserId,
-    });
+    const index = await this.deps.store.turnIndex(storageRef(record));
     // What each turn cost, joined on from the accounting. Not read from the log
     // beside it: the money on a `turn_end` is a per-turn figure for some
     // runtimes and a running total for others, and the one place that
     // difference has already been worked out is the row the accountant filed.
-    const spend = this.deps.usage?.spendByTurn(record.id, record.ownerUserId);
+    const spend = (this.deps.usageFor?.(record) ?? this.deps.usage)
+      ?.spendByTurn(record.id, record.ownerUserId);
     if (!spend || spend.size === 0) return index;
     return {
       ...index,
@@ -343,7 +350,7 @@ export class ChatSessionManager {
     openTurnId: string | null;
   }> {
     return this.deps.store
-      .read({ id: record.id, ownerUserId: record.ownerUserId }, fromSeq, count)
+      .read(storageRef(record), fromSeq, count)
       .then((page) => ({
         events: page.events,
         firstSeq: page.firstSeq,

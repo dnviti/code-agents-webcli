@@ -3,7 +3,10 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 
-const { openDatabase } = require('../dist/server/services/sqlite.js');
+const {
+  openDatabase,
+  resolveSqliteFileBindingBackend,
+} = require('../dist/server/services/sqlite.js');
 
 /**
  * The SQLite adapter's own semantics.
@@ -222,6 +225,72 @@ describe('sqlite adapter', function () {
     it('tolerates being closed twice', function () {
       db.close();
       assert.doesNotThrow(() => db.close());
+    });
+
+    it('routes Windows to mandatory sharing and Unix to descriptor proof when available', function () {
+      assert.strictEqual(
+        resolveSqliteFileBindingBackend('win32', false),
+        'windows-mandatory-share',
+      );
+      assert.strictEqual(
+        resolveSqliteFileBindingBackend('linux', true),
+        'descriptor-inventory',
+      );
+      assert.strictEqual(
+        resolveSqliteFileBindingBackend('darwin', true),
+        'descriptor-inventory',
+      );
+      assert.strictEqual(
+        resolveSqliteFileBindingBackend('darwin', false),
+        'unavailable',
+      );
+    });
+
+    it('fails closed when the modeled Windows provider permits rename with SQLite open', function () {
+      if (process.platform === 'win32') this.skip();
+      const boundPath = path.join(dir, 'portable-bound.sqlite');
+      fs.writeFileSync(boundPath, 'unchanged', { mode: 0o600 });
+      const expectedFd = fs.openSync(boundPath, 'r+');
+      try {
+        assert.throws(
+          () => openDatabase(boundPath, {
+            fileBinding: {
+              expectedFd,
+              displayPath: boundPath,
+              testHooks: { bindingBackendForTest: 'windows-mandatory-share' },
+            },
+          }),
+          /does not enforce mandatory delete sharing/,
+        );
+        assert.strictEqual(fs.readFileSync(boundPath, 'utf8'), 'unchanged');
+        assert.deepStrictEqual(
+          fs.readdirSync(dir).filter((name) => name.startsWith('.ccweb-sqlite-binding-')),
+          [],
+        );
+      } finally {
+        fs.closeSync(expectedFd);
+      }
+    });
+
+    it('opens a bound database on Windows only after proving mandatory delete sharing', function () {
+      if (process.platform !== 'win32') this.skip();
+      const boundPath = path.join(dir, 'windows-bound.sqlite');
+      fs.writeFileSync(boundPath, '', { mode: 0o600 });
+      const expectedFd = fs.openSync(boundPath, 'r+');
+      let bound;
+      try {
+        bound = openDatabase(boundPath, {
+          fileBinding: { expectedFd, displayPath: boundPath },
+        });
+        bound.exec('CREATE TABLE windows_binding (value TEXT)');
+        assert.strictEqual(
+          bound.prepare("SELECT name FROM sqlite_master WHERE name = 'windows_binding'").get().name,
+          'windows_binding',
+        );
+      } finally {
+        try { bound?.close(); } catch { /* Preserve the test result. */ }
+        fs.closeSync(expectedFd);
+      }
     });
   });
 

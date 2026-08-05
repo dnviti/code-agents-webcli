@@ -17,6 +17,10 @@ const {
   titleBarSymbolColor,
   writeWindowState,
 } = require('../desktop/lib.js');
+const {
+  installRendererSessionPolicy,
+  rendererPermissionAllowed,
+} = require('../desktop/renderer-session-policy.js');
 
 describe('Electron desktop helpers', function () {
   it('keeps the Electron renderer isolated and packaging targets complete', function () {
@@ -27,7 +31,11 @@ describe('Electron desktop helpers', function () {
     assert.match(main, /sandbox:\s*true/);
     assert.match(main, /webSecurity:\s*true/);
     assert.match(main, /setWindowOpenHandler/);
-    assert.match(main, /setPermissionRequestHandler/);
+    const rendererPolicy = fs.readFileSync(
+      path.join(__dirname, '..', 'desktop', 'renderer-session-policy.js'),
+      'utf8',
+    );
+    assert.match(rendererPolicy, /setPermissionRequestHandler/);
     assert.match(main, /will-redirect/);
     assert.match(main, /hasSwitch\('no-sandbox'\)/);
     assert.match(main, /\.\.\.desktopWindowChrome\(\)/);
@@ -52,10 +60,103 @@ describe('Electron desktop helpers', function () {
     assert.match(release, /EXPECTED_TAG="v\$\{VERSION\}"/);
     assert.match(release, /git merge-base --is-ancestor "\$TAG_TARGET" origin\/main/);
     assert.match(release, /Smoke the native packaged application/);
+    assert.match(release, /Smoke the installed Flatpak artifact/);
+    assert.match(release, /flatpak install --user --noninteractive --no-deps --bundle/);
+    assert.match(release, /flatpak uninstall --user --noninteractive --delete-data/);
+    assert.match(release, /DESKTOP_WORKSPACE_ATTACHMENT_SMOKE_OK/);
+    assert.match(release, /DESKTOP_PACKAGED_RENDERER_SMOKE_OK/);
     assert.match(release, /sha256sum -c SHA256SUMS/);
     assert.match(release, /tag_name:\s*\$\{\{ needs\.verify\.outputs\.tag \}\}/);
     assert.match(release, /target_commitish:\s*\$\{\{ needs\.verify\.outputs\.commit_sha \}\}/);
     assert.match(release, /permissions:\s*\n\s*contents: write/);
+  });
+
+  it('keeps picker, drop, and user paste outside broad Electron permissions', function () {
+    const origin = 'http://127.0.0.1:43210';
+    assert.strictEqual(rendererPermissionAllowed('notifications', `${origin}/chat`, origin), true);
+    for (const permission of [
+      'clipboard-read',
+      'clipboard-sanitized-write',
+      'fileSystem',
+      'fileSystemWrite',
+      'openExternal',
+    ]) {
+      assert.strictEqual(
+        rendererPermissionAllowed(permission, `${origin}/chat`, origin),
+        false,
+        `${permission} must not be granted just to accept a user gesture`,
+      );
+    }
+    assert.strictEqual(
+      rendererPermissionAllowed('notifications', 'http://127.0.0.1:43211/chat', origin),
+      false,
+      'even the one permitted capability is pinned to the exact gateway origin',
+    );
+
+    const installed = {};
+    installRendererSessionPolicy({
+      setPermissionCheckHandler(handler) { installed.check = handler; },
+      setPermissionRequestHandler(handler) { installed.request = handler; },
+    }, origin);
+    assert.strictEqual(installed.check(null, 'clipboard-read', origin), false);
+    let decision = null;
+    installed.request(
+      { getURL: () => `${origin}/chat` },
+      'notifications',
+      (allowed) => { decision = allowed; },
+      {},
+    );
+    assert.strictEqual(decision, true);
+  });
+
+  it('owns phone sharing in the desktop lifecycle without starting it implicitly', function () {
+    const main = fs.readFileSync(path.join(__dirname, '..', 'desktop', 'main.js'), 'utf8');
+    assert.match(main, /createPhoneAccessService\(\{[\s\S]*localAvailable:\s*false/);
+    assert.match(main, /createControllerGateway\(\{[\s\S]*phoneAccess:\s*phoneAccessService/);
+    assert.match(main, /attachLocal\([\s\S]*setLocalAvailable\(true\)/);
+    assert.match(main, /reportLocalFailure\([\s\S]*setLocalAvailable\(false/);
+    assert.match(main, /DESKTOP_PHONE_ACCESS_SMOKE_OK off-start-stop-port-released/);
+    assert.match(main, /desktopUpdateBusy\(\) && !updateQuitAuthorized/);
+    assert.match(main, /beforeInstall: authorizeDesktopUpdateQuit/);
+    assert.match(main, /afterInstallFailure: revokeDesktopUpdateQuit/);
+    assert.match(main, /nativeAutoUpdater/);
+    assert.match(main, /service\.status\(\)\.state !== 'off'/);
+    assert.match(main, /probe\.listen\(\{ host: '127\.0\.0\.1', port: running\.port/);
+    const phoneClose = main.indexOf("attempt('phone access'");
+    const serverClose = main.indexOf("attempt('embedded server'", phoneClose);
+    const controllerStop = main.indexOf("attempt('controller runtime'", phoneClose);
+    const gatewayClose = main.indexOf("attempt('controller gateway'", phoneClose);
+    assert.ok(phoneClose >= 0 && serverClose > phoneClose
+      && controllerStop > serverClose && gatewayClose > controllerStop,
+    'phone sharing closes before the embedded server, controller runtime, and controller gateway');
+  });
+
+  it('qualifies workspace-local binary attachments and the renderer in the packaged smoke', function () {
+    const main = fs.readFileSync(path.join(__dirname, '..', 'desktop', 'main.js'), 'utf8');
+    const smoke = fs.readFileSync(path.join(__dirname, '..', 'desktop', 'packaged-smoke.js'), 'utf8');
+    assert.match(main, /runPackagedWorkspacePersistenceSmoke\(\{/);
+    assert.match(main, /baseFolder: path\.resolve\(baseFolder\)/);
+    assert.match(main, /const workingDir = started\.baseFolder/);
+    assert.doesNotMatch(main, /path\.dirname\(started\.server\.database\.storageDir\)/);
+    assert.match(
+      main,
+      /fs\.realpathSync\(fs\.mkdtempSync\(path\.join\(os\.tmpdir\(\), 'cc-web-electron-smoke-'\)\)\)/,
+      'the packaged smoke must admit the same canonical tmp namespace it sends to the server',
+    );
+    assert.match(main, /runPackagedRendererSmoke\(started/);
+    assert.match(main, /DESKTOP_WORKSPACE_ATTACHMENT_SMOKE_OK/);
+    assert.match(main, /DESKTOP_PACKAGED_RENDERER_SMOKE_OK/);
+    assert.ok(
+      main.indexOf('DESKTOP_WORKSPACE_ATTACHMENT_SMOKE_OK') < main.indexOf('DESKTOP_SMOKE_OK'),
+      'the final packaged marker must follow the workspace persistence assertion',
+    );
+    assert.match(smoke, /\/api\/sessions\/create/);
+    assert.match(smoke, /chat-attachments\?name=packaged-smoke\.bin/);
+    assert.match(smoke, /downloadResponse\.arrayBuffer\(\)/);
+    assert.match(smoke, /session-state\.sqlite/);
+    assert.match(smoke, /runtime_sessions.*usage_jobs.*usage_job_models.*usage_job_tools/s);
+    assert.match(smoke, /cache-control.*no-store/s);
+    assert.doesNotMatch(smoke, /clearAuthCache|fromPartition/);
   });
 
   it('uses native-side controls in the PWA title bar and removes the Windows menu bar', function () {

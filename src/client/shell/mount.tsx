@@ -16,6 +16,13 @@ import {
 } from '../../shared/conversations';
 import { showConfirm } from '../ui/confirm';
 import { onBannerAction, onBannerDismiss, onBannerToggleLog } from '../ui/update-banner';
+import {
+  deferDesktopUpdate,
+  installDesktopUpdate,
+  openDesktopUpdate,
+  retryDesktopUpdate,
+  whenDesktopUpdatesHydrated,
+} from '../ui/desktop-update';
 import { showNotification } from '../ui/notifications';
 import { hideOverlay, showError } from '../ui/overlay';
 import { AppShell, type ShellActions } from './AppShell';
@@ -28,6 +35,23 @@ import { useAgentMaintenance } from '../agent-maintenance/useAgentMaintenance';
 
 /** The live terminal, so a theme change can reach it. Set once at mount. */
 let themedApp: App | null = null;
+/**
+ * Installer operations may outlive a launcher remount while this renderer is
+ * open, but their target and operation ids are session-related state. Keep the
+ * rejoin handle in process memory so Electron never writes it under userData.
+ */
+const launcherMaintenanceOperations = new Map<string, string>();
+
+function DesktopRendererReady(): null {
+  React.useEffect(() => {
+    let active = true;
+    void whenDesktopUpdatesHydrated().then(() => {
+      if (active) window.dispatchEvent(new Event('cc-web:desktop-renderer-ready'));
+    });
+    return () => { active = false; };
+  }, []);
+  return null;
+}
 
 /**
  * Switch theme from the shell's own toggle: mode plus the Relay terminal
@@ -90,11 +114,14 @@ export function mountShell(app: App): void {
   shellStore.setState({ chatView: loadChatView() });
 
   createRoot(mountPoint).render(
-    <AppShell
-      terminalNode={terminalNode}
-      actions={buildActions(app)}
-      launcher={buildLauncher(app)}
-    />,
+    <>
+      <AppShell
+        terminalNode={terminalNode}
+        actions={buildActions(app)}
+        launcher={buildLauncher(app)}
+      />
+      <DesktopRendererReady />
+    </>,
   );
 }
 
@@ -453,18 +480,18 @@ function buildLauncher(app: App): React.ReactNode {
     conversations: ResumableConversation[];
     loading: boolean;
   }): React.JSX.Element {
-    const operationKey = `cc-agent-maintenance-operation:${encodeURIComponent(serverId)}:${encodeURIComponent(targetId)}`;
+    const operationKey = JSON.stringify([serverId, targetId]);
     const [operationId, setOperationId] = React.useState<string | null>(() => {
-      try { return localStorage.getItem(operationKey); } catch { return null; }
+      return launcherMaintenanceOperations.get(operationKey) ?? null;
     });
     const rememberOperation = React.useCallback((id: string): void => {
       setOperationId(id);
-      try { localStorage.setItem(operationKey, id); } catch { /* optional */ }
+      launcherMaintenanceOperations.set(operationKey, id);
     }, [operationKey]);
     const forgetSettledOperation = React.useCallback((operation: import('../../shared/agent-maintenance').AgentMaintenanceOperation): void => {
       if (operation.phase !== 'complete' && operation.phase !== 'cancelled') return;
       setOperationId(null);
-      try { localStorage.removeItem(operationKey); } catch { /* optional */ }
+      launcherMaintenanceOperations.delete(operationKey);
     }, [operationKey]);
     const maintenance = useAgentMaintenance({
       targetId,
@@ -750,6 +777,10 @@ function buildActions(app: App): ShellActions {
     updateAction: (serverId) => void onBannerAction(serverId),
     updateToggleLog: (serverId) => onBannerToggleLog(serverId),
     updateDismiss: (serverId) => onBannerDismiss(serverId),
+    desktopUpdateOpen: openDesktopUpdate,
+    desktopUpdateDefer: () => void deferDesktopUpdate(),
+    desktopUpdateInstall: () => void installDesktopUpdate(),
+    desktopUpdateRetry: () => void retryDesktopUpdate(),
     restartAgent: (sessionId, automatic, allowFreshContext) => {
       app.send({ type: 'runtime_restart', sessionId, automatic, allowFreshContext });
     },

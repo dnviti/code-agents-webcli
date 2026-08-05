@@ -606,7 +606,7 @@ export function ChatView({
     [controller, runtime],
   );
   const upload = React.useCallback(
-    (file: File) => uploadAttachment(controller.sessionId, file),
+    (file: File, signal?: AbortSignal) => uploadAttachment(controller.sessionId, file, signal),
     [controller],
   );
   const findProjectFiles = React.useCallback(
@@ -1586,51 +1586,21 @@ interface DraftState {
 
 const EMPTY_DRAFT: DraftState = { text: '', attachments: [] };
 
-/**
- * Read this browser's own copy of a draft back.
- *
- * Session storage rather than local: a draft is something you are in the middle
- * of, and one restored into a new window a week later is a surprise rather than
- * a convenience.
- *
- * A bare string is what every version before the shared composer wrote here, and
- * it still reads correctly — as a draft with nothing attached to it, which is
- * exactly what it was.
- */
-function readStoredDraft(key: string): DraftState {
-  let raw: string | null = null;
+/** Remove the pre-workspace browser copy without importing private text. */
+function forgetLegacyStoredDraft(key: string): void {
   try {
-    raw = sessionStorage.getItem(key);
+    sessionStorage.removeItem(key);
   } catch {
-    // Private browsing, or storage disabled. Nothing was kept.
-    return EMPTY_DRAFT;
-  }
-  if (!raw) return EMPTY_DRAFT;
-  try {
-    const parsed = JSON.parse(raw) as Partial<DraftState>;
-    // Anything that parses but is not one of these is a draft from before this
-    // was written that happened to look like JSON — `42`, `true`, `[1, 2]`. It
-    // is still what somebody typed, so it is still their draft.
-    if (!parsed || typeof parsed !== 'object' || typeof parsed.text !== 'string') {
-      return { text: raw, attachments: [] };
-    }
-    return {
-      text: parsed.text,
-      attachments: Array.isArray(parsed.attachments) ? parsed.attachments : [],
-    };
-  } catch {
-    return { text: raw, attachments: [] };
+    // Storage may be disabled. There is no new browser-side write either way.
   }
 }
 
 /**
  * The composer, shared with every other screen looking at this conversation.
  *
- * Three copies of one sentence, and each of them earns its place. The React
- * state is what the field renders from. Session storage is what survives this
- * page being reloaded, and it is the only copy left when the server has
- * restarted under an open tab. The server's own is the one the account's other
- * screens read, which is the whole point (#163).
+ * Two copies of one sentence, and each of them earns its place. The React state
+ * is what the field renders from. The server's workspace-local session record
+ * is the durable copy the account's other screens and a restarted server read.
  *
  * The rule between them is the plainest one that works: whoever typed last wins.
  * There is no merging here and there should not be — two devices belonging to
@@ -1649,7 +1619,8 @@ function useSyncedDraft(
     // time, and what it heard is newer than anything written here.
     const held = controller.draftValue;
     if (held.revision > 0) return { text: held.text, attachments: held.attachments };
-    return readStoredDraft(key);
+    forgetLegacyStoredDraft(key);
+    return EMPTY_DRAFT;
   });
 
   /** So the effect below can read the current draft without re-running on it. */
@@ -1657,14 +1628,11 @@ function useSyncedDraft(
   latest.current = draft;
 
   const remember = React.useCallback(
-    (next: DraftState) => {
-      try {
-        if (next.text || next.attachments.length) sessionStorage.setItem(key, JSON.stringify(next));
-        else sessionStorage.removeItem(key);
-      } catch {
-        // Applying it anyway is right: it works for this window, it just will
-        // not survive a reload.
-      }
+    (_next: DraftState) => {
+      // Old builds placed draft text and attachment metadata in Chromium's
+      // userData. Never write it there again, and erase the legacy key if an
+      // upgraded renderer encounters one.
+      forgetLegacyStoredDraft(key);
     },
     [key],
   );
@@ -1697,11 +1665,9 @@ function useSyncedDraft(
         remember(next);
         return;
       }
-      // The server has no composer for this conversation — it has restarted, or
-      // nothing has been typed into it since it came up. This browser may be the
-      // only thing still holding what was being written, so it offers it rather
-      // than waiting to be asked. Nothing goes out when there is nothing to
-      // offer, so an empty composer stays quiet.
+      // The server has no composer for this conversation. Browser storage is no
+      // longer a source of session data, so only this mount's live React value
+      // can be offered (normally empty, unless the subscription raced typing).
       const held = latest.current;
       if (held.text || held.attachments.length) {
         controller.publishDraft(held.text, held.attachments);

@@ -1,0 +1,211 @@
+name: Desktop updater installed qualification
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Candidate vX.Y.Z tag whose exact commit was tested
+        required: true
+        type: string
+      base_version:
+        description: Installed updater-capable X.Y.Z version used as the base
+        required: true
+        type: string
+      windows_evidence:
+        description: Successful Actions run URL for signed NSIS old-to-new install/relaunch
+        required: true
+        type: string
+      appimage_evidence:
+        description: Successful Actions run URL for writable AppImage old-to-new install/relaunch
+        required: true
+        type: string
+      flatpak_evidence:
+        description: Successful Actions run URL for repository/portal Flatpak old-to-new install/relaunch
+        required: true
+        type: string
+      macos_x64_evidence:
+        description: Successful Actions run URL for signed/notarized Intel macOS old-to-new install/relaunch
+        required: true
+        type: string
+      macos_arm64_evidence:
+        description: Successful Actions run URL for signed/notarized Apple Silicon old-to-new install/relaunch
+        required: true
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  attest:
+    name: Record protected installed-package evidence
+    runs-on: ubuntu-latest
+    environment: release
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+      - name: Bind the qualification to the exact stable tag
+        id: target
+        shell: bash
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+          INPUT_BASE_VERSION: ${{ inputs.base_version }}
+        run: |
+          set -euo pipefail
+          tag="$INPUT_TAG"
+          base="$INPUT_BASE_VERSION"
+          [[ "$tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
+          [[ "$base" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
+          target="${tag#v}"
+          test "$target" != "$base"
+          commit="$(git rev-parse "${tag}^{commit}")"
+          test "$(git show "${tag}:package.json" | node -e 'let s=""; process.stdin.on("data",c=>s+=c).on("end",()=>process.stdout.write(JSON.parse(s).version))')" = "$target"
+          echo "target=$target" >> "$GITHUB_OUTPUT"
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+      - name: Download the exact private staging packages
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ inputs.tag }}
+          COMMIT: ${{ steps.target.outputs.commit }}
+        run: |
+          set -euo pipefail
+          gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" > "$RUNNER_TEMP/candidate-release.json"
+          RELEASE_FILE="$RUNNER_TEMP/candidate-release.json" node <<'NODE'
+          const fs = require('node:fs');
+          const release = JSON.parse(fs.readFileSync(process.env.RELEASE_FILE, 'utf8'));
+          if (!release.draft || release.tag_name !== process.env.TAG
+            || release.target_commitish !== process.env.COMMIT) {
+            throw new Error('Qualification requires the exact private candidate release.');
+          }
+          NODE
+          mkdir qualification-assets
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir qualification-assets
+          mkdir qualification-feed
+          candidate_url="https://dnviti.github.io/code-agents-webcli/flatpak-candidates/${TAG}/"
+          curl_args=(--fail --silent --show-error --location --proto '=https' --tlsv1.2)
+          for file in code-agents-webcli.gpg summary summary.sig update-info.json update-info.json.asc; do
+            curl "${curl_args[@]}" "${candidate_url}${file}" -o "qualification-feed/$file"
+          done
+      - name: Write the qualification attestation
+        shell: bash
+        env:
+          TAG: ${{ inputs.tag }}
+          BASE_VERSION: ${{ inputs.base_version }}
+          TARGET_VERSION: ${{ steps.target.outputs.target }}
+          COMMIT: ${{ steps.target.outputs.commit }}
+          WINDOWS_EVIDENCE: ${{ inputs.windows_evidence }}
+          APPIMAGE_EVIDENCE: ${{ inputs.appimage_evidence }}
+          FLATPAK_EVIDENCE: ${{ inputs.flatpak_evidence }}
+          MACOS_X64_EVIDENCE: ${{ inputs.macos_x64_evidence }}
+          MACOS_ARM64_EVIDENCE: ${{ inputs.macos_arm64_evidence }}
+          ASSET_DIRECTORY: qualification-assets
+          FEED_DIRECTORY: qualification-feed
+        run: |
+          set -euo pipefail
+          node <<'NODE'
+          const crypto = require('node:crypto');
+          const fs = require('node:fs');
+          const path = require('node:path');
+          const assetNames = {
+            'windows-nsis': `Code-Agents-Web-CLI-${process.env.TARGET_VERSION}-win-x64.exe`,
+            'linux-appimage': `Code-Agents-Web-CLI-${process.env.TARGET_VERSION}-linux-x64.AppImage`,
+            'macos-x64': `Code-Agents-Web-CLI-${process.env.TARGET_VERSION}-mac-x64.zip`,
+            'macos-arm64': `Code-Agents-Web-CLI-${process.env.TARGET_VERSION}-mac-arm64.zip`,
+          };
+          const sha256File = (filename) => {
+            const hash = crypto.createHash('sha256');
+            const descriptor = fs.openSync(filename, 'r');
+            const buffer = Buffer.allocUnsafe(1024 * 1024);
+            try {
+              let length;
+              do {
+                length = fs.readSync(descriptor, buffer, 0, buffer.length, null);
+                if (length > 0) hash.update(buffer.subarray(0, length));
+              } while (length > 0);
+            } finally {
+              fs.closeSync(descriptor);
+            }
+            return hash.digest('hex');
+          };
+          const releaseAssets = Object.fromEntries(fs.readdirSync(process.env.ASSET_DIRECTORY)
+            .sort().map((name) => [name, sha256File(path.join(process.env.ASSET_DIRECTORY, name))]));
+          const flatpakFiles = [
+            'code-agents-webcli.gpg', 'summary', 'summary.sig', 'update-info.json', 'update-info.json.asc',
+          ];
+          const updateInfo = JSON.parse(fs.readFileSync(path.join(process.env.FEED_DIRECTORY, 'update-info.json'), 'utf8'));
+          const evidence = (name, environment) => ({
+            passed: true,
+            evidence: process.env[environment],
+            payload: name === 'linux-flatpak'
+              ? {
+                  kind: 'flatpak-repository',
+                  commit: updateInfo.commit,
+                  files: Object.fromEntries(flatpakFiles.map((filename) => [
+                    filename, sha256File(path.join(process.env.FEED_DIRECTORY, filename)),
+                  ])),
+                }
+              : { kind: 'asset', name: assetNames[name], sha256: releaseAssets[assetNames[name]] },
+          });
+          fs.writeFileSync('desktop-updater-qualification.json', `${JSON.stringify({
+            schemaVersion: 2,
+            tag: process.env.TAG,
+            commit: process.env.COMMIT,
+            baseVersion: process.env.BASE_VERSION,
+            targetVersion: process.env.TARGET_VERSION,
+            completedAt: new Date().toISOString(),
+            releaseAssets,
+            results: {
+              'windows-nsis': evidence('windows-nsis', 'WINDOWS_EVIDENCE'),
+              'linux-appimage': evidence('linux-appimage', 'APPIMAGE_EVIDENCE'),
+              'linux-flatpak': evidence('linux-flatpak', 'FLATPAK_EVIDENCE'),
+              'macos-x64': evidence('macos-x64', 'MACOS_X64_EVIDENCE'),
+              'macos-arm64': evidence('macos-arm64', 'MACOS_ARM64_EVIDENCE'),
+            },
+          })}\n`);
+          NODE
+          node scripts/validate-desktop-updater-qualification.js \
+            desktop-updater-qualification.json "$TAG" "$COMMIT" qualification-assets qualification-feed
+      - name: Verify package-specific installed-trial artifacts
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          COMMIT: ${{ steps.target.outputs.commit }}
+          WINDOWS_EVIDENCE: ${{ inputs.windows_evidence }}
+          APPIMAGE_EVIDENCE: ${{ inputs.appimage_evidence }}
+          FLATPAK_EVIDENCE: ${{ inputs.flatpak_evidence }}
+          MACOS_X64_EVIDENCE: ${{ inputs.macos_x64_evidence }}
+          MACOS_ARM64_EVIDENCE: ${{ inputs.macos_arm64_evidence }}
+        run: |
+          set -euo pipefail
+          packages=(windows-nsis linux-appimage linux-flatpak macos-x64 macos-arm64)
+          evidence_urls=("$WINDOWS_EVIDENCE" "$APPIMAGE_EVIDENCE" "$FLATPAK_EVIDENCE" "$MACOS_X64_EVIDENCE" "$MACOS_ARM64_EVIDENCE")
+          for index in "${!packages[@]}"; do
+            package="${packages[$index]}"
+            url="${evidence_urls[$index]%/}"
+            [[ "$url" =~ ^https://github\.com/dnviti/code-agents-webcli/actions/runs/([1-9][0-9]*)$ ]]
+            run_id="${BASH_REMATCH[1]}"
+            run_file="$RUNNER_TEMP/run-$run_id.json"
+            gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run_id" > "$run_file"
+            RUN_FILE="$run_file" node <<'NODE'
+          const fs = require('node:fs');
+          const run = JSON.parse(fs.readFileSync(process.env.RUN_FILE, 'utf8'));
+          if (run.conclusion !== 'success' || run.head_sha !== process.env.COMMIT) {
+            throw new Error('Installed-trial run is not successful for the candidate commit.');
+          }
+          NODE
+            directory="$RUNNER_TEMP/evidence-$package"
+            mkdir "$directory"
+            gh run download "$run_id" --repo "$GITHUB_REPOSITORY" \
+              --name "desktop-updater-evidence-$package" --dir "$directory"
+            test "$(find "$directory" -maxdepth 1 -type f -name desktop-updater-evidence.json | wc -l)" = 1
+            node scripts/validate-desktop-updater-trial-evidence.js \
+              "$directory/desktop-updater-evidence.json" "$package" desktop-updater-qualification.json
+          done
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: desktop-updater-qualification
+          path: desktop-updater-qualification.json
+          if-no-files-found: error
+          retention-days: 90

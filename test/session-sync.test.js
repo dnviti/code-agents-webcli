@@ -36,8 +36,10 @@ let server;
 let base;
 let currentUser;
 let destroyed;
+let finalTeardown;
 let saves;
 let saveSessions;
+let loadWorkspaceSessions;
 let tabAcquireRequests;
 
 async function waitUntil(check, message, timeoutMs = 1000) {
@@ -129,6 +131,7 @@ describe('telling every screen what happened to a session', function () {
         baseFolder: '/projects',
         dev: false,
         validatePath: (target) => ({ valid: true, path: target }),
+        loadWorkspaceSessions: (userId, root) => loadWorkspaceSessions(userId, root),
         createSessionRecord: (params) => record(params.id, params),
         getRuntimeBridge: () => null,
         saveSessionsToDisk: () => saveSessions(),
@@ -139,6 +142,7 @@ describe('telling every screen what happened to a session', function () {
         historyStore: { deleteHistory: async () => {} },
         getScreenSnapshot: () => [],
         disposeRecorder: (id) => destroyed.push(id),
+        sessionTeardown: { dispose: (session) => { finalTeardown.push(session.id); } },
         getSelectedWorkingDir: () => null,
         sessionStore: { getSessionMetadata: async () => ({}) },
         tabCoordinator: {
@@ -167,9 +171,11 @@ describe('telling every screen what happened to a session', function () {
     sessions.clear();
     sockets.clear();
     destroyed = [];
+    finalTeardown = [];
     saves = 0;
     tabAcquireRequests = 0;
     saveSessions = async () => { saves++; };
+    loadWorkspaceSessions = async () => {};
     currentUser = USER;
   });
 
@@ -211,6 +217,23 @@ describe('telling every screen what happened to a session', function () {
     const response = await fetch(`${base}/api/sessions/list`);
     return { status: response.status, body: await response.json().catch(() => null) };
   }
+
+  it('reports an unavailable workspace archive without creating a session', async function () {
+    loadWorkspaceSessions = async () => {
+      throw new Error('workspace root is already assigned to another account');
+    };
+
+    const result = await create({ workingDir: '/projects/shared' });
+
+    assert.strictEqual(result.status, 409);
+    assert.deepStrictEqual(result.body, {
+      error: 'workspace_persistence_unavailable',
+      message: 'workspace root is already assigned to another account',
+      retryable: true,
+    });
+    assert.strictEqual(sessions.size, 0);
+    assert.strictEqual(saves, 0);
+  });
 
   it('announces a new session to every one of this user\'s screens, and nobody else\'s', async function () {
     const asking = socket('w1', USER.id);
@@ -281,6 +304,7 @@ describe('telling every screen what happened to a session', function () {
     assert.strictEqual(sessions.get('chat'), chat, 'the conversation record remains');
     assert.strictEqual(chat.active, true, 'its running agent is not stopped');
     assert.deepStrictEqual(destroyed, [], 'none of its durable data is torn down');
+    assert.deepStrictEqual(finalTeardown, [], 'close tab never runs definitive artifact teardown');
     assert.strictEqual(saves, 1, 'the account-level tab state is persisted immediately');
     const expected = { type: 'session_tab_closed', sessionId: 'chat' };
     assert.deepStrictEqual(typed(laptop, 'session_tab_closed'), [expected]);
@@ -322,6 +346,38 @@ describe('telling every screen what happened to a session', function () {
       { type: 'session_tabs_reordered', sessionIds: ['chat'] },
     ]);
     assert.deepStrictEqual((await list()).body.sessions.map((entry) => entry.id), ['chat']);
+  });
+
+  it('refuses tab, order and delete mutations while workspace migration is blocked', async function () {
+    const reason = 'Workspace archive cannot currently be opened';
+    const blocked = record('blocked', {
+      surface: 'chat',
+      tabOrder: 0,
+      persistenceUnavailable: reason,
+    });
+    const normal = record('normal', { surface: 'chat', tabOrder: 1 });
+    sessions.set(blocked.id, blocked);
+    sessions.set(normal.id, normal);
+    const phone = socket('w1', USER.id);
+    sockets.set(phone.id, phone);
+
+    const tabResult = await setTab(blocked.id, false);
+    assert.strictEqual(tabResult.status, 409);
+    assert.strictEqual(tabResult.body.error, 'session_persistence_unavailable');
+    assert.strictEqual(blocked.tabOpen, undefined);
+
+    const orderResult = await reorder([normal.id, blocked.id]);
+    assert.strictEqual(orderResult.status, 409);
+    assert.strictEqual(orderResult.body.error, 'session_persistence_unavailable');
+    assert.deepStrictEqual([blocked.tabOrder, normal.tabOrder], [0, 1]);
+
+    const deleteResult = await remove(blocked.id);
+    assert.strictEqual(deleteResult.status, 409);
+    assert.strictEqual(deleteResult.body.error, 'session_persistence_unavailable');
+    assert.strictEqual(sessions.get(blocked.id), blocked);
+    assert.strictEqual(saves, 0, 'no refused mutation reaches persistence');
+    assert.deepStrictEqual(destroyed, [], 'no refused mutation reaches teardown');
+    assert.deepStrictEqual(phone.sent, [], 'no refused mutation is announced');
   });
 
   it('persists one exact tab order and announces it only to this account', async function () {
@@ -636,6 +692,7 @@ describe('telling every screen what happened to a session', function () {
     assert.deepStrictEqual(typed(elsewhere, 'session_deleted'), [expected]);
     assert.deepStrictEqual(stranger.sent, [], 'another user hears nothing');
     assert.deepStrictEqual(destroyed, ['s1'], 'the session really is torn down');
+    assert.deepStrictEqual(finalTeardown, ['s1'], 'definitive delete runs registered artifact teardown');
   });
 
   it('restores the exact legacy Map order when a delete cannot be persisted', async function () {
@@ -754,6 +811,22 @@ function processorWith(infos, records) {
 }
 
 describe('announcing a session over the socket that made it', function () {
+  it('reports an unavailable workspace archive without creating a session', async function () {
+    const asking = socket('w1', USER.id);
+    const { processor, claudeSessions } = processorWith([asking], []);
+    processor.deps.loadWorkspaceSessions = async () => {
+      throw new Error('workspace root is already assigned to another account');
+    };
+
+    await processor.createAndJoinSession('w1', 'blocked', '/projects/shared');
+
+    assert.deepStrictEqual(asking.sent, [{
+      type: 'error',
+      message: 'Workspace persistence is unavailable: workspace root is already assigned to another account',
+    }]);
+    assert.strictEqual(claudeSessions.size, 0);
+  });
+
   it('tells the other screens about a session created on this one', async function () {
     const asking = socket('w1', USER.id);
     const phone = socket('w2', USER.id);

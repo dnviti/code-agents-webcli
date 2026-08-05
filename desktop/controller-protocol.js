@@ -65,15 +65,82 @@ function attachmentUrlParts(value) {
   if (!match) return null;
   let sessionId;
   try { sessionId = decodeURIComponent(match[2]); } catch { return null; }
-  return { prefix: match[1], sessionId, suffix: `${match[3]}${match[4] || ''}` };
+  return {
+    prefix: match[1],
+    encodedSessionId: match[2],
+    sessionId,
+    suffix: `${match[3]}${match[4] || ''}`,
+  };
 }
 
-function qualifyAttachmentUrls(serverId, value) {
+function qualifyAttachmentUrls(serverId, value, expectedSessionId) {
+  const enforceMessageOwner = arguments.length >= 3;
   return mapAttachmentUrls(value, (url) => {
     const parts = attachmentUrlParts(url);
-    if (!parts || parseQualifiedSessionId(parts.sessionId)) return url;
+    if (!parts) return url;
+    if (parseQualifiedSessionId(parts.sessionId)) {
+      throw new TypeError('Upstream attachment URLs must not contain a qualified session id');
+    }
+    if (enforceMessageOwner && (
+      typeof expectedSessionId !== 'string'
+      || !expectedSessionId
+      || parts.sessionId !== expectedSessionId
+      || parts.encodedSessionId !== encodeURIComponent(expectedSessionId)
+    )) {
+      throw new TypeError('The attachment URL does not belong to the message session');
+    }
     return `${parts.prefix}${encodeURIComponent(qualifySessionId(serverId, parts.sessionId))}${parts.suffix}`;
   });
+}
+
+/**
+ * Qualify the capability returned by one successful attachment upload.
+ *
+ * General server messages may contain unrelated `url` fields, so the broad
+ * message rewriter intentionally leaves unknown shapes alone. An upload is a
+ * narrower trust boundary: its one URL must be the canonical relative URL for
+ * the exact raw session that received the bytes. Absolute, already-qualified,
+ * cross-session, query-bearing, and malformed URLs are rejected rather than
+ * handed to the Electron renderer.
+ */
+function qualifyOwnedAttachment(serverId, sessionId, value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new TypeError('The attachment server returned an invalid descriptor');
+  }
+  if (
+    typeof value.name !== 'string'
+    || !value.name
+    || typeof value.mime !== 'string'
+    || !Number.isSafeInteger(value.size)
+    || value.size < 0
+    || typeof value.url !== 'string'
+  ) {
+    throw new TypeError('The attachment server returned an invalid descriptor');
+  }
+  const prefix = `/api/sessions/${encodeURIComponent(requireIdentifier(sessionId, 'Session id'))}/chat-attachments/`;
+  if (!value.url.startsWith(prefix)) {
+    throw new TypeError('The attachment URL does not belong to the uploaded session');
+  }
+  const encodedName = value.url.slice(prefix.length);
+  if (!encodedName || encodedName.includes('/') || encodedName.includes('?') || encodedName.includes('#')) {
+    throw new TypeError('The attachment URL is not canonical');
+  }
+  let storedName;
+  try { storedName = decodeURIComponent(encodedName); } catch {
+    throw new TypeError('The attachment URL is not canonical');
+  }
+  if (
+    encodeURIComponent(storedName) !== encodedName
+    || !/^[A-Za-z0-9._-]+$/.test(storedName)
+    || storedName === '.'
+    || storedName === '..'
+  ) {
+    throw new TypeError('The attachment URL is not canonical');
+  }
+  return {
+    ...value,
+    url: `/api/sessions/${encodeURIComponent(qualifySessionId(serverId, sessionId))}/chat-attachments/${encodedName}`,
+  };
 }
 
 function resolveAttachmentUrls(serverId, value) {
@@ -88,15 +155,22 @@ function resolveAttachmentUrls(serverId, value) {
 
 function qualifyServerMessage(serverId, message) {
   if (!message || typeof message !== 'object' || Array.isArray(message)) return message;
+  const rawSessionId = typeof message.sessionId === 'string' && message.sessionId
+    ? message.sessionId
+    : undefined;
   const qualified = { ...message, serverId };
-  if (typeof message.sessionId === 'string' && message.sessionId) {
-    qualified.sessionId = qualifySessionId(serverId, message.sessionId);
+  if (rawSessionId) {
+    qualified.sessionId = qualifySessionId(serverId, rawSessionId);
   }
   if (Array.isArray(message.sessionIds)) {
     qualified.sessionIds = message.sessionIds.map((sessionId) =>
       qualifySessionId(serverId, requireIdentifier(sessionId, 'Session id')));
   }
-  return qualifyAttachmentUrls(serverId, qualified);
+  // Attachment paths received from an upstream are capabilities. They must be
+  // raw, canonical paths for the exact session named by this message; accepting
+  // an already-qualified or cross-session path would let one target make the
+  // renderer fetch through another controller namespace.
+  return qualifyAttachmentUrls(serverId, qualified, rawSessionId);
 }
 
 /**
@@ -182,6 +256,7 @@ module.exports = {
   QUALIFIED_PREFIX,
   parseQualifiedSessionId,
   qualifyAttachmentUrls,
+  qualifyOwnedAttachment,
   qualifyServerMessage,
   qualifySessionId,
   qualifySessionList,

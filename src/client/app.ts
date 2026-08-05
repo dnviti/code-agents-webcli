@@ -66,6 +66,7 @@ import { watchKeyboardInset } from './terminal/keyboard';
 import { installBrowserShortcutGuard } from './ui/browser-shortcuts';
 import { showNotification, playNotificationSound } from './ui/notifications';
 import { setupUpdateBanner } from './ui/update-banner';
+import { setupDesktopUpdates } from './ui/desktop-update';
 import { pickImage, type ImagePasteTarget } from './terminal/paste';
 import { SplitContainer } from './splits/split-container';
 import { shellStore } from './shell/store';
@@ -263,6 +264,7 @@ export class App {
     // that can miss it outright.
     setupInstallPrompt();
     setupWindowControlsOverlay();
+    setupDesktopUpdates();
     // Same reason: a notification outlives the page that raised it, so one can
     // be clicked while this window is still fetching its session list. The
     // worker posts once and does not retry — the id is held until the tab

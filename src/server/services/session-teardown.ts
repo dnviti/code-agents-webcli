@@ -3,14 +3,38 @@ import { SessionRecord } from '../types.js';
 /**
  * Cleanup work owed by one subsystem when a session goes away.
  *
- * Fire-and-forget by contract: the DELETE route answers the client before any
- * of these finish, so a disposer that rejects must never surface as an
- * unhandled rejection. The registry swallows and logs instead.
+ * The DELETE path awaits these cleanups before it answers, while each failure
+ * remains isolated and logged so one subsystem cannot strand all the others.
  */
-export type SessionDisposer = (session: SessionRecord) => void | Promise<void>;
+export interface SessionTeardownContext {
+  /** ProjectManager already owns this project's exclusive lifecycle operation. */
+  projectLifecycleExclusive?: boolean;
+}
+
+export type SessionDisposer = (
+  session: SessionRecord,
+  context?: SessionTeardownContext,
+) => void | Promise<void>;
 
 export interface SessionTeardownLike {
-  dispose(session: SessionRecord): void;
+  dispose(session: SessionRecord, context?: SessionTeardownContext): void | Promise<void>;
+  /**
+   * Rollback-only variant which still isolates every subsystem but reports
+   * failures to the transaction coordinator instead of consuming them.
+   */
+  disposeStrict?(
+    session: SessionRecord,
+    context?: SessionTeardownContext,
+  ): Promise<SessionTeardownResult>;
+}
+
+export interface SessionTeardownFailure {
+  name: string;
+  error: unknown;
+}
+
+export interface SessionTeardownResult {
+  failures: SessionTeardownFailure[];
 }
 
 /**
@@ -26,20 +50,35 @@ export class SessionTeardownRegistry implements SessionTeardownLike {
     this.disposers.push({ name, run });
   }
 
-  dispose(session: SessionRecord): void {
+  async dispose(session: SessionRecord, context?: SessionTeardownContext): Promise<void> {
+    const result = await this.runAll(session, context);
+    for (const failure of result.failures) {
+      console.error(`Session teardown "${failure.name}" failed:`, failure.error);
+    }
+  }
+
+  async disposeStrict(
+    session: SessionRecord,
+    context?: SessionTeardownContext,
+  ): Promise<SessionTeardownResult> {
+    return this.runAll(session, context);
+  }
+
+  private async runAll(
+    session: SessionRecord,
+    context?: SessionTeardownContext,
+  ): Promise<SessionTeardownResult> {
+    const failures: SessionTeardownFailure[] = [];
     for (const disposer of this.disposers) {
       // Each disposer is isolated: one store throwing must not stop the next
-      // store from cleaning up.
+      // store from cleaning up. Awaiting still guarantees a successful DELETE
+      // does not leave workspace-local artefacts behind.
       try {
-        const result = disposer.run(session);
-        if (result && typeof result.then === 'function') {
-          result.then(undefined, (error: unknown) => {
-            console.error(`Session teardown "${disposer.name}" failed:`, error);
-          });
-        }
+        await disposer.run(session, context);
       } catch (error) {
-        console.error(`Session teardown "${disposer.name}" failed:`, error);
+        failures.push({ name: disposer.name, error });
       }
     }
+    return { failures };
   }
 }

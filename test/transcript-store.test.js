@@ -51,4 +51,29 @@ describe('TranscriptStore', function() {
     const exists = await fs.access(transcriptPath).then(() => true).catch(() => false);
     assert.strictEqual(exists, false);
   });
+
+  it('refuses a workspace root reached through a symlink', async function() {
+    const target = path.join(tempDir, 'real-workspace');
+    const link = path.join(tempDir, 'workspace-link');
+    await fs.mkdir(target);
+    await fs.symlink(target, link);
+
+    await assert.rejects(
+      () => transcriptStore.ensureTranscript({ ...session, storageRoot: link, ownerKey: 'owner' }),
+      /symlink/i,
+    );
+    assert.ok(!(await fs.readdir(target)).includes('.cc-web'));
+  });
+
+  it('leaves an existing nested workspace .gitignore unchanged', async function() {
+    const custom = '# mine\n!keep\n';
+    const container = path.join(tempDir, '.cc-web');
+    await fs.mkdir(container);
+    await fs.writeFile(path.join(container, '.gitignore'), custom);
+    const local = { ...session, storageRoot: tempDir, ownerKey: 'owner' };
+
+    const transcriptPath = await transcriptStore.ensureTranscript(local);
+    assert.strictEqual(transcriptPath, path.join(container, 'sessions', 'owner', session.id, 'transcript.md'));
+    assert.strictEqual(await fs.readFile(path.join(container, '.gitignore'), 'utf8'), custom);
+  });
 });

@@ -43,6 +43,7 @@ function fakeProjectManager(containerRoot, hostCheckout) {
   const closeTimes = [];
   const processControlStops = [];
   const unverifiedProcesses = [];
+  const workspaceOperations = [];
   let slowRead = false;
   let processControlFactory = async () => {};
   let omitProcessControl = false;
@@ -75,11 +76,23 @@ function fakeProjectManager(containerRoot, hostCheckout) {
     closeTimes,
     processControlStops,
     unverifiedProcesses,
+    workspaceOperations,
     setSlowRead(value) { slowRead = value; },
     setProcessControl(factory) { processControlFactory = factory; },
     setOmitProcessControl(value) { omitProcessControl = value; },
     getForUser: (userId, projectId) =>
       userId === USER.id && projectId === 'project-1' ? { id: projectId } : null,
+    projectWorkspaceRoot: (userId, projectId) =>
+      userId === USER.id && projectId === 'project-1' ? hostCheckout : null,
+    withProjectWorkspace: async (userId, projectId, operation) => {
+      if (userId !== USER.id || projectId !== 'project-1') throw new Error('project is unavailable');
+      workspaceOperations.push({ phase: 'start', userId, projectId });
+      try {
+        return await operation(hostCheckout);
+      } finally {
+        workspaceOperations.push({ phase: 'end', userId, projectId });
+      }
+    },
     ensureForSession: async (userId, projectId) => {
       const leaseId = `workspace-${++leaseNumber}`;
       ensured.push({ userId, projectId, leaseId });
@@ -396,6 +409,10 @@ describe('arbitrary project container workspaces', function () {
   });
 
   it('uploads, serves and resolves chat attachments inside the project container', async function () {
+    sessions.get('session-1').storageScope = {
+      workspaceRoot: hostCheckout,
+      ownerKey: 'stable-project-owner',
+    };
     const uploaded = await fetch(
       `${base}/api/sessions/session-1/chat-attachments?name=notes.txt`,
       { method: 'POST', headers: { 'Content-Type': 'text/plain' }, body: Buffer.from('container attachment') },
@@ -403,11 +420,21 @@ describe('arbitrary project container workspaces', function () {
     assert.strictEqual(uploaded.status, 200);
     const attachment = await uploaded.json();
     assert.strictEqual(attachment.name, 'notes.txt');
-    assert.strictEqual(attachment.path.startsWith(`${containerPath}/.cc-web/attachments/`), true);
+    assert.strictEqual(
+      attachment.path.startsWith('/workspace/repo/.cc-web/attachments/stable-project-owner/session-1/'),
+      true,
+    );
     assert.strictEqual(fs.existsSync(path.join(hostTwin, '.cc-web', 'attachments')), false,
       'an equal-looking host path must remain untouched');
     assert.strictEqual(
-      fs.readFileSync(path.join(containerRoot, attachment.path.slice(1)), 'utf8'),
+      fs.readFileSync(path.join(
+        hostCheckout,
+        '.cc-web',
+        'attachments',
+        'stable-project-owner',
+        'session-1',
+        path.basename(attachment.path),
+      ), 'utf8'),
       'container attachment',
     );
 
@@ -421,6 +448,428 @@ describe('arbitrary project container workspaces', function () {
     );
     assert.strictEqual(resolved.path, attachment.path);
     assert.strictEqual(resolved.name, 'notes.txt');
+    assert.strictEqual(manager.ensured.length, manager.released.length);
+  });
+
+  it('clones project attachment bytes in the canonical host checkout without starting a runtime', async function () {
+    const source = sessions.get('session-1');
+    source.storageScope = {
+      workspaceRoot: hostCheckout,
+      ownerKey: 'stable-project-owner',
+    };
+    const target = sessionRecord(containerPath, {
+      id: 'session-branch',
+      storageScope: source.storageScope,
+    });
+    const bytes = Buffer.from('project branch attachment');
+    const stored = await manager.attachmentStore.save(source, {
+      filename: 'branch.txt', declaredMime: 'text/plain', bytes,
+    });
+    const sourceUrl = `/api/sessions/${source.id}/chat-attachments/${stored.storedName}`;
+    const admissionsBefore = manager.ensured.length;
+    const workspaceOperationsBefore = manager.workspaceOperations.length;
+
+    await assert.rejects(
+      () => manager.attachmentStore.cloneForBranch(source, source, {
+        url: sourceUrl,
+        name: stored.name,
+        mime: stored.mime,
+        size: stored.bytes,
+      }),
+      (error) => error && error.code === 'INVALID_TARGET',
+    );
+    assert.strictEqual(
+      manager.ensured.length,
+      admissionsBefore,
+      'same-session rejection happens before project admission or filesystem access',
+    );
+    await assert.rejects(
+      () => manager.attachmentStore.cloneForBranch(source, {
+        ...target,
+        projectId: 'project-other',
+      }, {
+        url: sourceUrl,
+        name: stored.name,
+        mime: stored.mime,
+        size: stored.bytes,
+      }),
+      (error) => error && error.code === 'PROJECT_MISMATCH',
+    );
+    assert.strictEqual(
+      manager.workspaceOperations.length,
+      workspaceOperationsBefore,
+      'cross-project targets are rejected before lifecycle admission',
+    );
+
+    const cloned = await manager.attachmentStore.cloneForBranch(source, target, {
+      url: sourceUrl,
+      name: 'forged.txt',
+      mime: 'text/plain',
+      size: 1,
+      path: '/tmp/forged',
+    });
+
+    assert.strictEqual(cloned.name, 'branch.txt');
+    assert.ok(cloned.url.startsWith('/api/sessions/session-branch/chat-attachments/'));
+    assert.ok(cloned.path.startsWith(path.join(
+      hostCheckout,
+      '.cc-web',
+      'attachments',
+      'stable-project-owner',
+      'session-branch',
+    )));
+    assert.deepStrictEqual(
+      fs.readFileSync(path.join(
+        hostCheckout,
+        '.cc-web',
+        'attachments',
+        'stable-project-owner',
+        'session-branch',
+        path.basename(cloned.path),
+      )),
+      bytes,
+    );
+    assert.deepStrictEqual(fs.readFileSync(path.join(
+      hostCheckout,
+      '.cc-web',
+      'attachments',
+      'stable-project-owner',
+      source.id,
+      path.basename(stored.absolutePath),
+    )), bytes, 'source bytes remain owned by source');
+    assert.strictEqual(
+      manager.ensured.length,
+      admissionsBefore,
+      'durable branch copying does not start or admit the project runtime',
+    );
+    assert.deepStrictEqual(
+      manager.workspaceOperations.slice(workspaceOperationsBefore).map((entry) => entry.phase),
+      ['start', 'end'],
+      'one no-start lifecycle gate spans the complete bounded copy',
+    );
+
+    const resolved = await manager.attachmentStore.resolveForTurn(target, cloned);
+    assert.ok(
+      resolved.path.startsWith('/workspace/repo/.cc-web/attachments/stable-project-owner/session-branch/'),
+      'runtime resolution maps the durable host URL into the container only at launch',
+    );
+    assert.strictEqual(manager.ensured.length, admissionsBefore + 1);
+    assert.strictEqual(manager.ensured.length, manager.released.length);
+  });
+
+  it('rejects a project branch copy when the opened source changes size during the read', async function () {
+    const source = sessions.get('session-1');
+    source.storageScope = {
+      workspaceRoot: hostCheckout,
+      ownerKey: 'stable-project-owner',
+    };
+    const target = sessionRecord(containerPath, {
+      id: 'session-size-race',
+      storageScope: source.storageScope,
+    });
+    let sourceHostPath = '';
+    let changed = false;
+    const host = new AttachmentStore({
+      testHooks: {
+        afterBranchCloneChunk(pass) {
+          if (pass === 'copy' && !changed) {
+            changed = true;
+            fs.truncateSync(sourceHostPath, bytes.length - 17);
+          }
+        },
+      },
+    });
+    const projectStore = new ProjectAwareAttachmentStore(host, manager, async () => {});
+    const bytes = Buffer.alloc(128 * 1024, 0x61);
+    const stored = await projectStore.save(source, {
+      filename: 'mutable.bin', declaredMime: 'application/octet-stream', bytes,
+    });
+    sourceHostPath = path.join(
+      hostCheckout,
+      '.cc-web',
+      'attachments',
+      source.storageScope.ownerKey,
+      source.id,
+      stored.storedName,
+    );
+
+    await assert.rejects(
+      () => projectStore.cloneForBranch(source, target, {
+        url: `/api/sessions/${source.id}/chat-attachments/${stored.storedName}`,
+        name: stored.name,
+        mime: stored.mime,
+        size: stored.bytes,
+      }),
+      (error) => error && error.code === 'SOURCE_ATTACHMENT_CHANGED',
+    );
+    assert.strictEqual(changed, true);
+    assert.strictEqual(
+      fs.existsSync(path.join(
+        hostCheckout,
+        '.cc-web',
+        'attachments',
+        source.storageScope.ownerKey,
+        target.id,
+      )),
+      false,
+      'a changed source is rejected before target quota or bytes are created',
+    );
+    assert.strictEqual(manager.ensured.length, manager.released.length);
+  });
+
+  it('drains an already-admitted project upload and rejects later uploads at the lifecycle gate', async function () {
+    const current = sessions.get('session-1');
+    current.storageScope = {
+      workspaceRoot: hostCheckout,
+      ownerKey: 'stable-project-owner',
+    };
+    let uploadOpened;
+    const atUpload = new Promise((resolve) => { uploadOpened = resolve; });
+    let finishUpload;
+    const uploadMayFinish = new Promise((resolve) => { finishUpload = resolve; });
+    const host = new AttachmentStore({
+      testHooks: {
+        afterDirectoryOpened: async (operation) => {
+          if (operation !== 'save') return;
+          uploadOpened();
+          await uploadMayFinish;
+        },
+      },
+    });
+    const projectStore = new ProjectAwareAttachmentStore(host, manager, async () => {});
+
+    const admitted = projectStore.save(current, {
+      filename: 'admitted.txt',
+      declaredMime: 'text/plain',
+      bytes: Buffer.from('durable before lifecycle suspension'),
+    });
+    await atUpload;
+
+    // This is the synchronous admission gate installed by project lifecycle
+    // before it asks the store to drain earlier mutations.
+    current.persistenceUnavailable = 'Project workspace session storage is temporarily unavailable';
+    let drained = false;
+    const flushing = projectStore.flush(current).then(() => { drained = true; });
+    await Promise.resolve();
+    assert.strictEqual(drained, false, 'flush must include a save admitted before the gate');
+    await assert.rejects(
+      () => projectStore.save(current, {
+        filename: 'too-late.txt',
+        declaredMime: 'text/plain',
+        bytes: Buffer.from('must not be written'),
+      }),
+      (error) => error && error.code === 'SESSION_PERSISTENCE_UNAVAILABLE',
+    );
+
+    finishUpload();
+    const stored = await admitted;
+    await flushing;
+    assert.strictEqual(drained, true);
+    assert.strictEqual(
+      fs.readFileSync(path.join(
+        hostCheckout,
+        '.cc-web',
+        'attachments',
+        current.storageScope.ownerKey,
+        current.id,
+        stored.storedName,
+      ), 'utf8'),
+      'durable before lifecycle suspension',
+    );
+    assert.strictEqual(manager.ensured.length, manager.released.length);
+  });
+
+  it('does not deadlock lifecycle flush on an upload still queued for project admission', async function () {
+    const current = sessions.get('session-1');
+    current.storageScope = {
+      workspaceRoot: hostCheckout,
+      ownerKey: 'stable-project-owner',
+    };
+    const originalEnsure = manager.ensureForSession.bind(manager);
+    let signalEnsureQueued;
+    const ensureQueued = new Promise((resolve) => { signalEnsureQueued = resolve; });
+    let releaseEnsure;
+    const ensureMayProceed = new Promise((resolve) => { releaseEnsure = resolve; });
+    manager.ensureForSession = async (...args) => {
+      signalEnsureQueued();
+      await ensureMayProceed;
+      return originalEnsure(...args);
+    };
+
+    let hostSaveCalled = false;
+    let hostFlushes = 0;
+    const host = {
+      save: async () => {
+        hostSaveCalled = true;
+        throw new Error('a post-gate upload reached durable storage');
+      },
+      flush: async () => { hostFlushes += 1; },
+    };
+    const projectStore = new ProjectAwareAttachmentStore(host, manager, async () => {
+      throw new Error('a post-gate upload attempted cwd write-through');
+    });
+    const saving = projectStore.save(current, {
+      filename: 'queued.txt',
+      declaredMime: 'text/plain',
+      bytes: Buffer.from('still waiting for the lifecycle lock'),
+    });
+    await ensureQueued;
+
+    // Faithfully model beforeWorkspaceReplacement while it owns the same
+    // exclusive lock that ensureForSession is queued behind.
+    current.persistenceUnavailable = 'Project workspace session storage is temporarily unavailable';
+    const flushOutcome = await Promise.race([
+      projectStore.flush(current).then(() => 'flushed'),
+      new Promise((resolve) => setImmediate(() => resolve('blocked'))),
+    ]);
+    assert.strictEqual(
+      flushOutcome,
+      'flushed',
+      'lifecycle must not wait for a request which cannot acquire its lock',
+    );
+    assert.strictEqual(hostFlushes, 1);
+
+    releaseEnsure();
+    await assert.rejects(
+      () => saving,
+      (error) => error && error.code === 'SESSION_PERSISTENCE_UNAVAILABLE',
+    );
+    assert.strictEqual(hostSaveCalled, false);
+    assert.strictEqual(manager.ensured.length, manager.released.length);
+  });
+
+  it('deletes project attachments from an already-exclusive project teardown without re-entering its gate', async function () {
+    const current = sessions.get('session-1');
+    current.storageScope = {
+      workspaceRoot: hostCheckout,
+      ownerKey: 'stable-project-owner',
+    };
+    const sibling = sessionRecord(containerPath, {
+      id: 'session-sibling',
+      storageScope: current.storageScope,
+    });
+    const target = await manager.attachmentStore.save(current, {
+      filename: 'target.txt', declaredMime: 'text/plain', bytes: Buffer.from('delete me'),
+    });
+    const canary = await manager.attachmentStore.save(sibling, {
+      filename: 'canary.txt', declaredMime: 'text/plain', bytes: Buffer.from('keep me'),
+    });
+    const admissionsBeforeDelete = manager.ensured.length;
+    const targetHostDir = path.join(
+      hostCheckout, '.cc-web', 'attachments', 'stable-project-owner', 'session-1',
+    );
+    assert.strictEqual(fs.existsSync(path.join(targetHostDir, path.basename(target.absolutePath))), true);
+
+    await manager.attachmentStore.deleteSessionAttachments(current, {
+      projectLifecycleExclusive: true,
+    });
+
+    assert.strictEqual(fs.existsSync(targetHostDir), false);
+    assert.strictEqual(fs.readFileSync(path.join(
+      hostCheckout,
+      '.cc-web',
+      'attachments',
+      'stable-project-owner',
+      'session-sibling',
+      path.basename(canary.absolutePath),
+    ), 'utf8'), 'keep me');
+    assert.strictEqual(
+      manager.ensured.length,
+      admissionsBeforeDelete,
+      'definitive cleanup must not start or lease a project runtime',
+    );
+    assert.deepStrictEqual(manager.workspaceOperations, [], 'project deletion does not deadlock by reacquiring its gate');
+    assert.strictEqual(manager.ensured.length, manager.released.length);
+  });
+
+  it('refuses project cleanup when a persisted storage scope is not the manager-derived root', async function () {
+    const staleRoot = path.join(containerRoot, 'stale-project-root');
+    fs.mkdirSync(staleRoot);
+    const current = sessions.get('session-1');
+    current.storageScope = {
+      workspaceRoot: staleRoot,
+      ownerKey: 'stable-project-owner',
+    };
+    const staleRef = {
+      ...current,
+      workingDir: staleRoot,
+      projectId: undefined,
+      projectWorkingDirKind: undefined,
+    };
+    const stale = await new AttachmentStore().save(staleRef, {
+      filename: 'canary.txt', declaredMime: 'text/plain', bytes: Buffer.from('keep stale canary'),
+    });
+    const admissionsBeforeDelete = manager.ensured.length;
+
+    await assert.rejects(
+      () => manager.attachmentStore.deleteSessionAttachments(current),
+      (error) => error && error.code === 'UNSAFE_ATTACHMENT_DIR',
+    );
+
+    assert.strictEqual(fs.readFileSync(stale.absolutePath, 'utf8'), 'keep stale canary');
+    assert.strictEqual(
+      manager.ensured.length,
+      admissionsBeforeDelete,
+      'rejected cleanup does not start or admit a project runtime',
+    );
+    assert.deepStrictEqual(
+      manager.workspaceOperations.map((entry) => entry.phase),
+      ['start', 'end'],
+      'the stale scope was checked inside the ordinary lifecycle gate',
+    );
+  });
+
+  it('keeps ordinary cleanup on the stable project root while a checkout is replaced', async function () {
+    const current = sessions.get('session-1');
+    current.storageScope = {
+      workspaceRoot: hostCheckout,
+      ownerKey: 'stable-project-owner',
+    };
+    const checkout = path.join(hostCheckout, 'repo-checkout');
+    fs.mkdirSync(checkout);
+    fs.writeFileSync(path.join(checkout, 'old.txt'), 'old checkout');
+
+    let deleteOpened;
+    const atDelete = new Promise((resolve) => { deleteOpened = resolve; });
+    let finishDelete;
+    const deleteMayFinish = new Promise((resolve) => { finishDelete = resolve; });
+    const host = new AttachmentStore({
+      testHooks: {
+        afterDirectoryOpened: async (operation) => {
+          if (operation !== 'delete') return;
+          deleteOpened();
+          await deleteMayFinish;
+        },
+      },
+    });
+    const projectStore = new ProjectAwareAttachmentStore(host, manager, async () => {});
+    const stored = await projectStore.save(current, {
+      filename: 'retire.txt', declaredMime: 'text/plain', bytes: Buffer.from('retire me'),
+    });
+    const targetHostDir = path.join(
+      hostCheckout,
+      '.cc-web',
+      'attachments',
+      current.storageScope.ownerKey,
+      current.id,
+    );
+
+    const deleting = projectStore.deleteSessionAttachments(current);
+    await atDelete;
+    const previousCheckout = path.join(hostCheckout, 'repo-checkout.previous');
+    fs.renameSync(checkout, previousCheckout);
+    fs.mkdirSync(checkout);
+    fs.writeFileSync(path.join(checkout, 'new.txt'), 'new checkout');
+    finishDelete();
+    await deleting;
+
+    assert.strictEqual(fs.existsSync(path.join(targetHostDir, stored.storedName)), false);
+    assert.strictEqual(fs.readFileSync(path.join(checkout, 'new.txt'), 'utf8'), 'new checkout');
+    assert.deepStrictEqual(
+      manager.workspaceOperations.slice(-2).map((entry) => entry.phase),
+      ['start', 'end'],
+      'ordinary cleanup remains inside the project lifecycle gate',
+    );
     assert.strictEqual(manager.ensured.length, manager.released.length);
   });
 

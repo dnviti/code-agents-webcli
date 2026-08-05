@@ -12,8 +12,10 @@ const WebSocket = require('ws');
 const {
   CONTROLLER_AUTH_HEADER,
   CONTROLLER_HEADER,
+  MAX_ATTACHMENT_BYTES,
   createControllerGateway,
 } = require('../desktop/controller-gateway.js');
+const { createLocalControllerTransport } = require('../desktop/controller-runtime.js');
 const { parseQualifiedSessionId, qualifySessionId } = require('../desktop/controller-protocol.js');
 
 class MockSocket extends EventEmitter {
@@ -46,7 +48,15 @@ class MockController {
     const response = this.responses.get(key);
     if (response instanceof Error) throw response;
     if (!response) throw new Error(`No mock response for ${key}`);
-    return typeof response === 'function' ? response(request) : response;
+    if (typeof response === 'function') return response(request);
+    // A real HTTP transport cannot complete an upload response without either
+    // consuming or aborting its request body. Keep canned responses honest so
+    // the gateway's input-completion invariant is exercised instead of leaving
+    // its bounded stream permanently unread.
+    if (request.body && typeof request.body.pipe === 'function') {
+      return requestBytes(request.body).then(() => response);
+    }
+    return response;
   }
   connectWebSocket(serverId, request) {
     this.socketRequests.push({ serverId, ...request });
@@ -72,6 +82,12 @@ function upstream(body, options = {}) {
     body: body && typeof body.pipe === 'function'
       ? body : Readable.from([Buffer.from(typeof body === 'string' ? body : JSON.stringify(body))]),
   };
+}
+
+async function requestBytes(request) {
+  const chunks = [];
+  for await (const chunk of request) chunks.push(Buffer.from(chunk));
+  return Buffer.concat(chunks);
 }
 
 function once(emitter, event) {
@@ -378,6 +394,7 @@ describe('desktop controller gateway', function () {
     assert.strictEqual(response.headers.get('set-cookie'), null);
     assert.strictEqual(response.headers.get('x-secret'), null);
     assert.strictEqual(response.headers.get('location'), null);
+    assert.strictEqual(response.headers.get('cache-control'), 'no-store');
     assert.strictEqual(controller.requests[0].path, '/api/download');
     assert.strictEqual(controller.requests[0].headers.cookie, undefined);
     assert.strictEqual(controller.requests[0].headers[CONTROLLER_AUTH_HEADER], undefined);
@@ -393,6 +410,9 @@ describe('desktop controller gateway', function () {
       conversations: [{ id: 'raw/id', name: 'Old chat' }],
     }));
     controller.responses.set('remote POST /api/sessions/raw%2Fid/branch', upstream({ sessionId: 'branch/id', name: 'Branch' }));
+    controller.responses.set('remote GET /api/sessions/raw%2Fid/children', upstream({
+      sessionIds: ['child/one', 'child/two'],
+    }));
     controller.responses.set('remote POST /api/sessions/raw%2Fid/chat-attachments', upstream({
       url: '/api/sessions/raw%2Fid/chat-attachments/image.png', name: 'image.png', mime: 'image/png', size: 3,
     }));
@@ -419,11 +439,510 @@ describe('desktop controller gateway', function () {
     })).json();
     assert.deepStrictEqual(parseQualifiedSessionId(branch.sessionId), { serverId: 'remote', sessionId: 'branch/id' });
 
+    const children = await (await authenticated(
+      `/api/sessions/${encodeURIComponent(qualified)}/children`,
+    )).json();
+    assert.deepStrictEqual(
+      children.sessionIds.map(parseQualifiedSessionId),
+      [
+        { serverId: 'remote', sessionId: 'child/one' },
+        { serverId: 'remote', sessionId: 'child/two' },
+      ],
+    );
+
     const attachment = await (await authenticated(`/api/sessions/${encodeURIComponent(qualified)}/chat-attachments`, {
       method: 'POST', headers: { 'content-type': 'application/octet-stream' }, body: Buffer.from([1, 2, 3]),
     })).json();
     const attachmentId = decodeURIComponent(/^\/api\/sessions\/([^/]+)/.exec(attachment.url)[1]);
     assert.deepStrictEqual(parseQualifiedSessionId(attachmentId), { serverId: 'remote', sessionId: 'raw/id' });
+  });
+
+  it('rejects a successful upload descriptor that is absolute or belongs to another session or target', async function () {
+    const controller = new MockController([{ id: 'remote', name: 'Remote', status: 'connected' }]);
+    const qualified = qualifySessionId('remote', 'raw/id');
+    const cases = [
+      ['absolute', 'http://127.0.0.1:9999/private'],
+      ['session', '/api/sessions/other/chat-attachments/image.png'],
+      [
+        'target',
+        `/api/sessions/${encodeURIComponent(qualifySessionId('other', 'raw/id'))}/chat-attachments/image.png`,
+      ],
+    ];
+    for (const [name, url] of cases) {
+      controller.responses.set(
+        `remote POST /api/sessions/raw%2Fid/chat-attachments?name=${name}`,
+        upstream({ url, name: 'image.png', mime: 'image/png', size: 3 }),
+      );
+    }
+    await start(controller);
+
+    for (const [name] of cases) {
+      const response = await authenticated(
+        `/api/sessions/${encodeURIComponent(qualified)}/chat-attachments?name=${name}`,
+        {
+          method: 'POST',
+          headers: { 'content-type': 'application/octet-stream' },
+          body: Buffer.from([1, 2, 3]),
+        },
+      );
+      assert.strictEqual(response.status, 502);
+      assert.strictEqual((await response.json()).error, 'controller_request_failed');
+    }
+  });
+
+  it('rejects attachment capabilities smuggled through generic target JSON', async function () {
+    const controller = new MockController([{ id: 'remote', name: 'Remote', status: 'connected' }]);
+    const qualified = qualifySessionId('remote', 'raw/id');
+    controller.responses.set('remote POST /api/sessions/raw%2Fid/branch', upstream({
+      sessionId: 'branch/id',
+      url: `/api/sessions/${encodeURIComponent(qualifySessionId('local', 'other'))}/chat-attachments/image.png`,
+    }));
+    await start(controller);
+
+    const response = await authenticated(`/api/sessions/${encodeURIComponent(qualified)}/branch`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}',
+    });
+    assert.strictEqual(response.status, 502);
+    assert.match((await response.json()).message, /unsafe response/i);
+  });
+
+  it('streams fixed and chunked attachment bytes to their qualified owner without JSON routing', async function () {
+    const controller = new MockController([{ id: 'remote', name: 'Remote', status: 'connected' }]);
+    const qualified = qualifySessionId('remote', 'raw/id');
+    const path = `/api/sessions/${encodeURIComponent(qualified)}/chat-attachments?name=photo.png`;
+    const seen = [];
+    controller.responses.set('remote POST /api/sessions/raw%2Fid/chat-attachments?name=photo.png', async (request) => {
+      seen.push({ headers: request.headers, bytes: await requestBytes(request.body) });
+      return upstream({
+        url: '/api/sessions/raw%2Fid/chat-attachments/photo.png', name: 'photo.png', mime: 'image/png', size: seen.at(-1).bytes.length,
+      });
+    });
+    await start(controller);
+
+    // Cross the gateway's unrelated 16 MiB aggregate-response limit: upload
+    // bytes must remain a stream all the way to the selected target.
+    const fixed = Buffer.alloc(16 * 1024 * 1024 + 257);
+    for (let index = 0; index < fixed.length; index += 1) fixed[index] = index % 251;
+    const fixedResponse = await authenticated(path, {
+      method: 'POST', headers: { 'content-type': 'image/png' }, body: fixed,
+    });
+    assert.strictEqual(fixedResponse.status, 200);
+    assert.deepStrictEqual(seen[0].bytes, fixed);
+    assert.strictEqual(seen[0].headers['content-type'], 'image/png');
+    assert.strictEqual(seen[0].headers['content-length'], String(fixed.length));
+    const attachment = await fixedResponse.json();
+    assert.deepStrictEqual(parseQualifiedSessionId(decodeURIComponent(/^\/api\/sessions\/([^/]+)/.exec(attachment.url)[1])), {
+      serverId: 'remote', sessionId: 'raw/id',
+    });
+
+    const chunked = [Buffer.from([0, 255, 1]), Buffer.alloc(17, 127), Buffer.from([2, 3, 4, 5])];
+    const target = new URL(base);
+    const response = await new Promise((resolve, reject) => {
+      const request = http.request({
+        hostname: target.hostname,
+        port: target.port,
+        method: 'POST',
+        path,
+        headers: { [CONTROLLER_AUTH_HEADER]: capability, 'content-type': 'application/octet-stream' },
+      }, resolve);
+      request.once('error', reject);
+      for (const chunk of chunked) request.write(chunk);
+      request.end();
+    });
+    assert.strictEqual(response.statusCode, 200);
+    await requestBytes(response);
+    assert.deepStrictEqual(seen[1].bytes, Buffer.concat(chunked));
+    assert.strictEqual(seen[1].headers['content-type'], 'application/octet-stream');
+    assert.strictEqual(seen[1].headers['content-length'], undefined);
+  });
+
+  it('aborts the selected upload when the renderer disconnects and permits an immediate retry', async function () {
+    const controller = new MockController([{ id: 'local', name: 'Local', status: 'ready' }]);
+    const qualified = qualifySessionId('local', 'raw/id');
+    const uploadPath = `/api/sessions/${encodeURIComponent(qualified)}/chat-attachments?name=retry.bin`;
+    let attempts = 0;
+    let markStarted;
+    const started = new Promise((resolve) => { markStarted = resolve; });
+    let markAborted;
+    const aborted = new Promise((resolve) => { markAborted = resolve; });
+    controller.responses.set('local POST /api/sessions/raw%2Fid/chat-attachments?name=retry.bin', async (request) => {
+      attempts += 1;
+      if (attempts === 1) {
+        request.body.on('error', () => {});
+        request.body.resume();
+        request.signal.addEventListener('abort', () => markAborted(), { once: true });
+        markStarted();
+        await new Promise((_resolve, reject) => request.signal.addEventListener('abort', () => {
+          reject(Object.assign(new Error('renderer disconnected'), { name: 'AbortError', code: 'ABORT_ERR' }));
+        }, { once: true }));
+      }
+      const bytes = await requestBytes(request.body);
+      return upstream({
+        url: '/api/sessions/raw%2Fid/chat-attachments/retry.bin',
+        name: 'retry.bin',
+        mime: 'application/octet-stream',
+        size: bytes.length,
+      });
+    });
+    await start(controller);
+
+    const target = new URL(base);
+    const renderer = http.request({
+      hostname: target.hostname,
+      port: target.port,
+      method: 'POST',
+      path: uploadPath,
+      headers: {
+        [CONTROLLER_AUTH_HEADER]: capability,
+        'content-type': 'application/octet-stream',
+      },
+    });
+    const rendererClosed = new Promise((resolve) => renderer.once('error', resolve));
+    renderer.write(Buffer.alloc(4096, 7));
+    await started;
+    renderer.destroy();
+    await rendererClosed;
+    await aborted;
+    assert.strictEqual(controller.requests[0].signal.aborted, true);
+
+    const retry = await authenticated(uploadPath, {
+      method: 'POST',
+      headers: { 'content-type': 'application/octet-stream' },
+      body: Buffer.from([1, 2, 3, 4]),
+    });
+    assert.strictEqual(retry.status, 200);
+    assert.strictEqual((await retry.json()).size, 4);
+    assert.strictEqual(attempts, 2);
+  });
+
+  it('observes a body abort while a remote connection failure is still pending', async function () {
+    const controller = new MockController([{ id: 'remote', name: 'Remote', status: 'connected' }]);
+    const qualified = qualifySessionId('remote', 'raw/id');
+    const uploadPath = `/api/sessions/${encodeURIComponent(qualified)}/chat-attachments?name=retry.bin`;
+    let attempts = 0;
+    let markStarted;
+    const started = new Promise((resolve) => { markStarted = resolve; });
+    let markTransportFailed;
+    const transportFailed = new Promise((resolve) => { markTransportFailed = resolve; });
+    controller.responses.set('remote POST /api/sessions/raw%2Fid/chat-attachments?name=retry.bin', async (request) => {
+      attempts += 1;
+      if (attempts === 1) {
+        markStarted();
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        markTransportFailed();
+        throw Object.assign(new Error('remote TLS connection failed'), { code: 'UNREACHABLE' });
+      }
+      const bytes = await requestBytes(request.body);
+      return upstream({
+        url: '/api/sessions/raw%2Fid/chat-attachments/retry.bin',
+        name: 'retry.bin', mime: 'application/octet-stream', size: bytes.length,
+      });
+    });
+    await start(controller);
+
+    const unhandled = [];
+    const recordUnhandled = (reason) => unhandled.push(reason);
+    process.on('unhandledRejection', recordUnhandled);
+    try {
+      const target = new URL(base);
+      const renderer = http.request({
+        hostname: target.hostname,
+        port: target.port,
+        method: 'POST',
+        path: uploadPath,
+        headers: {
+          [CONTROLLER_AUTH_HEADER]: capability,
+          'content-type': 'application/octet-stream',
+        },
+      });
+      const rendererClosed = new Promise((resolve) => renderer.once('error', resolve));
+      renderer.write(Buffer.alloc(1024, 7));
+      await started;
+      renderer.destroy();
+      await Promise.all([rendererClosed, transportFailed]);
+      await new Promise((resolve) => setImmediate(resolve));
+      await new Promise((resolve) => setImmediate(resolve));
+      assert.deepStrictEqual(unhandled, [], 'body rejection is observed before delayed remote failure');
+
+      const retry = await authenticated(uploadPath, {
+        method: 'POST',
+        headers: { 'content-type': 'application/octet-stream' },
+        body: Buffer.from([1, 2, 3]),
+      });
+      assert.strictEqual(retry.status, 200);
+      assert.strictEqual((await retry.json()).size, 3);
+      assert.strictEqual(attempts, 2);
+    } finally {
+      process.removeListener('unhandledRejection', recordUnhandled);
+    }
+  });
+
+  it('preserves attachment upstream error bytes and rejects the canonical 20 MiB boundary before forwarding', async function () {
+    const controller = new MockController([{ id: 'remote', name: 'Remote', status: 'connected' }]);
+    const qualified = qualifySessionId('remote', 'raw/id');
+    const path = `/api/sessions/${encodeURIComponent(qualified)}/chat-attachments`;
+    const upstreamError = Buffer.from([0, 255, 2, 254, 3]);
+    controller.responses.set('remote POST /api/sessions/raw%2Fid/chat-attachments', async (request) => {
+      const received = await requestBytes(request.body);
+      if (received.length === MAX_ATTACHMENT_BYTES) {
+        return upstream({
+          url: '/api/sessions/raw%2Fid/chat-attachments/limit.bin',
+          name: 'limit.bin',
+          mime: 'application/octet-stream',
+          size: received.length,
+        });
+      }
+      return upstream(Readable.from([upstreamError.subarray(0, 2), upstreamError.subarray(2)]), {
+        statusCode: 422,
+        headers: { 'content-type': 'application/octet-stream', 'content-length': String(upstreamError.length) },
+      });
+    });
+    await start(controller);
+
+    const rejected = await authenticated(path, {
+      method: 'POST', headers: { 'content-type': 'application/octet-stream' }, body: Buffer.from([9, 8, 7, 6]),
+    });
+    assert.strictEqual(rejected.status, 422);
+    assert.strictEqual(rejected.headers.get('content-type'), 'application/octet-stream');
+    assert.strictEqual(rejected.headers.get('content-length'), String(upstreamError.length));
+    assert.deepStrictEqual(Buffer.from(await rejected.arrayBuffer()), upstreamError);
+
+    assert.strictEqual(MAX_ATTACHMENT_BYTES, 20 * 1024 * 1024);
+    const atLimit = await authenticated(path, {
+      method: 'POST',
+      headers: { 'content-type': 'application/octet-stream' },
+      body: Buffer.alloc(MAX_ATTACHMENT_BYTES, 6),
+    });
+    assert.strictEqual(atLimit.status, 200);
+    assert.strictEqual((await atLimit.json()).size, MAX_ATTACHMENT_BYTES);
+
+    const target = new URL(base);
+    const tooLarge = await new Promise((resolve, reject) => {
+      const request = http.request({
+        hostname: target.hostname,
+        port: target.port,
+        method: 'POST',
+        path,
+        headers: {
+          [CONTROLLER_AUTH_HEADER]: capability,
+          'content-type': 'application/octet-stream',
+          'content-length': String(MAX_ATTACHMENT_BYTES + 1),
+        },
+      }, resolve);
+      request.once('error', reject);
+      request.end(Buffer.alloc(MAX_ATTACHMENT_BYTES + 1, 5));
+    });
+    assert.strictEqual(tooLarge.statusCode, 413);
+    const tooLargeBody = JSON.parse((await requestBytes(tooLarge)).toString('utf8'));
+    assert.deepStrictEqual(tooLargeBody, {
+      error: 'file_too_large',
+      message: 'Attachment exceeds the 20 MiB limit',
+      limitBytes: MAX_ATTACHMENT_BYTES,
+    });
+    assert.strictEqual(controller.requests.length, 2, 'the oversized request never reaches its owner');
+
+    const chunkedTooLarge = await new Promise((resolve, reject) => {
+      let received = false;
+      const request = http.request({
+        hostname: target.hostname,
+        port: target.port,
+        method: 'POST',
+        path,
+        headers: {
+          [CONTROLLER_AUTH_HEADER]: capability,
+          'content-type': 'application/octet-stream',
+        },
+      }, (response) => {
+        received = true;
+        resolve(response);
+      });
+      request.once('error', (error) => { if (!received) reject(error); });
+      request.write(Buffer.alloc(MAX_ATTACHMENT_BYTES, 4));
+      request.end(Buffer.from([5]));
+    });
+    assert.strictEqual(chunkedTooLarge.statusCode, 413);
+    assert.strictEqual(JSON.parse((await requestBytes(chunkedTooLarge)).toString()).error, 'file_too_large');
+    assert.strictEqual(controller.requests.length, 3, 'chunked size is enforced while streaming upstream');
+    assert.strictEqual(
+      controller.requests.at(-1).signal.aborted,
+      true,
+      'a client-size rejection is an aborted request, not a target health failure',
+    );
+
+    const retry = await authenticated(path, {
+      method: 'POST', headers: { 'content-type': 'application/octet-stream' }, body: Buffer.from([1]),
+    });
+    assert.strictEqual(retry.status, 422, 'the selected target remains usable after a rejected upload');
+  });
+
+  it('keeps a chunked limit rejection at 413 through the real local transport abort', async function () {
+    this.timeout(15_000);
+    const rawSessionId = 'raw/id';
+    const upstreamServer = http.createServer((request, response) => {
+      let bytes = 0;
+      request.on('data', (chunk) => { bytes += chunk.length; });
+      request.on('error', () => undefined);
+      request.on('end', () => {
+        const body = Buffer.from(JSON.stringify({
+          url: `/api/sessions/${encodeURIComponent(rawSessionId)}/chat-attachments/retry.bin`,
+          name: 'retry.bin', mime: 'application/octet-stream', size: bytes,
+        }));
+        response.writeHead(200, {
+          'content-type': 'application/json',
+          'content-length': String(body.length),
+        });
+        response.end(body);
+      });
+    });
+    await new Promise((resolve, reject) => {
+      upstreamServer.once('error', reject);
+      upstreamServer.listen(0, '127.0.0.1', resolve);
+    });
+    const upstreamAddress = upstreamServer.address();
+    const transport = createLocalControllerTransport({
+      origin: `http://127.0.0.1:${upstreamAddress.port}`,
+      auth: { name: 'session', value: 'local-cookie' },
+    });
+    const controller = {
+      listTargets: () => [{ id: 'local', name: 'Local computer', status: 'ready' }],
+      request: (serverId, request) => {
+        assert.strictEqual(serverId, 'local');
+        return transport.requestTarget(request);
+      },
+      connectWebSocket: () => { throw new Error('not used'); },
+    };
+    try {
+      await start(controller);
+      const qualified = qualifySessionId('local', rawSessionId);
+      const uploadPath = `/api/sessions/${encodeURIComponent(qualified)}/chat-attachments`;
+      const target = new URL(base);
+      const tooLarge = await new Promise((resolve, reject) => {
+        let received = false;
+        const request = http.request({
+          hostname: target.hostname,
+          port: target.port,
+          method: 'POST',
+          path: uploadPath,
+          headers: {
+            [CONTROLLER_AUTH_HEADER]: capability,
+            'content-type': 'application/octet-stream',
+          },
+        }, (response) => {
+          received = true;
+          resolve(response);
+        });
+        request.once('error', (error) => { if (!received) reject(error); });
+        request.write(Buffer.alloc(MAX_ATTACHMENT_BYTES, 7));
+        request.end(Buffer.from([8]));
+      });
+      assert.strictEqual(tooLarge.statusCode, 413);
+      assert.strictEqual(JSON.parse((await requestBytes(tooLarge)).toString()).error, 'file_too_large');
+
+      const retry = await authenticated(uploadPath, {
+        method: 'POST',
+        headers: { 'content-type': 'application/octet-stream' },
+        body: Buffer.from([1, 2, 3]),
+      });
+      assert.strictEqual(retry.status, 200);
+      assert.strictEqual((await retry.json()).size, 3);
+    } finally {
+      upstreamServer.closeAllConnections?.();
+      await new Promise((resolve) => upstreamServer.close(() => resolve()));
+    }
+  });
+
+  it('forwards an early local attachment rejection without waiting for the renderer body', async function () {
+    this.timeout(10_000);
+    const rawSessionId = 'raw/id';
+    const upstreamServer = http.createServer((request, response) => {
+      const url = new URL(request.url, 'http://127.0.0.1');
+      if (url.searchParams.get('name') === 'reject.bin') {
+        const body = Buffer.from(JSON.stringify({ error: 'session_deleted', message: 'gone before body' }));
+        response.writeHead(404, {
+          connection: 'close',
+          'content-type': 'application/json',
+          'content-length': String(body.length),
+        });
+        response.end(body);
+        return;
+      }
+      requestBytes(request).then((bytes) => {
+        const body = Buffer.from(JSON.stringify({
+          url: `/api/sessions/${encodeURIComponent(rawSessionId)}/chat-attachments/retry.bin`,
+          name: 'retry.bin', mime: 'application/octet-stream', size: bytes.length,
+        }));
+        response.writeHead(200, {
+          'content-type': 'application/json',
+          'content-length': String(body.length),
+        });
+        response.end(body);
+      }, () => response.destroy());
+    });
+    await new Promise((resolve, reject) => {
+      upstreamServer.once('error', reject);
+      upstreamServer.listen(0, '127.0.0.1', resolve);
+    });
+    const upstreamAddress = upstreamServer.address();
+    const transport = createLocalControllerTransport({
+      origin: `http://127.0.0.1:${upstreamAddress.port}`,
+      auth: { name: 'session', value: 'local-cookie' },
+    });
+    const controller = {
+      listTargets: () => [{ id: 'local', name: 'Local computer', status: 'ready' }],
+      request: (serverId, request) => {
+        assert.strictEqual(serverId, 'local');
+        return transport.requestTarget(request);
+      },
+      connectWebSocket: () => { throw new Error('not used'); },
+    };
+    try {
+      await start(controller);
+      const qualified = qualifySessionId('local', rawSessionId);
+      const uploadPath = `/api/sessions/${encodeURIComponent(qualified)}/chat-attachments`;
+      const target = new URL(base);
+      const early = await Promise.race([
+        new Promise((resolve, reject) => {
+          let received = false;
+          const request = http.request({
+            hostname: target.hostname,
+            port: target.port,
+            method: 'POST',
+            path: `${uploadPath}?name=reject.bin`,
+            headers: {
+              [CONTROLLER_AUTH_HEADER]: capability,
+              'content-type': 'application/octet-stream',
+            },
+          }, (response) => {
+            received = true;
+            resolve({ request, response });
+          });
+          request.once('error', (error) => { if (!received) reject(error); });
+          // Deliberately keep the request writable. A pre-body 4xx must reach
+          // the renderer even when the picker is still streaming a large file.
+          request.write(Buffer.alloc(1024, 9));
+        }),
+        new Promise((_, reject) => setTimeout(
+          () => reject(new Error('the early attachment rejection was not forwarded')),
+          2_000,
+        )),
+      ]);
+      assert.strictEqual(early.response.statusCode, 404);
+      assert.deepStrictEqual(JSON.parse((await requestBytes(early.response)).toString()), {
+        error: 'session_deleted', message: 'gone before body',
+      });
+      early.request.destroy();
+
+      const retry = await authenticated(`${uploadPath}?name=retry.bin`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/octet-stream' },
+        body: Buffer.from([1, 2, 3]),
+      });
+      assert.strictEqual(retry.status, 200);
+      assert.strictEqual((await retry.json()).size, 3);
+    } finally {
+      upstreamServer.closeAllConnections?.();
+      await new Promise((resolve) => upstreamServer.close(() => resolve()));
+    }
   });
 
   it('multiplexes target sockets, qualifies inbound ids, and isolates outbound routing', async function () {
@@ -468,6 +987,24 @@ describe('desktop controller gateway', function () {
       serverId: 'remote', sessionId: 'same',
     });
     assert.strictEqual(attention.serverName, undefined);
+
+    const messageCount = messages.length;
+    controller.sockets.get('remote').upstream({
+      type: 'chat_snapshot',
+      sessionId: 'same',
+      attachments: [{
+        url: `/api/sessions/${encodeURIComponent(qualifySessionId('local', 'one'))}/chat-attachments/image.png`,
+      }],
+    });
+    for (let count = 0; count < 30 && messages.length === messageCount; count += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    assert.ok(messages.some((message, index) => index >= messageCount
+      && message.type === 'controller_error'
+      && message.serverId === 'remote'
+      && /invalid message/.test(message.message)));
+    assert.ok(!messages.some((message, index) => index >= messageCount
+      && message.type === 'chat_snapshot'));
 
     ws.send(JSON.stringify({
       type: 'reorder_tabs',

@@ -62,7 +62,7 @@ function stateFor(owner: UpdateOwner): OwnedUpdateState {
 function selectedOwner(): UpdateOwner | null {
   const controller = getControllerSnapshot();
   if (!controller.enabled) return BROWSER_OWNER;
-  return controller.selectedServerId;
+  return controller.selectedServerId === 'local' ? null : controller.selectedServerId;
 }
 
 /**
@@ -73,7 +73,8 @@ function selectedOwner(): UpdateOwner | null {
 function eventOwner(serverId?: string | null): UpdateOwner | null {
   const controller = getControllerSnapshot();
   if (!controller.enabled) return BROWSER_OWNER;
-  if (!serverId || !controller.targets.some((target) => target.id === serverId)) return null;
+  if (!serverId || serverId === 'local'
+    || !controller.targets.some((target) => target.id === serverId)) return null;
   return serverId;
 }
 
@@ -90,12 +91,10 @@ function targetName(owner: UpdateOwner): string | null {
   return getControllerSnapshot().targets.find((target) => target.id === owner)?.name ?? null;
 }
 
-function ownerLabel(owner: UpdateOwner, state?: OwnedUpdateState): string | null {
+function ownerLabel(owner: UpdateOwner): string | null {
   if (owner === BROWSER_OWNER) return null;
   const name = targetName(owner) ?? 'Unknown server';
-  return state?.current?.mode === 'desktop'
-    ? owner === 'local' ? 'Desktop package' : `Desktop package · ${name}`
-    : `Server · ${name}`;
+  return `Server · ${name}`;
 }
 
 function dismissalKey(owner: UpdateOwner): string {
@@ -143,10 +142,6 @@ export function setupUpdateBanner(app: App): void {
 
   const owner = selectedOwner();
   if (owner !== null) void refreshOwner(app, owner);
-  if (getControllerSnapshot().enabled && owner !== 'local'
-    && getControllerSnapshot().targets.some((target) => target.id === 'local')) {
-    void refreshOwner(app, 'local');
-  }
 }
 
 /** Wired to the banner's action button by the shell. */
@@ -257,7 +252,7 @@ export function onUpdateDone(
   if (state?.current) {
     state.current = { ...state.current, running: false, runnerState: 'idle' };
   }
-  const label = ownerLabel(owner, state);
+  const label = ownerLabel(owner);
   showNotification(label ? `${label}: ${message.message}` : message.message, message.ok ? 'info' : 'error');
   render(owner);
   if (!message.restarting) void refreshOwner(app, owner);
@@ -340,7 +335,7 @@ async function onAction(app: App, owner: UpdateOwner): Promise<void> {
   const current = state.current;
   const view = describeUpdate(current);
   const serverId = explicitServerId(owner);
-  const label = ownerLabel(owner, state);
+  const label = ownerLabel(owner);
 
   if (view.action === 'copy-command') {
     try {
@@ -411,16 +406,12 @@ async function onAction(app: App, owner: UpdateOwner): Promise<void> {
 function render(owner: UpdateOwner): void {
   const state = states.get(owner);
   const current = state?.current;
-  const desktopChannel = getControllerSnapshot().enabled
-    && owner === 'local'
-    && current?.mode === 'desktop';
   // A background server may update its state and log, but only the currently
-  // selected owner paints the server channel. Local's desktop-package channel
-  // is intentionally independent so both notices can remain visible.
-  if (!desktopChannel && !isSelected(owner)) return;
-  const storeKey = desktopChannel ? 'desktopBanner' : 'banner';
+  // selected owner paints the server channel. Native package updates have a
+  // separate Electron bridge and never pass through this commit-based banner.
+  if (!isSelected(owner)) return;
   if (!state || !current) {
-    shellStore.setState({ [storeKey]: null });
+    shellStore.setState({ banner: null });
     return;
   }
 
@@ -430,20 +421,18 @@ function render(owner: UpdateOwner): void {
     !view.visible || (view.dismissible && dismissedSha(owner) === remoteSha && !current.running);
 
   if (hidden) {
-    shellStore.setState({ [storeKey]: null });
+    shellStore.setState({ banner: null });
     return;
   }
 
   let text = state.overrideText ?? view.text;
   if (owner !== BROWSER_OWNER) {
     const name = targetName(owner) ?? 'Unknown server';
-    text = current.mode === 'desktop'
-      ? `${owner === 'local' ? 'Desktop package update' : `Desktop package update · ${name}`}: ${text}`
-      : `Server update · ${name}: ${text}`;
+    text = `Server update · ${name}: ${text}`;
   }
 
   shellStore.setState({
-    [storeKey]: {
+    banner: {
       ownerId: owner === BROWSER_OWNER ? null : owner,
       tone: view.tone,
       // The commit subject is whatever text landed on main and is not trusted;

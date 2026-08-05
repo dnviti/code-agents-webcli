@@ -74,18 +74,20 @@ export function ActiveAgentMaintenance({
 }: ActiveAgentMaintenanceProps): React.JSX.Element | null {
   const agentId = maintenanceAgent(agentKind);
   const operationKey = `cc-agent-maintenance-operation:${sessionId}`;
-  const [operationId, setOperationId] = React.useState<string | null>(() => {
-    try { return localStorage.getItem(operationKey); } catch { return null; }
-  });
+  const [operationId, setOperationId] = React.useState<string | null>(null);
+  React.useEffect(() => {
+    // Old builds persisted this session-bound retry handle in Electron
+    // userData. The live hook owns it now; the workspace owns session state.
+    try { localStorage.removeItem(operationKey); } catch { /* optional */ }
+  }, [operationKey]);
   const operationSettled = React.useCallback((operation: AgentMaintenanceOperation): void => {
     if (!['complete', 'cancelled'].includes(operation.phase)) return;
     setOperationId(null);
-    try { localStorage.removeItem(operationKey); } catch { /* optional */ }
     if (operation.phase !== 'complete') return;
     if (surface === 'chat' && chatLooksAutomaticSafe(chatController)) {
       restartAgent(sessionId, true, false);
     }
-  }, [chatController, operationKey, restartAgent, sessionId, surface]);
+  }, [chatController, restartAgent, sessionId, surface]);
   const maintenance = useAgentMaintenance({
     targetId: sessionId,
     serverId,
@@ -94,7 +96,6 @@ export function ActiveAgentMaintenance({
     operationId,
     onOperationId: (id) => {
       setOperationId(id);
-      try { localStorage.setItem(operationKey, id); } catch { /* optional */ }
     },
     onOperationSettled: operationSettled,
   });

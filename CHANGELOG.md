@@ -33,7 +33,81 @@
   app](docs/desktop.md).
 
 ### Changed
+- **Desktop releases now use a consent-first native update channel.** Signed
+  Windows/macOS and trusted AppImage/Flatpak feeds check stable semantic
+  releases in the installed app, propose a full-window update, and retain a
+  bottom-right reminder after deferral. Nothing downloads or installs until the
+  user confirms; installation cleanly restarts the local controller. Existing
+  installations need one manual bridge release, and Flatpak users move once to
+  the signed project remote without deleting application data. See [Desktop
+  updates](docs/desktop.md#updates).
+- **Session history and state now travel with the workspace in `.cc-web`.** New
+  session/tab records, unsent composer drafts, conversation events and indexes,
+  Plan/question state, terminal transcript and scrollback, paste metadata,
+  attachments, and per-turn usage are stored under an immutable, owner-scoped
+  workspace root.
+  Account-wide tabs, conversation lists, resume and usage aggregate the
+  authorised workspace databases, while `--data-dir` retains only
+  installation-wide accounts, authentication, settings, certificates,
+  credentials, runtime profiles, project configuration, and a path-only
+  workspace catalog. Existing global session data migrates per session with
+  checksum/count verification and remains in place on an unavailable or unsafe
+  destination. For a managed-project rebuild or reclaim, the exact `.cc-web`
+  inode is atomically staged in a deterministic sibling outside the
+  container-writable project root, the disposable workspace is replaced, and
+  that same inode is restored durably before its database is reopened. Cold
+  startup first reconciles and quiesces reachable managed runtimes; an archive
+  that cannot be restored stays staged and unavailable instead of being
+  replaced by an empty database. See [Configuration](docs/configuration.md#where-state-lives)
+  and [Projects](docs/projects.md#what-survives-a-rebuild).
+- The installation data directory now has a private, heartbeat-backed
+  single-writer lease acquired before SQLite opens or legacy migration starts.
+  A concurrent server fails with `data_dir_in_use`; a live process that loses
+  ownership exits fail-stop instead of continuing as a second writer.
 - Prepare release 6.1.0.
+
+### Fixed
+- **Desktop Attach, drag-and-drop, and clipboard-image uploads now reach both
+  Local computer and saved remote servers intact.** The controller streams raw
+  bodies with backpressure through the selected session's target, supports
+  content-length and chunked uploads up to 20 MiB, propagates the server's real
+  status/error body, and qualifies only successful attachment URLs. Preview,
+  download, and turn delivery remain bound to the same server without weakening
+  Electron sandboxing, origin isolation, or TLS pinning. See [Desktop
+  attachments](docs/desktop.md#attach-files-and-images).
+- Desktop upgrades now import only whitelisted presentation preferences and
+  then erase the old default renderer's Web Storage and HTTP cache before the
+  new UI loads. Session identifiers, drafts and cached attachment responses no
+  longer remain physically under Electron `userData`; cookies and per-server
+  remote partitions are left untouched.
+- Chat/terminal messages, runtime output, joins and attachment access no longer
+  refresh the global project catalog's activity timestamp. Conversation
+  activity remains exclusively in the owning workspace archive.
+- Workspace archives now refuse symlinked final state/log components, validate
+  owner-scoped paste and attachment manifests before cleanup or fallback reads,
+  and authenticate saved execution controls to the installation and canonical
+  workspace root. Imported archives retain history without inheriting approval
+  bypasses, native resume IDs, or unchecked project paths. A canonical
+  plaintext workspace archive is assigned to exactly one immutable account;
+  conflicting legacy catalog entries fail closed instead of sharing history.
+- Legacy migration now copies and checksum-verifies referenced attachment and
+  pasted-image bytes from prior working directories into the immutable
+  workspace root before cutover. Legacy roots and file namespaces are pinned by
+  verified directory handles, destination publication and source retirement
+  are directory-synchronised, and deterministic retirement slots make a crash
+  retryable without guessing which file is authoritative. Corrupt paste
+  manifests, wrong owners, symlinks, directories and hard links fail closed.
+  Migration also enforces the live limits before hashing or copying: 10 MiB per
+  paste and 200 MiB per session, and 20 MiB per attachment and 400 MiB per
+  session. Existing `.cc-web/.gitignore` bytes are preserved and its permissions
+  are hardened to `0600`.
+- Branching a conversation now clones every carried app-owned attachment into
+  the new owner/session namespace before its log and session record commit, and
+  rewrites carried URLs to those independent bytes. A managed-project branch
+  holds the no-start project lifecycle gate throughout source reads, writes and
+  compensation. If persistence or cleanup cannot be proved, rollback runs every
+  disposer but preserves ambiguous data and returns the branch id with
+  `recoveryPending` rather than risking destructive cleanup.
 
 ## [6.0.0] - 2026-08-05
 

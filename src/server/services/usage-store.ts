@@ -22,6 +22,7 @@
 
 import { ChatUsage } from '../../shared/chat-events.js';
 import { AppDatabase } from './database.js';
+import { SessionPersistenceDatabase } from './workspace-session-database.js';
 import {
   EMPTY_TOTALS,
   UNATTRIBUTED,
@@ -110,6 +111,12 @@ export interface UsageHistoryQuery extends UsageQuery, UsageFilters {
   sessionId?: string;
 }
 
+export interface UsageStoreOptions {
+  database: AppDatabase | SessionPersistenceDatabase;
+  /** Required when the database is a shared workspace state file. */
+  ownerKey?: string;
+}
+
 interface JobRow {
   id: string;
   session_id: string;
@@ -196,7 +203,17 @@ const MAX_HISTORY_PAGE = 500;
 const MAX_EXPORT_ROWS = 50_000;
 
 export class UsageStore {
-  constructor(private readonly database: AppDatabase) {}
+  private readonly database: AppDatabase | SessionPersistenceDatabase;
+  private readonly ownerKey: string | null;
+
+  /** `new UsageStore(appDb)` remains valid; workspace callers pass `{ database, ownerKey }`. */
+  constructor(database: AppDatabase | SessionPersistenceDatabase | UsageStoreOptions, options: { ownerKey?: string } = {}) {
+    const configured = 'database' in database ? database as UsageStoreOptions : null;
+    this.database = configured
+      ? configured.database
+      : database as AppDatabase | SessionPersistenceDatabase;
+    this.ownerKey = configured ? configured.ownerKey ?? null : options.ownerKey ?? null;
+  }
 
   // ------------------------------------------------------------------ writing
 
@@ -212,17 +229,20 @@ export class UsageStore {
   record(job: UsageJobInput): string {
     const db = this.database.raw;
     const id = `${job.sessionId}:${job.turnId}`;
+    const ownerColumn = this.ownerKey ? 'owner_key, ' : '';
+    const ownerValues: unknown[] = this.ownerKey ? [this.ownerKey] : [];
     const write = db.transaction(() => {
       db.prepare(`
         INSERT OR REPLACE INTO usage_jobs (
-          id, session_id, native_session_id, turn_id, user_id, user_login,
+          ${ownerColumn}id, session_id, native_session_id, turn_id, user_id, user_login,
           agent, model, project, project_source, started_at, ended_at, duration_ms, outcome,
           turns, model_turns, tool_calls,
           input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
           reasoning_tokens, total_tokens, cost_usd,
           reports_usage, reports_cost
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (${Array.from({ length: 26 + ownerValues.length }, () => '?').join(', ')})
       `).run(
+        ...ownerValues,
         id,
         job.sessionId,
         job.nativeSessionId,
@@ -255,16 +275,19 @@ export class UsageStore {
         job.reportsCost ? 1 : 0,
       );
 
-      db.prepare('DELETE FROM usage_job_models WHERE job_id = ?').run(id);
+      db.prepare(this.ownerKey
+        ? 'DELETE FROM usage_job_models WHERE owner_key = ? AND job_id = ?'
+        : 'DELETE FROM usage_job_models WHERE job_id = ?').run(...ownerValues, id);
       const insertModel = db.prepare(`
         INSERT INTO usage_job_models (
-          job_id, model, calls, input_tokens, output_tokens,
+          ${ownerColumn}job_id, model, calls, input_tokens, output_tokens,
           cache_read_tokens, cache_write_tokens, cost_usd
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (${Array.from({ length: 8 + ownerValues.length }, () => '?').join(', ')})
       `);
       for (const split of job.models ?? []) {
         if (!split.model) continue;
         insertModel.run(
+          ...ownerValues,
           id,
           split.model,
           split.calls,
@@ -276,13 +299,15 @@ export class UsageStore {
         );
       }
 
-      db.prepare('DELETE FROM usage_job_tools WHERE job_id = ?').run(id);
+      db.prepare(this.ownerKey
+        ? 'DELETE FROM usage_job_tools WHERE owner_key = ? AND job_id = ?'
+        : 'DELETE FROM usage_job_tools WHERE job_id = ?').run(...ownerValues, id);
       const insertTool = db.prepare(
-        'INSERT INTO usage_job_tools (job_id, tool, calls) VALUES (?, ?, ?)',
+        `INSERT INTO usage_job_tools (${ownerColumn}job_id, tool, calls) VALUES (${Array.from({ length: 3 + ownerValues.length }, () => '?').join(', ')})`,
       );
       for (const tool of job.tools) {
         if (!tool.tool || tool.calls <= 0) continue;
-        insertTool.run(id, tool.tool, tool.calls);
+        insertTool.run(...ownerValues, id, tool.tool, tool.calls);
       }
     });
     write();
@@ -303,9 +328,9 @@ export class UsageStore {
     const row = this.database.raw
       .prepare(`
         SELECT COUNT(*) AS rows, SUM(COALESCE(cost_usd, 0)) AS total
-        FROM usage_jobs WHERE native_session_id = ?
+        FROM usage_jobs WHERE native_session_id = ?${this.ownerKey ? ' AND owner_key = ?' : ''}
       `)
-      .get(nativeSessionId) as { rows: number; total: number | null } | undefined;
+      .get(nativeSessionId, ...(this.ownerKey ? [this.ownerKey] : [])) as { rows: number; total: number | null } | undefined;
     // Null, not zero, when this conversation has no record at all. It is a
     // conversation that ran before any of this existed, and its counter is
     // already somewhere well above zero — so a baseline of zero would charge
@@ -335,9 +360,9 @@ export class UsageStore {
           SUM(COALESCE(reasoning_tokens, 0)) AS reasoning_tokens,
           SUM(COALESCE(total_tokens, 0)) AS total_tokens,
           SUM(COALESCE(cost_usd, 0)) AS cost_usd
-        FROM usage_jobs WHERE native_session_id = ?
+        FROM usage_jobs WHERE native_session_id = ?${this.ownerKey ? ' AND owner_key = ?' : ''}
       `)
-      .get(nativeSessionId) as Record<string, number | null> | undefined;
+      .get(nativeSessionId, ...(this.ownerKey ? [this.ownerKey] : [])) as Record<string, number | null> | undefined;
     if (!row) return {};
     return {
       inputTokens: row.input_tokens ?? 0,
@@ -368,9 +393,9 @@ export class UsageStore {
       .prepare(`
         SELECT turn_id, input_tokens, output_tokens, cache_read_tokens,
                cache_write_tokens, reasoning_tokens, total_tokens, cost_usd
-        FROM usage_jobs WHERE session_id = ? AND user_id = ?
+        FROM usage_jobs WHERE session_id = ? AND user_id = ?${this.ownerKey ? ' AND owner_key = ?' : ''}
       `)
-      .all(sessionId, userId) as Array<Record<string, number | string | null>>;
+      .all(sessionId, userId, ...(this.ownerKey ? [this.ownerKey] : [])) as Array<Record<string, number | string | null>>;
 
     const spend = new Map<string, ChatUsage>();
     for (const row of rows) {
@@ -458,15 +483,15 @@ export class UsageStore {
     if (!row) return null;
 
     const tools = this.database.raw
-      .prepare('SELECT tool, calls FROM usage_job_tools WHERE job_id = ? ORDER BY calls DESC, tool ASC')
-      .all(id) as Array<{ tool: string; calls: number }>;
+      .prepare(`SELECT tool, calls FROM usage_job_tools WHERE job_id = ?${this.ownerKey ? ' AND owner_key = ?' : ''} ORDER BY calls DESC, tool ASC`)
+      .all(id, ...(this.ownerKey ? [this.ownerKey] : [])) as Array<{ tool: string; calls: number }>;
     const models = this.database.raw
       .prepare(`
         SELECT model, calls, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, cost_usd
-        FROM usage_job_models WHERE job_id = ?
+        FROM usage_job_models WHERE job_id = ?${this.ownerKey ? ' AND owner_key = ?' : ''}
         ORDER BY COALESCE(cost_usd, 0) DESC, model ASC
       `)
-      .all(id) as Array<Record<string, string | number | null>>;
+      .all(id, ...(this.ownerKey ? [this.ownerKey] : [])) as Array<Record<string, string | number | null>>;
     return {
       ...mapJob(row),
       tools,
@@ -603,9 +628,9 @@ export class UsageStore {
     const named = new Map<string, string>();
     const sessionRows = db
       .prepare(`
-        SELECT id, name, custom_name FROM runtime_sessions WHERE id IN (${slots})
+        SELECT id, name, custom_name FROM runtime_sessions WHERE id IN (${slots})${this.ownerKey ? ' AND owner_key = ?' : ''}
       `)
-      .all(...ids) as Array<{ id: string; name: string | null; custom_name: string | null }>;
+      .all(...ids, ...(this.ownerKey ? [this.ownerKey] : [])) as Array<{ id: string; name: string | null; custom_name: string | null }>;
     for (const row of sessionRows) {
       const label = row.custom_name?.trim() || row.name?.trim();
       if (label) named.set(row.id, label);
@@ -643,13 +668,13 @@ export class UsageStore {
     // figures and the tool counts together. A filter applied to some of them
     // and not the rest is a dashboard whose parts disagree about what is on
     // screen.
-    const narrow = filterClause(query);
+    const narrow = filterClause(query, '', Boolean(this.ownerKey));
     const where = `WHERE ended_at >= ? AND ended_at < ?${base.and}${narrow.and}`;
     // The same predicate, qualified, for the one query that joins. Built rather
     // than rewritten out of the string above: a regex over SQL is a bug waiting
     // for the first column name that contains another one.
-    const joinedNarrow = filterClause(query, 'j.');
-    const joined = `WHERE j.ended_at >= ? AND j.ended_at < ?${base.and.replace('user_id', 'j.user_id')}${joinedNarrow.and}`;
+    const joinedNarrow = filterClause(query, 'j.', Boolean(this.ownerKey));
+    const joined = `WHERE j.ended_at >= ? AND j.ended_at < ?${base.and.replace('user_id', 'j.user_id').replace('owner_key', 'j.owner_key')}${joinedNarrow.and}`;
     const params = [from.toISOString(), to.toISOString(), ...base.params, ...narrow.params];
     const shift = `${tz >= 0 ? '+' : '-'}${Math.abs(tz)} minutes`;
 
@@ -723,9 +748,9 @@ export class UsageStore {
     const row = this.database.raw
       .prepare(`
         SELECT ${TOTALS_COLUMNS} FROM usage_jobs
-        WHERE ended_at >= ? AND ended_at < ? AND user_id = ? AND agent = ?
+        WHERE ended_at >= ? AND ended_at < ? AND user_id = ? AND agent = ?${this.ownerKey ? ' AND owner_key = ?' : ''}
       `)
-      .get(from.toISOString(), now.toISOString(), userId, agent) as TotalsRow;
+      .get(from.toISOString(), now.toISOString(), userId, agent, ...(this.ownerKey ? [this.ownerKey] : [])) as TotalsRow;
     return {
       from: from.toISOString(),
       to: now.toISOString(),
@@ -784,7 +809,7 @@ export class UsageStore {
       .prepare(`
         SELECT DISTINCT m.model AS value
         FROM usage_job_models m
-        JOIN usage_jobs ON usage_jobs.id = m.job_id${clause ? `${clause.replace(' WHERE', ' AND')}` : ''}
+        JOIN usage_jobs ON usage_jobs.id = m.job_id${this.ownerKey ? ' AND usage_jobs.owner_key = m.owner_key' : ''}${clause ? `${clause.replace(' WHERE', ' AND').replace(/owner_key/g, 'usage_jobs.owner_key')}` : ''}
       `)
       .all(...scope.params) as Array<{ value: string }>;
     const models = [...new Set([...distinct('model'), ...splitModels.map((row) => row.value)])].sort();
@@ -802,7 +827,7 @@ export class UsageStore {
    */
   private historyClause(query: UsageHistoryQuery): { clause: string; params: unknown[] } {
     const scope = this.scopeClause(query);
-    const narrow = filterClause(query);
+    const narrow = filterClause(query, '', Boolean(this.ownerKey));
     const where: string[] = [...scope.parts, ...narrow.parts];
     const params: unknown[] = [...scope.params, ...narrow.params];
 
@@ -887,7 +912,7 @@ export class UsageStore {
                    THEN 1 ELSE 0 END) AS tokens_reported_jobs,
           SUM(CASE WHEN ${reported('cost_usd')} IS NOT NULL THEN 1 ELSE 0 END) AS cost_reported_jobs
         FROM usage_jobs j
-        LEFT JOIN usage_job_models m ON m.job_id = j.id
+        LEFT JOIN usage_job_models m ON m.job_id = j.id${this.ownerKey ? ' AND m.owner_key = j.owner_key' : ''}
         ${joined}
         GROUP BY key
         ORDER BY cost_usd DESC, total_tokens DESC, turns DESC
@@ -986,7 +1011,7 @@ export class UsageStore {
         SELECT t.tool AS tool, ${key} AS agent_key,
                SUM(t.calls) AS calls, COUNT(DISTINCT t.job_id) AS turns
         FROM usage_job_tools t
-        JOIN usage_jobs j ON j.id = t.job_id
+        JOIN usage_jobs j ON j.id = t.job_id${this.ownerKey ? ' AND j.owner_key = t.owner_key' : ''}
         ${where}
         -- Not "GROUP BY agent": usage_jobs has a column by that name, and
         -- SQLite binds it in preference to the alias above — which silently
@@ -1013,8 +1038,13 @@ export class UsageStore {
    * query cannot accidentally get the wide one by omission.
    */
   private scopeClause(query: UsageQuery): { parts: string[]; and: string; params: unknown[] } {
-    if (query.scope === 'everyone') return { parts: [], and: '', params: [] };
-    return { parts: ['user_id = ?'], and: ' AND user_id = ?', params: [query.userId] };
+    const parts: string[] = this.ownerKey ? ['owner_key = ?'] : [];
+    const params: unknown[] = this.ownerKey ? [this.ownerKey] : [];
+    if (query.scope !== 'everyone') {
+      parts.push('user_id = ?');
+      params.push(query.userId);
+    }
+    return { parts, and: parts.map((part) => ` AND ${part}`).join(''), params };
   }
 }
 
@@ -1034,6 +1064,7 @@ export class UsageStore {
 function filterClause(
   filters: UsageFilters,
   prefix = '',
+  ownerScoped = false,
 ): { parts: string[]; and: string; params: unknown[] } {
   const parts: string[] = [];
   const params: unknown[] = [];
@@ -1057,9 +1088,12 @@ function filterClause(
     // and narrowing to only the answering model would hide exactly the work
     // the per-model breakdown exists to make visible — click the row, and the
     // spend it stands for is gone.
+    const outerOwnerColumn = prefix ? `${prefix}owner_key` : 'usage_jobs.owner_key';
     parts.push(
       `(${prefix}model = ? OR EXISTS (`
-        + `SELECT 1 FROM usage_job_models mm WHERE mm.job_id = ${prefix}id AND mm.model = ?))`,
+        + `SELECT 1 FROM usage_job_models mm WHERE mm.job_id = ${prefix}id`
+        + `${ownerScoped ? ` AND mm.owner_key = ${outerOwnerColumn}` : ''}`
+        + ` AND mm.model = ?))`,
     );
     params.push(filters.model, filters.model);
   } else {

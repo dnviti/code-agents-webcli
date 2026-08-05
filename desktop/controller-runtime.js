@@ -86,6 +86,13 @@ function localCookie(auth) {
   return `${auth.name}=${auth.value}`;
 }
 
+function abortedRequestError() {
+  return Object.assign(new Error('The request was aborted.'), {
+    name: 'AbortError',
+    code: 'ABORT_ERR',
+  });
+}
+
 function sanitizeLocalHeaders(headers = {}, origin, cookie) {
   const result = {};
   for (const [rawName, value] of Object.entries(headers)) {
@@ -113,14 +120,44 @@ function createLocalControllerTransport(options = {}) {
     const url = new URL(requestOptions.path || '/', origin);
     if (url.origin !== origin) throw new TypeError('The local request crossed its server boundary');
     return new Promise((resolve, reject) => {
+      const signal = requestOptions.signal;
+      if (signal?.aborted) {
+        reject(abortedRequestError());
+        return;
+      }
       const request = requestImpl(url, {
         method: requestOptions.method || 'GET',
         headers: sanitizeLocalHeaders(requestOptions.headers, origin, cookie),
-      }, resolve);
+      }, (response) => {
+        const location = response?.headers?.location;
+        if (typeof location === 'string') {
+          try {
+            const redirect = new URL(location, origin);
+            if (redirect.origin === origin) {
+              response.headers.location = `${redirect.pathname}${redirect.search}${redirect.hash}`;
+            }
+          } catch {
+            // Leave malformed or external locations for the caller's strict
+            // response-header policy to reject.
+          }
+        }
+        resolve(response);
+      });
+      const abortRequest = () => request.destroy(abortedRequestError());
+      signal?.addEventListener?.('abort', abortRequest, { once: true });
       request.once('error', reject);
+      request.once('close', () => signal?.removeEventListener?.('abort', abortRequest));
       const body = requestOptions.body;
-      if (body && typeof body.pipe === 'function') body.pipe(request);
-      else request.end(body == null ? undefined : body);
+      if (body && typeof body.pipe === 'function') {
+        const abort = () => request.destroy(Object.assign(new Error('The upload was aborted.'), { code: 'ECONNRESET' }));
+        body.once?.('error', (error) => request.destroy(error));
+        body.once?.('aborted', abort);
+        request.once('close', () => {
+          if (!request.writableEnded && !body.destroyed) body.destroy?.();
+          body.removeListener?.('aborted', abort);
+        });
+        body.pipe(request);
+      } else request.end(body == null ? undefined : body);
     });
   }
 
@@ -226,10 +263,15 @@ function createControllerRuntime(options = {}) {
 
   function targetWithState(target) {
     const current = state.get(target.id) || {};
-    const cachedSessions = target.offlineMetadataCache?.sessions || [];
-    const runningWorkCount = cachedSessions.filter((session) => (
-      session.active === true || session.status === 'active' || session.status === 'running'
-    )).length;
+    const cachedSessions = Array.isArray(target.offlineMetadataCache?.sessions)
+      ? target.offlineMetadataCache.sessions : null;
+    const runningWorkCount = Number.isInteger(current.runningWorkCount)
+      ? current.runningWorkCount
+      : cachedSessions
+        ? cachedSessions.filter((session) => (
+            session.active === true || session.status === 'active' || session.status === 'running'
+          )).length
+        : null;
     return {
       ...target,
       ...current,
@@ -241,7 +283,7 @@ function createControllerRuntime(options = {}) {
       ...(target.certificateOverride?.fingerprint
         ? { certificateFingerprint: target.certificateOverride.fingerprint }
         : {}),
-      ...(runningWorkCount > 0 ? { runningWorkCount } : {}),
+      ...(runningWorkCount !== null ? { runningWorkCount } : {}),
     };
   }
 
@@ -368,7 +410,7 @@ function createControllerRuntime(options = {}) {
       }
       return response;
     } catch (error) {
-      if (generation === connectionGeneration(serverId)) {
+      if (generation === connectionGeneration(serverId) && !requestOptions?.signal?.aborted) {
         if (serverId !== LOCAL_ID && error?.code === 'AUTH_REQUIRED' && error?.statusCode === 401) {
           catalog.setAuthMarker(serverId, false);
         }
@@ -399,7 +441,16 @@ function createControllerRuntime(options = {}) {
   }
 
   function cacheSessions(serverId, sessions) {
-    if (serverId !== LOCAL_ID) catalog.setOfflineMetadata(serverId, sessions);
+    if (serverId !== LOCAL_ID) {
+      catalog.setOfflineMetadata(serverId, sessions);
+      return;
+    }
+    const runningWorkCount = Array.isArray(sessions)
+      ? sessions.filter((session) => (
+          session.active === true || session.status === 'active' || session.status === 'running'
+        )).length
+      : 0;
+    state.set(LOCAL_ID, { ...(state.get(LOCAL_ID) || {}), runningWorkCount });
   }
 
   async function testTarget(payload = {}) {

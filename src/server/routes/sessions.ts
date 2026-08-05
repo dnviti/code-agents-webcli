@@ -14,7 +14,12 @@ import {
 } from '../types.js';
 import { TranscriptStoreLike } from '../services/transcript-store.js';
 import { HistoryStoreLike } from '../services/history-store.js';
-import { SessionTeardownLike } from '../services/session-teardown.js';
+import { SessionTeardownContext, SessionTeardownLike } from '../services/session-teardown.js';
+import type {
+  AttachmentSessionRef,
+  AttachmentStoreLike,
+} from '../services/attachment-store.js';
+import { storedAttachmentNameFromUrl } from '../services/attachment-store.js';
 import {
   AccountTabCoordinator,
   AccountTabCoordinatorLike,
@@ -27,7 +32,7 @@ import {
   projectName,
 } from '../../shared/conversations.js';
 import { planBranch, tooLargeMessage } from '../chat/branch.js';
-import { TurnCut } from '../chat/store.js';
+import { ChatSessionRef, TurnCut } from '../chat/store.js';
 import { getOwnedSession, requireUser } from './helpers.js';
 import {
   announceSessionClosed,
@@ -81,6 +86,44 @@ const DESCRIBE_CONCURRENCY = 16;
 /** Long enough for any label worth reading on a tab, short enough to store freely. */
 const MAX_NAME_LENGTH = 200;
 
+/** Project-aware attachment seam used only while the route owns its lifecycle gate. */
+interface ProjectBranchAttachmentStoreLike {
+  cloneForBranchInProjectWorkspace(
+    source: AttachmentSessionRef,
+    target: AttachmentSessionRef,
+    attachment: Parameters<AttachmentStoreLike['cloneForBranch']>[2],
+    workspaceRoot: string,
+  ): ReturnType<AttachmentStoreLike['cloneForBranch']>;
+}
+
+function rejectUnavailablePersistence(res: Response, session: SessionRecord): boolean {
+  if (session.persistenceUnavailable) {
+    res.status(409).json({
+      error: 'session_persistence_unavailable',
+      message: session.persistenceUnavailable,
+      retryable: true,
+    });
+    return true;
+  }
+  if (session.rollbackRecoveryPending) {
+    res.status(409).json({
+      error: 'session_recovery_pending',
+      message: 'This session is retained only to retry an incomplete rollback',
+      retryable: true,
+    });
+    return true;
+  }
+  return false;
+}
+
+function reportWorkspacePersistenceUnavailable(res: Response, error: unknown): void {
+  res.status(409).json({
+    error: 'workspace_persistence_unavailable',
+    message: error instanceof Error ? error.message : 'Workspace persistence is unavailable',
+    retryable: true,
+  });
+}
+
 /**
  * Process-local coordination for the one race persistence cannot express:
  * creating a hidden child while its owning conversation is being retired.
@@ -91,6 +134,8 @@ const MAX_NAME_LENGTH = 200;
  */
 interface SessionRouteCoordination {
   pendingOwnedCreates: Map<string, Set<Promise<void>>>;
+  pendingProjectCreates: Map<string, Set<Promise<void>>>;
+  retiringProjects: Set<string>;
   retiringTrees: WeakMap<SessionRecord, Promise<boolean>>;
   destroyedSessions: WeakMap<SessionRecord, Promise<void>>;
 }
@@ -105,6 +150,8 @@ function coordinationFor(deps: SessionRoutesDeps): SessionRouteCoordination {
   if (!coordination) {
     coordination = {
       pendingOwnedCreates: new Map(),
+      pendingProjectCreates: new Map(),
+      retiringProjects: new Set(),
       retiringTrees: new WeakMap(),
       destroyedSessions: new WeakMap(),
     };
@@ -130,7 +177,13 @@ export interface SessionRoutesDeps {
     ownerSessionId?: string;
     projectId?: string | null;
     projectWorkingDirKind?: 'host' | 'container';
+    /** Canonical server-resolved workspace root, never request input. */
+    storageRoot?: string;
   }): SessionRecord;
+  /** Lazy-load a trusted workspace before any save is allowed to prune it. */
+  loadWorkspaceSessions?(ownerUserId: number, storageRoot: string): Promise<void>;
+  /** Read-only project catalog resolution for resume/listing. */
+  loadProjectWorkspaceSessions?(ownerUserId: number, projectId: string): Promise<void>;
   getRuntimeBridge(agentKind: AgentKind): BridgeInterface | null;
   /**
    * Stop whichever process owns this record. The real composition root routes
@@ -161,7 +214,7 @@ export interface SessionRoutesDeps {
    */
   activeProfileFor?(runtime: string): { profileName: string; model?: string } | null;
   sessionStore: {
-    getSessionMetadata(): Promise<any>;
+    getSessionMetadata(ownerUserId?: number): Promise<any>;
     /** Write-through for the runtime active flag. Optional for tests. */
     setActive?(id: string, active: boolean): Promise<void>;
     /** Boot reset for stale active flags. Optional for tests. */
@@ -179,6 +232,8 @@ export interface SessionRoutesDeps {
    * compiling; the server always supplies one.
    */
   sessionTeardown?: SessionTeardownLike;
+  /** Durable attachment copy used when carried branch events name stored bytes. */
+  attachmentStore?: AttachmentStoreLike & Partial<ProjectBranchAttachmentStoreLike>;
   /** Shared with socket-created sessions so all account tab writes serialize. */
   tabCoordinator?: AccountTabCoordinatorLike;
   /**
@@ -189,8 +244,8 @@ export interface SessionRoutesDeps {
    * resume, which the route reports as an empty list rather than an error.
    */
   chatStore?: {
-    stat(session: { id: string; ownerUserId: number }): Promise<{ firstSeq: number; cursor: number }>;
-    describe(session: { id: string; ownerUserId: number }): Promise<{
+    stat(session: ChatSessionRef): Promise<{ firstSeq: number; cursor: number }>;
+    describe(session: ChatSessionRef): Promise<{
       nativeSessionId: string | null;
       firstMessage: string | null;
     }>;
@@ -199,9 +254,11 @@ export interface SessionRoutesDeps {
      * itself is: a deployment without a chat log has no conversation to branch
      * and the route says so rather than throwing.
      */
-    turnCut?(session: { id: string; ownerUserId: number }, turnId: string): Promise<TurnCut | null>;
-    append?(session: { id: string; ownerUserId: number }, events: ChatEvent[]): void;
-    setOpeningContext?(session: { id: string; ownerUserId: number }, context: string): Promise<void>;
+    turnCut?(session: ChatSessionRef, turnId: string): Promise<TurnCut | null>;
+    append?(session: ChatSessionRef, events: ChatEvent[]): void | Promise<void>;
+    setOpeningContext?(session: ChatSessionRef, context: string): Promise<void>;
+    /** Required for an all-or-nothing branch when any later step fails. */
+    deleteChat?(session: ChatSessionRef): Promise<void>;
   };
 }
 
@@ -221,7 +278,7 @@ export function createSessionRoutes(deps: SessionRoutesDeps): Router {
       return;
     }
 
-    const metadata = await deps.sessionStore.getSessionMetadata();
+    const metadata = await deps.sessionStore.getSessionMetadata(user.id);
     const currentSessions = countUserSessions(deps.claudeSessions, user.id);
 
     res.json({
@@ -312,6 +369,14 @@ export function createSessionRoutes(deps: SessionRoutesDeps): Router {
       canonicalDir = validation.path;
     }
 
+    try {
+      if (projectId) await deps.loadProjectWorkspaceSessions?.(user.id, projectId);
+      else await deps.loadWorkspaceSessions?.(user.id, canonicalDir);
+    } catch (error) {
+      reportWorkspacePersistenceUnavailable(res, error);
+      return;
+    }
+
     const candidates = chatRecords(deps, user.id)
       .filter((session) => session.workingDir === canonicalDir)
       .filter((session) => (session.projectId || '') === projectId)
@@ -325,7 +390,9 @@ export function createSessionRoutes(deps: SessionRoutesDeps): Router {
       dir: canonicalDir,
       projectId: projectId || null,
       workingDirKind,
-      conversations: conversations.filter((entry) => entry.events > 0),
+      conversations: conversations.filter(
+        (entry) => entry.events > 0 || entry.rollbackRecoveryPending,
+      ),
     });
   });
 
@@ -362,7 +429,9 @@ export function createSessionRoutes(deps: SessionRoutesDeps): Router {
     // from. It is not a conversation, and listing it would put a row with nothing
     // to read in front of the ones that matter — the same rule the resume list
     // applies, for the same reason.
-    const conversations = described.filter((entry) => entry.events > 0);
+    const conversations = described.filter(
+      (entry) => entry.events > 0 || entry.rollbackRecoveryPending,
+    );
 
     // Insertion order carries the grouping: `owned` is already newest-first, so
     // the first time a directory is seen is at its most recent conversation, and
@@ -446,6 +515,8 @@ export function createSessionRoutes(deps: SessionRoutesDeps): Router {
         // dialog; the tab strip was the one place the fact was known and not
         // carried.
         bypassPermissions: session.chatBypassPermissions === true,
+        persistenceUnavailable: session.persistenceUnavailable,
+        rollbackRecoveryPending: session.rollbackRecoveryPending === true,
         }));
 
       res.json({ sessions: sessionList });
@@ -481,6 +552,14 @@ export function createSessionRoutes(deps: SessionRoutesDeps): Router {
       const release = await acquireTabMutation(user.id);
       try {
         const current = orderedAccountTabs(deps.claudeSessions, user.id);
+        if (current.some((session) => session.persistenceUnavailable)) {
+          res.status(409).json({
+            error: 'session_persistence_unavailable',
+            message: 'A tab is read-only until its workspace migration can be retried',
+            retryable: true,
+          });
+          return;
+        }
         const currentIds = new Set(current.map((session) => session.id));
         if (
           sessionIds.length !== current.length
@@ -534,7 +613,7 @@ export function createSessionRoutes(deps: SessionRoutesDeps): Router {
    * windows open on the same sessions disagreeing about what a tab is called
    * until somebody reloads is the same complaint as losing the name entirely.
    */
-  router.patch('/api/sessions/:sessionId/name', (req: Request, res: Response): void => {
+  router.patch('/api/sessions/:sessionId/name', async (req: Request, res: Response): Promise<void> => {
     const user = requireUser(res);
     if (!user) {
       res.status(401).json({ error: 'authentication_required' });
@@ -546,6 +625,7 @@ export function createSessionRoutes(deps: SessionRoutesDeps): Router {
       res.status(404).json({ error: 'Session not found' });
       return;
     }
+    if (rejectUnavailablePersistence(res, session)) return;
 
     const { name } = req.body ?? {};
     if (typeof name !== 'string') {
@@ -563,8 +643,22 @@ export function createSessionRoutes(deps: SessionRoutesDeps): Router {
       return;
     }
 
+    const previousName = session.customName;
     session.customName = trimmed;
-    void deps.saveSessionsToDisk();
+    let saved = false;
+    try {
+      saved = (await deps.saveSessionsToDisk()) !== false;
+    } catch (error) {
+      console.error('Failed to persist session name:', error);
+    }
+    if (!saved) {
+      session.customName = previousName;
+      res.status(503).json({
+        error: 'session_name_not_saved',
+        message: 'The session name could not be saved',
+      });
+      return;
+    }
 
     for (const wsInfo of deps.webSocketConnections.values()) {
       if (wsInfo.userId !== user.id) continue;
@@ -601,6 +695,7 @@ export function createSessionRoutes(deps: SessionRoutesDeps): Router {
         res.status(404).json({ error: 'Session not found' });
         return;
       }
+      if (rejectUnavailablePersistence(res, session)) return;
 
       if (
         typeof req.body?.open !== 'boolean'
@@ -762,6 +857,7 @@ export function createSessionRoutes(deps: SessionRoutesDeps): Router {
         });
         return;
       }
+      if (rejectUnavailablePersistence(res, parent)) return;
       if (parent.retiring) {
         res.status(409).json({
           error: 'owner_session_retiring',
@@ -945,9 +1041,18 @@ export function createSessionRoutes(deps: SessionRoutesDeps): Router {
         }
       }
 
+      const sessionStorageRoot = ownerRecord?.storageScope?.workspaceRoot
+        || preparedProject?.allowedWorkingDirs[0]
+        || validWorkingDir;
       const release = await acquireTabMutation(user.id);
       let session: SessionRecord;
       try {
+        try {
+          await deps.loadWorkspaceSessions?.(user.id, sessionStorageRoot);
+        } catch (error) {
+          reportWorkspacePersistenceUnavailable(res, error);
+          return;
+        }
         // Project preparation may await for long enough that the owner is
         // retired or replaced. Revalidate the exact record under the same
         // account turn that allocates tab membership and persists it.
@@ -970,15 +1075,21 @@ export function createSessionRoutes(deps: SessionRoutesDeps): Router {
         // Allocate and insert inside the same account turn as visibility/order.
         // Otherwise a close that later rolls back can leave this new tab sharing
         // its tentative append position.
-        session = deps.createSessionRecord({
-          id: sessionId,
-          ownerUserId: user.id,
-          name,
-          workingDir: validWorkingDir,
-          ownerSessionId: owner,
-          projectId: persistedProjectId,
-          projectWorkingDirKind: persistedProjectId ? validWorkingDirKind : undefined,
-        });
+        try {
+          session = deps.createSessionRecord({
+            id: sessionId,
+            ownerUserId: user.id,
+            name,
+            workingDir: validWorkingDir,
+            ownerSessionId: owner,
+            projectId: persistedProjectId,
+            projectWorkingDirKind: persistedProjectId ? validWorkingDirKind : undefined,
+            storageRoot: sessionStorageRoot,
+          });
+        } catch (error) {
+          reportWorkspacePersistenceUnavailable(res, error);
+          return;
+        }
         if (!owner) session.tabOrder = nextAccountTabOrder(deps.claudeSessions, user.id);
         deps.claudeSessions.set(sessionId, session);
 
@@ -1074,6 +1185,7 @@ export function createSessionRoutes(deps: SessionRoutesDeps): Router {
       res.status(404).json({ error: 'unknown_conversation', message: 'That conversation does not exist' });
       return;
     }
+    if (rejectUnavailablePersistence(res, source)) return;
 
     const turnId = typeof req.body?.turnId === 'string' ? req.body.turnId.trim() : '';
     if (!turnId) {
@@ -1082,16 +1194,164 @@ export function createSessionRoutes(deps: SessionRoutesDeps): Router {
     }
 
     const store = deps.chatStore;
-    if (!store?.turnCut || !store.append || !store.setOpeningContext) {
+    if (!store?.turnCut || !store.append || !store.setOpeningContext || !store.deleteChat) {
       res.status(501).json({
         error: 'branching_unavailable',
         message: 'This server cannot branch conversations',
       });
       return;
     }
+    const turnCut = store.turnCut.bind(store);
+    const appendBranchChat = store.append.bind(store);
+    const setBranchOpeningContext = store.setOpeningContext.bind(store);
+
+    const branchCoordination = coordinationFor(deps);
+    if (
+      source.retiring
+      || (source.projectId && branchCoordination.retiringProjects.has(source.projectId))
+    ) {
+      res.status(409).json({
+        error: 'source_session_retiring',
+        message: 'That conversation is being deleted',
+      });
+      return;
+    }
+
+    const executeBranch = async (projectWorkspaceRoot?: string): Promise<void> => {
+      // A project branch reaches here only after acquiring its no-start
+      // lifecycle gate. Register the session/project create gates after that
+      // admission, otherwise a deletion which already owns the lifecycle gate
+      // could wait on a branch that is itself waiting behind the deletion.
+      const currentSource = deps.claudeSessions.get(source.id);
+      if (
+        currentSource !== source
+        || currentSource.ownerUserId !== user.id
+        || currentSource.surface !== 'chat'
+        || currentSource.retiring
+        || (source.projectId && branchCoordination.retiringProjects.has(source.projectId))
+      ) {
+        res.status(409).json({
+          error: 'source_session_retiring',
+          message: 'That conversation is being deleted',
+        });
+        return;
+      }
+
+      const completeSourceBranchCreate = trackOwnedSessionCreate(branchCoordination, source.id);
+      const completeProjectBranchCreate = source.projectId
+        ? trackProjectSessionCreate(branchCoordination, source.projectId)
+        : undefined;
+
+      try {
+
+    let pendingBranch: SessionRecord | null = null;
+    let accountMutationHeld = false;
+    let rollbackStarted = false;
+    let rollbackAmbiguous = false;
+    let rollbackAmbiguousBranchId: string | null = null;
+    let rollbackRecoveryDurable: boolean | undefined;
+    const rollbackPendingBranch = async (): Promise<void> => {
+      const branch = pendingBranch;
+      if (!branch || rollbackStarted) return;
+      rollbackStarted = true;
+
+      // Never remove a record another operation installed under the same id.
+      // UUID collisions are fantastically unlikely, but cleanup must still be
+      // exact rather than relying on that likelihood.
+      const occupant = deps.claudeSessions.get(branch.id);
+      if (occupant && occupant !== branch) {
+        // A collision means the target namespace may now contain another live
+        // session's artefacts. Preserve everything rather than deleting by id.
+        console.error(`Refusing ambiguous rollback for colliding branch ${branch.id}`);
+        rollbackAmbiguous = true;
+        rollbackAmbiguousBranchId = branch.id;
+        pendingBranch = null;
+        return;
+      }
+      // A recovery row is the crash-safe authority for every later filesystem
+      // mutation. For failures before the branch's ordinary commit, acquire the
+      // same account turn used by tab mutations; failures during commit already
+      // call rollback while holding it.
+      const releaseRecoveryMutation = accountMutationHeld
+        ? undefined
+        : await acquireTabMutation(user.id);
+      try {
+        const recoveryOccupant = deps.claudeSessions.get(branch.id);
+        if (recoveryOccupant && recoveryOccupant !== branch) {
+          rollbackAmbiguous = true;
+          rollbackAmbiguousBranchId = branch.id;
+          rollbackRecoveryDurable = false;
+          pendingBranch = null;
+          return;
+        }
+        if (branch.tabOrder === undefined) {
+          branch.tabOrder = nextAccountTabOrder(deps.claudeSessions, user.id);
+        }
+        branch.tabOpen = false;
+        branch.rollbackRecoveryPending = true;
+        deps.claudeSessions.set(branch.id, branch);
+
+        let anchorSaved = false;
+        try {
+          anchorSaved = (await deps.saveSessionsToDisk()) !== false;
+        } catch (error) {
+          console.error(`Failed to persist rollback anchor for branch ${branch.id}:`, error);
+        }
+        if (!anchorSaved) {
+          // Without a confirmed workspace-local anchor no destructive cleanup
+          // may begin. All branch artifacts remain intact and the response says
+          // explicitly that recovery durability is not yet confirmed.
+          rollbackAmbiguous = true;
+          rollbackAmbiguousBranchId = branch.id;
+          rollbackRecoveryDurable = false;
+          pendingBranch = null;
+          return;
+        }
+        rollbackRecoveryDurable = true;
+
+        const cleanupFailures = await cleanupRollbackArtifacts(deps, branch, {
+          projectLifecycleExclusive: Boolean(projectWorkspaceRoot),
+        });
+        for (const failure of cleanupFailures) {
+          console.error(
+            `Failed to remove ${failure.artifact} artifacts for branch ${branch.id}:`,
+            failure.error,
+          );
+        }
+        if (cleanupFailures.length > 0) {
+          rollbackAmbiguous = true;
+          rollbackAmbiguousBranchId = branch.id;
+          pendingBranch = null;
+          return;
+        }
+
+        // Cleanup is complete, but the flagged anchor remains authoritative
+        // until its removal is confirmed. If this save fails, restore the exact
+        // record; boot will reload the flag and DELETE can retry idempotently.
+        if (deps.claudeSessions.get(branch.id) === branch) {
+          deps.claudeSessions.delete(branch.id);
+        }
+        let removalSaved = false;
+        try {
+          removalSaved = (await deps.saveSessionsToDisk()) !== false;
+        } catch (error) {
+          console.error(`Failed to remove rollback anchor for branch ${branch.id}:`, error);
+        }
+        if (!removalSaved) {
+          deps.claudeSessions.set(branch.id, branch);
+          rollbackAmbiguous = true;
+          rollbackAmbiguousBranchId = branch.id;
+        } else {
+          rollbackRecoveryDurable = undefined;
+        }
+        pendingBranch = null;
+      } finally {
+        releaseRecoveryMutation?.();
+      }
+    };
 
     try {
-      const cut = await store.turnCut({ id: source.id, ownerUserId: source.ownerUserId }, turnId);
+      const cut = await turnCut(source, turnId);
       if (!cut) {
         res.status(404).json({
           error: 'unknown_turn',
@@ -1125,6 +1385,7 @@ export function createSessionRoutes(deps: SessionRoutesDeps): Router {
         // make its next launch silently fall back to the user's environment.
         projectId: source.projectId,
         projectWorkingDirKind: source.projectWorkingDirKind,
+        storageRoot: source.storageScope?.workspaceRoot || source.workingDir,
       });
       // The conversation this one came from, running the same agent in the same
       // place. Not `agent`, which says a process is up: nothing is running here
@@ -1169,28 +1430,49 @@ export function createSessionRoutes(deps: SessionRoutesDeps): Router {
           ? source.chatModelPinned
           : deps.activeProfileFor?.(source.lastAgent || '')?.model;
       branch.chatEffortOverride = source.chatEffortOverride;
+      pendingBranch = branch;
 
-      const ref = { id: sessionId, ownerUserId: user.id };
-      store.append(ref, plan.events);
-      // `append` is fire-and-forget by contract — it runs on the event path and
-      // may not fail a live conversation — so the write is confirmed here
-      // instead, through the store's own per-log queue: a stat cannot answer
-      // until the append ahead of it has finished, and an append that threw
-      // leaves nothing behind it to count.
+      const ref: ChatSessionRef = branch;
+      const branchEvents = await cloneBranchAttachmentEvents(
+        attachmentSessionRef(source),
+        attachmentSessionRef(branch),
+        plan.events,
+        deps.attachmentStore,
+        undefined,
+        projectWorkspaceRoot,
+      );
+      // The ordinary event path may fire-and-forget this promise, but branch
+      // creation is a durability boundary: no session record is committed
+      // until every newly-created artifact is ready. Attachment bytes are
+      // cloned first, so a durable log can never point back into the source
+      // namespace or outlive bytes that were not flushed yet.
+      await appendBranchChat(ref, branchEvents);
       const stats = await store.stat(ref);
-      if (stats.cursor < plan.events.length) {
+      if (stats.cursor < branchEvents.length) {
+        await rollbackPendingBranch();
         res.status(500).json({
           error: 'branch_not_written',
           message: 'The branch could not be written to disk',
+          ...(rollbackAmbiguousBranchId ? {
+            sessionId: rollbackAmbiguousBranchId,
+            recoveryPending: true,
+            recoveryDurable: rollbackRecoveryDurable === true,
+            retryable: true,
+          } : {}),
         });
         return;
       }
-      await store.setOpeningContext(ref, plan.context);
+      await setBranchOpeningContext(ref, plan.context);
+      // Prepare the empty transcript before the session row is committed. If
+      // this fails, the chat log and opening context can still be rolled back
+      // without a durable record ever pointing at missing artifacts.
+      await deps.transcriptStore.ensureTranscript(branch);
 
       const branchProjectName = branch.projectId
         ? deps.projectsManager?.getForUser(branch.ownerUserId, branch.projectId)?.name || null
         : null;
       const release = await acquireTabMutation(user.id);
+      accountMutationHeld = true;
       try {
         // Creating the record happened before the durable branch log was built,
         // which can take long enough for another device to reorder or close
@@ -1206,15 +1488,20 @@ export function createSessionRoutes(deps: SessionRoutesDeps): Router {
           console.error('Failed to persist branched session:', error);
         }
         if (!saved) {
-          deps.claudeSessions.delete(sessionId);
+          await rollbackPendingBranch();
           res.status(503).json({
             error: 'branch_not_saved',
             message: 'The branch could not be saved',
+            ...(rollbackAmbiguous ? {
+              sessionId,
+              recoveryPending: true,
+              recoveryDurable: rollbackRecoveryDurable === true,
+              retryable: true,
+            } : {}),
           });
           return;
         }
 
-        void deps.transcriptStore.ensureTranscript(branch);
         // A branch is a conversation that now exists, so it reaches the user's
         // other screens on the same terms as one started from scratch.
         announceSessionOpened(
@@ -1222,7 +1509,12 @@ export function createSessionRoutes(deps: SessionRoutesDeps): Router {
           deps.webSocketConnections,
           branch.projectId ? branchProjectName : undefined,
         );
+        // The durable record is the commit point. Everything that can fail and
+        // creates an artifact ran before it; broadcasting and serializing the
+        // already-built response do not mutate branch storage.
+        pendingBranch = null;
       } finally {
+        accountMutationHeld = false;
         release();
       }
 
@@ -1245,10 +1537,90 @@ export function createSessionRoutes(deps: SessionRoutesDeps): Router {
         sizeChecked: plan.budgetTokens !== undefined,
       });
     } catch (error: unknown) {
+      await rollbackPendingBranch();
       const message = error instanceof Error ? error.message : String(error);
       console.error(`Failed to branch session ${source.id}:`, error);
-      res.status(500).json({ error: 'branch_failed', message });
+      res.status(500).json({
+        error: 'branch_failed',
+        message,
+        ...(rollbackAmbiguousBranchId ? {
+          sessionId: rollbackAmbiguousBranchId,
+          recoveryPending: true,
+          recoveryDurable: rollbackRecoveryDurable === true,
+          retryable: true,
+        } : {}),
+      });
     }
+      } finally {
+        try {
+          completeProjectBranchCreate?.();
+        } finally {
+          completeSourceBranchCreate();
+        }
+      }
+    };
+
+    if (!source.projectId) {
+      await executeBranch();
+      return;
+    }
+
+    const projects = deps.projectsManager;
+    if (!projects || !projects.getForUser(user.id, source.projectId)) {
+      res.status(404).json({ error: 'project_not_found', message: 'Project not found' });
+      return;
+    }
+    if (!projects.withProjectWorkspace) {
+      res.status(503).json({
+        error: 'project_unavailable',
+        message: 'Project lifecycle storage is unavailable',
+      });
+      return;
+    }
+    try {
+      // This gate does not start or build a stopped project. It pins the
+      // canonical host checkout through source reads, attachment copies, all
+      // branch writes, commit and any compensating rollback.
+      await projects.withProjectWorkspace(
+        user.id,
+        source.projectId,
+        (workspaceRoot) => executeBranch(workspaceRoot),
+      );
+    } catch (error) {
+      if (res.headersSent) return;
+      const currentProject = projects.getForUser(user.id, source.projectId);
+      res.status(currentProject ? 409 : 404).json({
+        error: currentProject ? 'project_unavailable' : 'project_not_found',
+        message: error instanceof Error ? error.message : 'Project is unavailable',
+      });
+    }
+  });
+
+  /** Terminal panes owned by one conversation, restored after reload/restart. */
+  router.get('/api/sessions/:sessionId/children', (req: Request, res: Response): void => {
+    const user = requireUser(res);
+    if (!user) {
+      res.status(401).json({ error: 'authentication_required' });
+      return;
+    }
+
+    const parent = getOwnedSession(deps.claudeSessions, req.params.sessionId as string, user);
+    if (!parent || parent.surface !== 'chat' || parent.ownerSessionId) {
+      res.status(404).json({ error: 'Session not found' });
+      return;
+    }
+    if (rejectUnavailablePersistence(res, parent)) return;
+
+    const sessionIds = Array.from(deps.claudeSessions.values())
+      .filter((session) => (
+        session.ownerUserId === user.id
+        && session.ownerSessionId === parent.id
+        && !session.persistenceUnavailable
+        && !session.rollbackRecoveryPending
+      ))
+      .sort((left, right) => left.created.getTime() - right.created.getTime())
+      .map((session) => session.id);
+    res.json({ sessionIds });
   });
 
   router.get('/api/sessions/:sessionId', (req: Request, res: Response): void => {
@@ -1268,6 +1640,8 @@ export function createSessionRoutes(deps: SessionRoutesDeps): Router {
       id: session.id,
       name: session.name,
       customName: session.customName,
+      persistenceUnavailable: session.persistenceUnavailable,
+      rollbackRecoveryPending: session.rollbackRecoveryPending === true,
       created: session.created,
       active: session.active,
       agent: session.agent,
@@ -1294,6 +1668,164 @@ export function createSessionRoutes(deps: SessionRoutesDeps): Router {
       res.status(404).json({ error: 'Session not found' });
       return;
     }
+    // A legacy migration failure outranks recovery. Without a usable workspace
+    // database this process cannot prove that cleanup authority is durable, so
+    // DELETE must not touch a byte even when both markers are present.
+    if (session.persistenceUnavailable) {
+      rejectUnavailablePersistence(res, session);
+      return;
+    }
+    if (session.rollbackRecoveryPending) {
+      if (session.retiring) {
+        res.status(409).json({
+          error: 'session_recovery_in_progress',
+          message: 'Rollback cleanup is already in progress',
+          retryable: true,
+        });
+        return;
+      }
+      session.retiring = true;
+      const retryCleanup = async (projectLifecycleExclusive: boolean): Promise<void> => {
+        // A flag in memory is not cleanup authority: it may be the residue of
+        // an anchor save whose commit could not be confirmed. Re-persist the
+        // exact flagged row while it is still present, and do not touch one
+        // filesystem byte unless that durability boundary succeeds.
+        const releaseAnchorMutation = await acquireTabMutation(user.id);
+        try {
+          if (deps.claudeSessions.get(session.id) !== session) {
+            session.retiring = false;
+            res.status(409).json({
+              error: 'session_recovery_changed',
+              message: 'Rollback recovery changed before cleanup could start',
+              retryable: true,
+            });
+            return;
+          }
+          if (session.persistenceUnavailable) {
+            session.retiring = false;
+            rejectUnavailablePersistence(res, session);
+            return;
+          }
+          let anchorConfirmed = false;
+          try {
+            anchorConfirmed = (await deps.saveSessionsToDisk()) !== false;
+          } catch (error) {
+            console.error(`Failed to confirm rollback recovery ${session.id}:`, error);
+          }
+          if (!anchorConfirmed) {
+            session.retiring = false;
+            res.status(503).json({
+              error: 'session_recovery_not_durable',
+              message: 'Rollback cleanup cannot start until its recovery row is saved',
+              sessionId: session.id,
+              recoveryPending: true,
+              recoveryDurable: false,
+              retryable: true,
+            });
+            return;
+          }
+        } finally {
+          releaseAnchorMutation();
+        }
+        if (res.headersSent) return;
+
+        const failures = await cleanupRollbackArtifacts(
+          deps,
+          session,
+          { projectLifecycleExclusive },
+          true,
+        );
+        if (failures.length > 0) {
+          for (const failure of failures) {
+            console.error(
+              `Failed to retry ${failure.artifact} cleanup for branch ${session.id}:`,
+              failure.error,
+            );
+          }
+          session.retiring = false;
+          res.status(503).json({
+            error: 'session_recovery_incomplete',
+            message: 'Rollback cleanup is still incomplete',
+            sessionId: session.id,
+            recoveryPending: true,
+            recoveryDurable: true,
+            retryable: true,
+          });
+          return;
+        }
+
+        const release = await acquireTabMutation(user.id);
+        try {
+          if (deps.claudeSessions.get(session.id) !== session) {
+            session.retiring = false;
+            res.status(409).json({
+              error: 'session_recovery_changed',
+              message: 'Rollback recovery changed while cleanup was running',
+              retryable: true,
+            });
+            return;
+          }
+          deps.claudeSessions.delete(session.id);
+          let saved = false;
+          try {
+            saved = (await deps.saveSessionsToDisk()) !== false;
+          } catch (error) {
+            console.error(`Failed to remove rollback recovery ${session.id}:`, error);
+          }
+          if (!saved) {
+            deps.claudeSessions.set(session.id, session);
+            session.retiring = false;
+            res.status(503).json({
+              error: 'session_recovery_not_saved',
+              message: 'Cleanup completed but its recovery row could not be removed',
+              sessionId: session.id,
+              recoveryPending: true,
+              recoveryDurable: true,
+              retryable: true,
+            });
+            return;
+          }
+          deps.disposeRecorder(session.id);
+          announceSessionClosed(session, deps.webSocketConnections);
+          res.json({ success: true, message: 'Session recovery cleaned up' });
+        } finally {
+          release();
+        }
+      };
+
+      if (session.projectId) {
+        const projects = deps.projectsManager;
+        if (!projects?.withProjectWorkspace || !projects.getForUser(user.id, session.projectId)) {
+          session.retiring = false;
+          res.status(409).json({
+            error: 'project_unavailable',
+            message: 'Project workspace is unavailable for rollback cleanup',
+            retryable: true,
+          });
+          return;
+        }
+        try {
+          await projects.withProjectWorkspace(
+            user.id,
+            session.projectId,
+            () => retryCleanup(true),
+          );
+        } catch (error) {
+          session.retiring = false;
+          if (!res.headersSent) {
+            res.status(409).json({
+              error: 'project_unavailable',
+              message: error instanceof Error ? error.message : 'Project workspace is unavailable',
+              retryable: true,
+            });
+          }
+        }
+      } else {
+        await retryCleanup(false);
+      }
+      return;
+    }
+    if (rejectUnavailablePersistence(res, session)) return;
 
     // Close child admission before looking for children. A create that already
     // passed owner validation is drained, then either appears in this cascade
@@ -1335,6 +1867,13 @@ export function createSessionRoutes(deps: SessionRoutesDeps): Router {
         res.status(404).json({ error: 'Session not found' });
         return;
       }
+      // Legacy rows whose destination is unavailable remain visible so the
+      // user can retry migration, but their installation-global files are an
+      // import source, not a live store. History reads can repair/truncate a
+      // torn index, so even export must fail closed until the workspace owns
+      // the data. Recovery anchors are likewise cleanup authority, not an
+      // exportable conversation.
+      if (rejectUnavailablePersistence(res, session)) return;
 
       res.setHeader('Content-Type', 'text/markdown; charset=utf-8');
       res.setHeader(
@@ -1384,6 +1923,156 @@ export function createSessionRoutes(deps: SessionRoutesDeps): Router {
   return router;
 }
 
+/**
+ * Clone every workspace attachment named by carried events and rewrite its URL
+ * to the new immutable session namespace.
+ *
+ * `attachment` blocks are always expected to name app-owned bytes. Older chat
+ * logs represented uploaded images as `image` blocks, so those are copied when
+ * (and only when) their URL has the exact canonical source-session shape.
+ * Runtime-emitted images with data/external URLs remain ordinary carried
+ * history. Duplicate references are copied once and all rewritten to the same
+ * target URL.
+ */
+async function cloneBranchAttachmentEvents(
+  source: AttachmentSessionRef,
+  target: AttachmentSessionRef,
+  events: ChatEvent[],
+  attachmentStore?: AttachmentStoreLike & Partial<ProjectBranchAttachmentStoreLike>,
+  onClone?: () => void,
+  projectWorkspaceRoot?: string,
+): Promise<ChatEvent[]> {
+  const clones = new Map<string, Awaited<ReturnType<AttachmentStoreLike['cloneForBranch']>>>();
+  const rewritten: ChatEvent[] = [];
+
+  for (const event of events) {
+    if (event.t !== 'block_start') {
+      rewritten.push(event);
+      continue;
+    }
+    const block = event.block;
+    const storedImage = block.kind === 'image'
+      && storedAttachmentNameFromUrl(block.url, source.id) !== null;
+    if (block.kind !== 'attachment' && !storedImage) {
+      rewritten.push(event);
+      continue;
+    }
+    if (!attachmentStore) {
+      throw new Error('Branch attachment storage is unavailable');
+    }
+
+    const requested = block.kind === 'attachment'
+      ? { url: block.url, mime: block.mime, name: block.name, size: block.size }
+      : { url: block.url, mime: block.mime, name: block.alt || 'attachment', size: 0 };
+    let cloned = clones.get(block.url);
+    if (!cloned) {
+      if (projectWorkspaceRoot) {
+        if (
+          !source.projectId
+          || source.projectId !== target.projectId
+          || !attachmentStore.cloneForBranchInProjectWorkspace
+        ) {
+          throw new Error('Project branch attachment storage is unavailable');
+        }
+        cloned = await attachmentStore.cloneForBranchInProjectWorkspace(
+          source,
+          target,
+          requested,
+          projectWorkspaceRoot,
+        );
+      } else {
+        cloned = await attachmentStore.cloneForBranch(source, target, requested);
+      }
+      clones.set(block.url, cloned);
+      onClone?.();
+    }
+
+    rewritten.push({
+      ...event,
+      block: block.kind === 'attachment'
+        ? {
+            kind: 'attachment',
+            url: cloned.url,
+            mime: cloned.mime,
+            name: cloned.name,
+            size: cloned.size,
+          }
+        : {
+            ...block,
+            url: cloned.url,
+            mime: cloned.mime,
+            alt: block.alt || cloned.name,
+          },
+    });
+  }
+  return rewritten;
+}
+
+function attachmentSessionRef(session: SessionRecord): AttachmentSessionRef {
+  return {
+    id: session.id,
+    ownerUserId: session.ownerUserId,
+    workingDir: session.workingDir,
+    projectId: session.projectId,
+    projectWorkingDirKind: session.projectWorkingDirKind,
+    storageScope: session.storageScope,
+  };
+}
+
+interface RollbackCleanupFailure {
+  artifact: string;
+  error: unknown;
+}
+
+/**
+ * Retry-safe cleanup while the recovery row remains authoritative.
+ * Descriptor-backed core stores finish before the teardown registry closes its
+ * workspace directory lease; every owner still runs when an earlier one fails.
+ */
+async function cleanupRollbackArtifacts(
+  deps: SessionRoutesDeps,
+  session: SessionRecord,
+  context: SessionTeardownContext,
+  includeHistory = false,
+): Promise<RollbackCleanupFailure[]> {
+  const failures: RollbackCleanupFailure[] = [];
+  const clean = async (artifact: string, operation: () => Promise<unknown>): Promise<void> => {
+    try {
+      await operation();
+    } catch (error) {
+      failures.push({ artifact, error });
+    }
+  };
+
+  await clean('transcript', () => deps.transcriptStore.deleteTranscript(session));
+  if (includeHistory) await clean('history', () => deps.historyStore.deleteHistory(session));
+  if (deps.sessionTeardown) {
+    if (deps.sessionTeardown.disposeStrict) {
+      try {
+        const result = await deps.sessionTeardown.disposeStrict(session, context);
+        for (const failure of result.failures) {
+          failures.push({ artifact: `session:${failure.name}`, error: failure.error });
+        }
+      } catch (error) {
+        failures.push({ artifact: 'session', error });
+      }
+    } else {
+      await clean('session', () => Promise.resolve(deps.sessionTeardown!.dispose(session, context)));
+    }
+  } else {
+    if (deps.chatStore?.deleteChat) {
+      await clean('chat', () => deps.chatStore!.deleteChat!(session));
+    }
+    if (deps.attachmentStore) {
+      await clean('attachments', () => deps.attachmentStore!.deleteSessionAttachments(
+        attachmentSessionRef(session),
+        { projectLifecycleExclusive: context.projectLifecycleExclusive },
+      ));
+    }
+  }
+  return failures;
+}
+
 /** Restore staged deletions at their exact Map positions after a refused save. */
 function restoreSessionMapOrder(
   sessions: Map<string, SessionRecord>,
@@ -1430,6 +2119,44 @@ function trackOwnedSessionCreate(
     if (pending!.size === 0) coordination.pendingOwnedCreates.delete(ownerSessionId);
     resolveCompletion();
   };
+}
+
+/** Record one independent branch while its project retirement gate is open. */
+function trackProjectSessionCreate(
+  coordination: SessionRouteCoordination,
+  projectId: string,
+): () => void {
+  let resolveCompletion!: () => void;
+  const completion = new Promise<void>((resolve) => {
+    resolveCompletion = resolve;
+  });
+  let pending = coordination.pendingProjectCreates.get(projectId);
+  if (!pending) {
+    pending = new Set();
+    coordination.pendingProjectCreates.set(projectId, pending);
+  }
+  pending.add(completion);
+
+  let completed = false;
+  return () => {
+    if (completed) return;
+    completed = true;
+    pending!.delete(completion);
+    if (pending!.size === 0) coordination.pendingProjectCreates.delete(projectId);
+    resolveCompletion();
+  };
+}
+
+/** Wait until every branch admitted before project retirement has settled. */
+async function drainProjectSessionCreates(
+  coordination: SessionRouteCoordination,
+  projectId: string,
+): Promise<void> {
+  for (;;) {
+    const pending = [...(coordination.pendingProjectCreates.get(projectId) || [])];
+    if (pending.length === 0) return;
+    await Promise.all(pending);
+  }
 }
 
 /** Await every create that was admitted before these owners began retiring. */
@@ -1583,12 +2310,13 @@ function retireSessionTree(
 function destroySessionOnce(
   deps: SessionRoutesDeps,
   session: SessionRecord,
+  context?: SessionTeardownContext,
 ): Promise<void> {
   const coordination = coordinationFor(deps);
   const existing = coordination.destroyedSessions.get(session);
   if (existing) return existing;
 
-  const destruction = destroySession(deps, session);
+  const destruction = destroySession(deps, session, context);
   coordination.destroyedSessions.set(session, destruction);
   // A failed stop must remain retryable. Successful promises stay associated
   // with the record object so a stale concurrent cascade cannot tear it down a
@@ -1611,53 +2339,114 @@ export async function retireProjectSessions(
   deps: SessionRoutesDeps,
   projectId: string,
 ): Promise<string[]> {
-  const roots = Array.from(deps.claudeSessions.values())
-    .filter((session) => session.projectId === projectId);
-  // Mark every project record synchronously, before the first drain yields.
-  // Project deletion can therefore neither miss a child create already in
-  // flight nor admit a new one while it is collecting the owned-session tree.
-  for (const session of roots) session.retiring = true;
-  const ids = await collectRetiringSessionTree(deps, roots);
-  const sessions = Array.from(deps.claudeSessions.values())
-    .filter((session) => ids.has(session.id));
-  if (sessions.length === 0) return [];
-
-  // A project cascade can remove several tabs at once. Hold each affected
-  // account's tab turn in stable order while the shared session snapshot is
-  // staged and persisted.
-  const releases: Array<() => void> = [];
+  const coordination = coordinationFor(deps);
+  coordination.retiringProjects.add(projectId);
   try {
-    if (deps.tabCoordinator) {
-      const ownerIds = [...new Set(sessions.map((session) => session.ownerUserId))]
-        .sort((left, right) => left - right);
-      for (const ownerUserId of ownerIds) {
-        releases.push(await deps.tabCoordinator.acquire(ownerUserId));
+    let roots = Array.from(deps.claudeSessions.values())
+      .filter((session) => session.projectId === projectId);
+    // Close admission synchronously, then drain branches which registered
+    // before that close. A branch is an independent root rather than an owned
+    // shell, so the project set must be rescanned after the drain.
+    for (const session of roots) session.retiring = true;
+    await drainProjectSessionCreates(coordination, projectId);
+    roots = Array.from(deps.claudeSessions.values())
+      .filter((session) => session.projectId === projectId);
+    for (const session of roots) session.retiring = true;
+
+    const recoveryAnchors = roots.filter((entry) => entry.rollbackRecoveryPending);
+    const blockedRecovery = recoveryAnchors.find((entry) => entry.persistenceUnavailable);
+    if (blockedRecovery) {
+      for (const root of roots) root.retiring = false;
+      throw new Error(
+        `Project rollback recovery ${blockedRecovery.id} is unavailable: ${blockedRecovery.persistenceUnavailable}`,
+      );
+    }
+    if (recoveryAnchors.length > 0) {
+      let anchorsConfirmed = false;
+      try {
+        anchorsConfirmed = (await deps.saveSessionsToDisk()) !== false;
+      } catch (error) {
+        console.error(`Failed to confirm project rollback recovery for ${projectId}:`, error);
+      }
+      if (!anchorsConfirmed) {
+        for (const root of roots) root.retiring = false;
+        throw new Error('Project rollback recovery rows could not be saved before cleanup');
       }
     }
 
-    const originalIds = Array.from(deps.claudeSessions.keys());
-    for (const session of sessions) deps.claudeSessions.delete(session.id);
-    try {
-      const saved = (await deps.saveSessionsToDisk()) !== false;
-      if (!saved) throw new Error('The project session deletion could not be saved');
-    } catch (error) {
-      restoreSessionMapOrder(deps.claudeSessions, sessions, originalIds);
-      for (const session of sessions) session.retiring = false;
-      throw error;
+    // Recovery anchors keep their row as authority until cleanup succeeds.
+    // Project removal already owns the lifecycle gate, so retry them here with
+    // the exclusive context before the shared snapshot can delete any row.
+    for (const session of recoveryAnchors) {
+      const failures = await cleanupRollbackArtifacts(
+        deps,
+        session,
+        { projectLifecycleExclusive: true },
+        true,
+      );
+      if (failures.length > 0) {
+        for (const root of roots) root.retiring = false;
+        throw new Error(
+          `Project rollback recovery ${session.id} is incomplete: ${failures.map((failure) => failure.artifact).join(', ')}`,
+        );
+      }
     }
 
-    for (const session of sessions) await destroySessionOnce(deps, session);
+    const ids = await collectRetiringSessionTree(deps, roots);
+    const sessions = Array.from(deps.claudeSessions.values())
+      .filter((session) => ids.has(session.id));
+    if (sessions.length === 0) return [];
+
+    // A project cascade can remove several tabs at once. Hold each affected
+    // account's tab turn in stable order while the shared session snapshot is
+    // staged and persisted.
+    const releases: Array<() => void> = [];
+    try {
+      if (deps.tabCoordinator) {
+        const ownerIds = [...new Set(sessions.map((session) => session.ownerUserId))]
+          .sort((left, right) => left - right);
+        for (const ownerUserId of ownerIds) {
+          releases.push(await deps.tabCoordinator.acquire(ownerUserId));
+        }
+      }
+
+      const originalIds = Array.from(deps.claudeSessions.keys());
+      for (const session of sessions) deps.claudeSessions.delete(session.id);
+      try {
+        const saved = (await deps.saveSessionsToDisk()) !== false;
+        if (!saved) throw new Error('The project session deletion could not be saved');
+      } catch (error) {
+        restoreSessionMapOrder(deps.claudeSessions, sessions, originalIds);
+        for (const session of sessions) session.retiring = false;
+        throw error;
+      }
+
+      for (const session of sessions) {
+        if (session.rollbackRecoveryPending) {
+          deps.disposeRecorder(session.id);
+          announceSessionClosed(session, deps.webSocketConnections);
+        } else {
+          await destroySessionOnce(deps, session, { projectLifecycleExclusive: true });
+        }
+      }
+    } finally {
+      for (let index = releases.length - 1; index >= 0; index -= 1) releases[index]();
+    }
+    return sessions.map((session) => session.id);
   } finally {
-    for (let index = releases.length - 1; index >= 0; index -= 1) releases[index]();
+    coordination.retiringProjects.delete(projectId);
   }
-  return sessions.map((session) => session.id);
 }
 
 /**
  * End one session: await its process, then remove its sockets, record and
  * stored transcript/history. The caller persists once for the whole cascade.
  */
-async function destroySession(deps: SessionRoutesDeps, session: SessionRecord): Promise<void> {
+async function destroySession(
+  deps: SessionRoutesDeps,
+  session: SessionRecord,
+  context?: SessionTeardownContext,
+): Promise<void> {
   if (deps.stopSessionRuntime) {
     // The unified hook also closes launch admission and drains a start that is
     // still awaiting an environment/adapter while `active` is false. Calling
@@ -1705,7 +2494,7 @@ async function destroySession(deps: SessionRoutesDeps, session: SessionRecord): 
   ]);
   // Subsystems that registered their own cleanup (pasted images, and
   // whatever comes next) rather than each appending a line here.
-  deps.sessionTeardown?.dispose(session);
+  await deps.sessionTeardown?.dispose(session, context);
 }
 
 /**
@@ -1803,14 +2592,24 @@ async function summarise(
   session: SessionRecord,
 ): Promise<ConversationSummary> {
   const store = deps.chatStore;
-  const ref = { id: session.id, ownerUserId: session.ownerUserId };
+  const ref: ChatSessionRef = session;
+  const unavailable = Boolean(
+    session.persistenceUnavailable || session.rollbackRecoveryPending,
+  );
+  // `stat()` intentionally repairs a derived chat index. That is correct for
+  // a workspace-local archive, but a blocked legacy row must remain byte-for-
+  // byte import-only. `describe()` is a bounded read of the JSONL head and
+  // does not publish, truncate or append any file, so the diagnostic row can
+  // still retain its useful opening line.
   const [stats, description] = await Promise.all([
-    store?.stat(ref).catch(() => null) ?? null,
+    unavailable ? null : store?.stat(ref).catch(() => null) ?? null,
     store?.describe(ref).catch(() => null) ?? null,
   ]);
 
   return {
     id: session.id,
+    persistenceUnavailable: session.persistenceUnavailable,
+    rollbackRecoveryPending: session.rollbackRecoveryPending === true,
     name: displayName(session),
     runtime: session.lastAgent,
     runtimeLabel: session.runtimeLabel,
@@ -1823,18 +2622,21 @@ async function summarise(
     workingDirKind: session.projectId
       ? session.projectWorkingDirKind ?? 'host'
       : 'host',
-    events: stats?.cursor ?? 0,
+    // Keep an unavailable legacy record in the conversation list even when we
+    // deliberately refused the mutating stat/repair path above.
+    events: stats?.cursor ?? (session.persistenceUnavailable ? 1 : 0),
     firstMessage: description?.firstMessage ?? null,
     // The record first, then the log: the record is authoritative and the head
     // scan is the backfill for conversations that predate it.
-    canResume: Boolean(session.nativeChatSessionId || description?.nativeSessionId),
+    canResume: !unavailable
+      && Boolean(session.nativeChatSessionId || description?.nativeSessionId),
     // Reported so the row can say which approval mode picking it will put back.
     // A restored bypass is a standing permission, and one that arrives silently
     // is no better than one that is silently dropped.
     bypassPermissions: session.chatBypassPermissions === true,
     // A conversation that is already running is not one to resume; the list says
     // so rather than offering an action that would be refused.
-    running: session.active === true,
+    running: !unavailable && session.active === true,
   };
 }
 

@@ -30,7 +30,9 @@ instead of making another container.
 You may create a project with no repository for scratch work. Confirm the
 disposability notice before doing so: there is no upstream source and no place
 to preserve its project workspace. A rebuild, long-idle reclaim, or deletion
-discards that work; only files in your persistent home survive.
+discards ordinary project files. The app preserves its own `.cc-web` session
+archive across a rebuild or reclaim, and files in your persistent home survive;
+neither is a backup of the scratch project's source files.
 
 For a private HTTPS repository, add a connected-host token for its host before
 the build begins. The token is used only to clone that repository and to push a
@@ -51,7 +53,8 @@ data:
 | Location | What happens on a project rebuild or reclaim |
 | --- | --- |
 | Your persistent home directory mounted in the project container | Kept. Agent sign-ins, installed user tooling, shell configuration and other files stored there survive. |
-| Project overlay mounted at `/opt/code-agents-project` | Kept for this project only. Project-specific settings and additions survive; deleting the project removes the overlay. |
+| Project overlay mounted at `/opt/code-agents-project` | Kept for this project only. Project-specific settings and additions survive. Deleting the project removes the overlay. |
+| `.cc-web/` at the canonical project workspace root | Kept across rebuild and reclaim. During the destructive interval, the exact directory is atomically staged in a deterministic sibling outside the container-writable root and then restored to this location. It contains session/tab state, conversation events, terminal history, attachments, paste metadata and usage; deleting the project removes it with the project. |
 | The repository checkout under `/workspace` | Disposable. A rebuild clones it afresh from its repository. |
 | Other paths in the project container outside your persistent home | Disposable. Do not use them as the only copy of important work. |
 
@@ -69,6 +72,26 @@ to Git and then freshly cloned, and every other container-local path is
 disposable. Container-local paths are executed and browsed through that
 project's already owner-checked environment; they are never treated as paths on
 the server host or as a way to select another project's container.
+
+Session persistence is always anchored to the canonical project workspace,
+even when a session runs in one of those subfolders or container-only paths.
+Before replacing a checkout, the project manager flushes and closes the open
+session database and verifies `.cc-web` without following symlinks. It atomically
+moves that exact pinned directory to
+`.<project-id>.ccweb-session-storage-retained`, a deterministic sibling outside
+the project root mounted into the container, and synchronises both parent
+directories. It can then remove disposable entries and create a fresh checkout.
+The manager restores and verifies the same directory inode, makes that rename
+durable, and only then reopens the local database. A competing `.cc-web` name is
+never allowed to replace or overwrite the staged archive.
+
+If a process crashes in this interval, the next startup first reconciles and
+quiesces reachable managed runtimes so no old container can mutate the archive,
+then restores the deterministic staging slot before session discovery. If the
+runtime cannot be quiesced, the slot is unsafe, or exact restoration fails, the
+authoritative archive stays staged and the project is reported unavailable; an
+empty replacement database is not created. A normal stop does not replace the
+worktree and therefore needs no staging cycle.
 
 Before an automatic reclaim or a rebuild of a repository project, the app checks
 the checkout for uncommitted work. If it is dirty, it commits that work to a new
@@ -105,8 +128,10 @@ so opening it again resumes it with the same checkout.
 An idle project has no active sessions, attached clients, builds, long-running
 commands, or agent turns. After the configured idle-stop period it is stopped,
 but its container and worktree remain. After the longer idle-reclaim period,
-the container and disposable worktree may be removed; reopening builds a fresh
-container and checkout. Active agent work prevents both actions.
+the container and disposable workspace contents may be removed after the
+verified `.cc-web` staging-and-restore cycle; reopening builds a fresh container
+and checkout around the restored archive. Active agent work prevents both
+actions.
 
 ## Targets and storage requirements
 

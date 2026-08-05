@@ -3381,9 +3381,13 @@ export class ChatSession {
         t: 'block_start',
         msgId: messageId,
         index: offset + 1,
-        block: attachment.mime.startsWith('image/')
-          ? { kind: 'image', mime: attachment.mime, url: attachment.url, alt: attachment.name }
-          : { kind: 'text', text: `Attached: ${attachment.name}` },
+        block: {
+          kind: 'attachment',
+          mime: attachment.mime,
+          url: attachment.url,
+          name: attachment.name,
+          size: attachment.size,
+        },
       });
     }
     this.ingest({ t: 'msg_end', msgId: messageId });

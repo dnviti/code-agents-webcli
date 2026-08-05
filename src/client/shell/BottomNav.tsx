@@ -43,6 +43,14 @@ export interface BottomNavDestination {
 
 export interface BottomNavProps {
   destinations: BottomNavDestination[];
+  /** Desktop-package reminder shown only by the installed Electron app. */
+  trailingAction?: {
+    label: string;
+    ariaLabel: string;
+    icon: string;
+    tone: 'warning' | 'error';
+    onPress(): void;
+  };
   /**
    * Hidden while the on-screen keyboard is up.
    *
@@ -53,7 +61,7 @@ export interface BottomNavProps {
   hidden?: boolean;
 }
 
-export function BottomNav({ destinations, hidden = false }: BottomNavProps): React.JSX.Element | null {
+export function BottomNav({ destinations, trailingAction, hidden = false }: BottomNavProps): React.JSX.Element | null {
   if (hidden || destinations.length === 0) return null;
 
   return (
@@ -137,6 +145,28 @@ export function BottomNav({ destinations, hidden = false }: BottomNavProps): Rea
           </span>
         </button>
       ))}
+      {trailingAction ? (
+        <button
+          type="button"
+          aria-label={trailingAction.ariaLabel}
+          aria-haspopup="dialog"
+          onClick={trailingAction.onPress}
+          style={{
+            flex: '0 1 88px', minWidth: TOUCH_TARGET, minHeight: TOUCH_TARGET,
+            display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: 3,
+            padding: '0 4px', border: 'none', borderLeft: '1px solid var(--border)',
+            background: 'color-mix(in srgb, var(--ansi-yellow) 10%, transparent)',
+            color: trailingAction.tone === 'error' ? 'var(--destructive)' : 'var(--foreground)',
+            fontFamily: 'var(--font-sans)', fontSize: PHONE_TEXT.meta, cursor: 'pointer',
+            WebkitTapHighlightColor: 'transparent', touchAction: 'manipulation',
+          }}
+        >
+          <Icon name={trailingAction.icon} size={20} />
+          <span style={{ maxWidth: '100%', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+            {trailingAction.label}
+          </span>
+        </button>
+      ) : null}
     </nav>
   );
 }

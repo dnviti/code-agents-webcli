@@ -240,14 +240,19 @@ function ConversationCard({
 }): React.JSX.Element {
   const [hover, setHover] = React.useState(false);
   const title = conversation.firstMessage || conversation.name;
+  const blockedReason = conversation.persistenceUnavailable
+    || (conversation.rollbackRecoveryPending
+      ? 'Rollback cleanup is pending. Delete this recovery entry to retry cleanup.'
+      : undefined);
 
   return (
     <button
       type="button"
+      disabled={Boolean(blockedReason)}
       onClick={onSelect}
       onMouseEnter={() => setHover(true)}
       onMouseLeave={() => setHover(false)}
-      title={title}
+      title={blockedReason || title}
       style={{
         display: 'grid',
         gap: 3,
@@ -259,7 +264,8 @@ function ConversationCard({
         background: hover ? 'var(--accent)' : 'transparent',
         border: '1px solid var(--border)',
         borderRadius: 'var(--radius)',
-        cursor: 'pointer',
+        cursor: blockedReason ? 'not-allowed' : 'pointer',
+        opacity: blockedReason ? 0.7 : 1,
       }}
     >
       <span
@@ -286,10 +292,16 @@ function ConversationCard({
         <span>{conversation.runtimeLabel || conversation.runtime || 'chat'}</span>
         <span>{formatWhen(conversation.lastActivity)}</span>
         {conversation.running ? <Badge variant="success">running</Badge> : null}
+        {conversation.persistenceUnavailable ? (
+          <Badge variant="destructive">migration blocked</Badge>
+        ) : null}
+        {conversation.rollbackRecoveryPending ? (
+          <Badge variant="destructive">rollback cleanup pending</Badge>
+        ) : null}
         {/* Said here rather than discovered on arrival: the transcript comes
             back either way, and this is the difference between an agent that
             remembers it and one reading it for the first time. */}
-        {!conversation.running && !conversation.canResume ? (
+        {!conversation.rollbackRecoveryPending && !conversation.running && !conversation.canResume ? (
           <Badge variant="outline">transcript only</Badge>
         ) : null}
         {/* The mode this conversation comes back in. Only the bypass is called

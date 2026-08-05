@@ -96,11 +96,6 @@ function describeInstalled(status: UpdateStatus): string {
 
 function refusalText(mode: UpdateMode): string | null {
   switch (mode) {
-    case 'desktop':
-      return (
-        'A newer desktop build is available. Download the installer for your system '
-        + 'from https://github.com/dnviti/code-agents-webcli/releases and install it over this version.'
-      );
     case 'ephemeral':
       return (
         'Running from the npx cache, so there is nothing to update in place — '
@@ -133,6 +128,22 @@ export function describeUpdate(
   now: number = Date.now(),
 ): UpdateBannerView {
   const { status, mode } = response;
+
+  // A packaged desktop has a separate, semantic-version native updater owned
+  // by Electron's main process. Its embedded server can retain a stale
+  // commit-based status in memory, but that status must never create a second
+  // (or misleading) browser-style update notice.
+  if (mode === 'desktop') {
+    return {
+      visible: false,
+      tone: 'neutral',
+      text: '',
+      action: null,
+      actionLabel: null,
+      dismissible: true,
+      showLog: false,
+    };
+  }
 
   if (response.runnerState === 'restarting') {
     return {

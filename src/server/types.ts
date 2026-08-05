@@ -94,9 +94,34 @@ export interface Aliases {
   antigravity: string;
 }
 
+/**
+ * The immutable location and account namespace of a persisted session.
+ *
+ * `ownerKey` is deliberately an opaque stable identifier, never a numeric
+ * database id or a login. That lets a workspace state file survive a fresh
+ * local AppDatabase without making one account's records visible to another.
+ */
+export interface SessionStorageScope {
+  readonly workspaceRoot: string;
+  readonly ownerKey: string;
+}
+
 export interface SessionRecord {
   id: string;
   ownerUserId: number;
+  /**
+   * Durable tombstone for a branch transaction whose artifact rollback has
+   * not completed. While set, DELETE retries cleanup before removing the row.
+   */
+  rollbackRecoveryPending?: boolean;
+  /**
+   * Legacy row retained read-only because its workspace archive could not be
+   * completed. It remains listable, but no runtime or mutation may write
+   * through it until a later migration retry succeeds.
+   */
+  persistenceUnavailable?: string;
+  /** Set once at creation when this record belongs to workspace-local state. */
+  readonly storageScope?: SessionStorageScope;
   name: string;
   created: Date;
   lastActivity: Date;
@@ -294,12 +319,10 @@ export interface SessionRecord {
    * conversation, dropped at a restart — and the one that got missed would be
    * the leak.
    *
-   * Deliberately absent from what the store writes to disk (see
-   * services/session-store.ts, which names its columns one by one). A draft is
-   * something you are in the middle of; restoring one into a conversation the
-   * following week is a surprise, not a convenience. Every browser also keeps
-   * its own copy in session storage, so a server restart costs the draft only on
-   * the screens that were not already showing it.
+   * Persisted with the session in the workspace archive. Draft text and its
+   * attachment descriptors are session data, so keeping a fallback copy in
+   * Chromium Web Storage would leak them into Electron's installation-level
+   * userData and make a server restart lose the only project-local copy.
    */
   chatDraft?: ChatDraft;
   /**
@@ -383,6 +406,7 @@ export interface WebSocketInfo {
 
 export interface SessionListItem {
   id: string;
+  rollbackRecoveryPending?: boolean;
   name: string;
   created: Date;
   active: boolean;

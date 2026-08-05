@@ -1,6 +1,18 @@
 import { randomBytes } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
+import {
+  ensureWorkspaceSessionDirectory,
+  openWorkspacePasteDirectorySync,
+  workspaceSessionAccessDirectory,
+  type WorkspaceStorageDirectoryLease,
+  WorkspaceSessionStorageRef,
+} from './workspace-session-storage.js';
+import {
+  openSessionFileForRead,
+  replaceSessionFile,
+  unlinkSessionEntry,
+} from './safe-session-file.js';
 
 /**
  * Stores images pasted from the browser and hands back the path to type into
@@ -21,10 +33,14 @@ export const PASTE_SUBDIR = 'pasted';
 export const DEFAULT_MAX_BYTES = 10 * 1024 * 1024;
 /** Per session, so a loop of pastes cannot fill the disk. */
 export const DEFAULT_SESSION_QUOTA_BYTES = 200 * 1024 * 1024;
+/** A manifest is untrusted workspace input and must never cause an unbounded allocation. */
+export const MAX_PASTE_MANIFEST_BYTES = 1024 * 1024;
+/** Keeps parse and quota accounting bounded even for extremely small images. */
+export const MAX_PASTE_MANIFEST_ENTRIES = 4096;
 
 export type ImageKind = 'png' | 'jpg' | 'gif' | 'webp' | 'bmp';
 
-export interface PasteSessionRef {
+export interface PasteSessionRef extends WorkspaceSessionStorageRef {
   id: string;
   ownerUserId: number;
   workingDir: string;
@@ -38,7 +54,8 @@ export interface PasteResult {
 
 export interface PasteStoreLike {
   save(session: PasteSessionRef, bytes: Buffer): Promise<PasteResult>;
-  deletePastes(session: Pick<PasteSessionRef, 'id' | 'ownerUserId'>): Promise<void>;
+  flush?(session: PasteSessionRef): Promise<void>;
+  deletePastes(session: Pick<PasteSessionRef, 'id' | 'ownerUserId'> & WorkspaceSessionStorageRef): Promise<void>;
 }
 
 export interface PasteStoreOptions {
@@ -48,6 +65,8 @@ export interface PasteStoreOptions {
   sessionQuotaBytes?: number;
   now?: () => Date;
   randomId?: () => string;
+  /** Deterministic seam for the pathname-only backend used on non-Linux hosts. */
+  forcePathFallback?: boolean;
 }
 
 interface ManifestEntry {
@@ -146,6 +165,7 @@ export function insertTextFor(absolutePath: string): string {
 const GITIGNORE_BODY = `# Written by code-agents-webcli. Pasted images are scratch, never commit them.
 *
 `;
+const NO_FOLLOW = (fs.constants as unknown as Record<string, number>).O_NOFOLLOW ?? 0;
 
 export class PasteStore implements PasteStoreLike {
   readonly storageDir: string;
@@ -155,6 +175,7 @@ export class PasteStore implements PasteStoreLike {
 
   private readonly now: () => Date;
   private readonly randomId: () => string;
+  private readonly forcePathFallback: boolean;
   private readonly queues = new Map<string, Promise<unknown>>();
   private readonly ignoredDirs = new Set<string>();
   /** Sessions whose teardown has begun; a late upload must not resurrect them. */
@@ -165,8 +186,15 @@ export class PasteStore implements PasteStoreLike {
     this.manifestDir = path.join(this.storageDir, 'pastes');
     this.maxBytes = options.maxBytes ?? DEFAULT_MAX_BYTES;
     this.sessionQuotaBytes = options.sessionQuotaBytes ?? DEFAULT_SESSION_QUOTA_BYTES;
+    if (!Number.isSafeInteger(this.maxBytes) || this.maxBytes <= 0) {
+      throw new TypeError('Paste maxBytes must be a positive safe integer');
+    }
+    if (!Number.isSafeInteger(this.sessionQuotaBytes) || this.sessionQuotaBytes < 0) {
+      throw new TypeError('Paste sessionQuotaBytes must be a non-negative safe integer');
+    }
     this.now = options.now ?? (() => new Date());
     this.randomId = options.randomId ?? (() => randomBytes(4).toString('hex'));
+    this.forcePathFallback = options.forcePathFallback === true;
   }
 
   /**
@@ -176,7 +204,7 @@ export class PasteStore implements PasteStoreLike {
    * the regex alone accepts both, and '..' would climb out of the per-owner
    * directory.
    */
-  private manifestPath(session: Pick<PasteSessionRef, 'id' | 'ownerUserId'>): string {
+  private manifestPath(session: Pick<PasteSessionRef, 'id' | 'ownerUserId'> & WorkspaceSessionStorageRef): string {
     const id = String(session.id);
     if (!/^[A-Za-z0-9._-]+$/.test(id) || id === '.' || id === '..') {
       throw new Error(`Refusing unsafe session id for paste storage: ${JSON.stringify(id)}`);
@@ -186,7 +214,12 @@ export class PasteStore implements PasteStoreLike {
       throw new Error(`Refusing non-integer owner id for paste storage: ${session.ownerUserId}`);
     }
 
-    return path.join(this.manifestDir, String(session.ownerUserId), `${id}.json`);
+    const workspaceDir = workspaceSessionAccessDirectory(session, {
+      forcePathFallback: this.forcePathFallback,
+    });
+    return workspaceDir
+      ? path.join(workspaceDir, 'paste-manifest.json')
+      : path.join(this.manifestDir, String(session.ownerUserId), `${id}.json`);
   }
 
   private enqueue<T>(key: string, task: () => Promise<T>): Promise<T> {
@@ -196,32 +229,97 @@ export class PasteStore implements PasteStoreLike {
     return next;
   }
 
-  private async readManifest(file: string): Promise<Manifest> {
+  private invalidManifest(file: string, detail: string, cause?: unknown): NodeJS.ErrnoException {
+    return Object.assign(new Error(`Unsafe paste manifest ${file}: ${detail}`), {
+      code: 'INVALID_PASTE_MANIFEST',
+      cause,
+    });
+  }
+
+  private async readManifest(file: string, tolerateInvalid = false): Promise<Manifest> {
+    let handle: fs.promises.FileHandle | null = null;
     try {
-      const parsed = JSON.parse(await fs.promises.readFile(file, 'utf8')) as Partial<Manifest>;
-      if (!Array.isArray(parsed.entries)) {
+      try {
+        handle = await openSessionFileForRead(file);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+          return { version: 1, entries: [] };
+        }
+        throw error;
+      }
+      const stat = await handle.stat();
+      if (!stat.isFile() || stat.nlink !== 1) {
+        throw this.invalidManifest(file, 'is not a private regular file');
+      }
+      if (!Number.isSafeInteger(stat.size) || stat.size < 0 || stat.size > MAX_PASTE_MANIFEST_BYTES) {
+        throw this.invalidManifest(file, `exceeds ${MAX_PASTE_MANIFEST_BYTES} bytes`);
+      }
+
+      // `readFile()` can allocate past the size observed above if a hostile
+      // runtime grows the workspace file concurrently. Read at most cap + 1
+      // bytes into one fixed allocation and reject growth beyond the cap.
+      const buffer = Buffer.allocUnsafe(MAX_PASTE_MANIFEST_BYTES + 1);
+      let offset = 0;
+      while (offset < buffer.length) {
+        const result = await handle.read(buffer, offset, buffer.length - offset, offset);
+        if (result.bytesRead === 0) break;
+        offset += result.bytesRead;
+      }
+      if (offset > MAX_PASTE_MANIFEST_BYTES) {
+        throw this.invalidManifest(file, `exceeds ${MAX_PASTE_MANIFEST_BYTES} bytes`);
+      }
+
+      let parsed: Partial<Manifest>;
+      try {
+        parsed = JSON.parse(buffer.toString('utf8', 0, offset)) as Partial<Manifest>;
+      } catch (error) {
+        throw this.invalidManifest(file, 'is not valid JSON', error);
+      }
+      if (
+        parsed.version !== 1
+        || !Array.isArray(parsed.entries)
+        || parsed.entries.length > MAX_PASTE_MANIFEST_ENTRIES
+      ) {
+        throw this.invalidManifest(file, 'has an unsupported shape');
+      }
+
+      const entries: ManifestEntry[] = [];
+      for (const entry of parsed.entries) {
+        if (
+          !entry
+          || typeof entry.path !== 'string'
+          || typeof entry.root !== 'string'
+          || !Number.isSafeInteger(entry.bytes)
+          || (entry.bytes as number) < 0
+        ) {
+          throw this.invalidManifest(file, 'contains an invalid entry');
+        }
+        entries.push({ path: entry.path, root: entry.root, bytes: entry.bytes as number });
+      }
+      return { version: 1, entries };
+    } catch (error) {
+      if (tolerateInvalid && (error as NodeJS.ErrnoException).code === 'INVALID_PASTE_MANIFEST') {
+        // Teardown may retire a corrupt manifest, but must never trust its
+        // contents as deletion authority.
         return { version: 1, entries: [] };
       }
-      return {
-        version: 1,
-        entries: parsed.entries.filter(
-          (entry): entry is ManifestEntry =>
-            !!entry && typeof entry.path === 'string' && typeof entry.root === 'string',
-        ),
-      };
-    } catch {
-      // Missing, or truncated by a crash mid-write. Either way there is
-      // nothing trustworthy to read; deletion falls back to the recorded root.
-      return { version: 1, entries: [] };
+      throw error;
+    } finally {
+      await handle?.close().catch(() => undefined);
     }
   }
 
   /** Written via a temp file and rename so a crash cannot truncate it. */
   private async writeManifest(file: string, manifest: Manifest): Promise<void> {
+    if (manifest.entries.length > MAX_PASTE_MANIFEST_ENTRIES) {
+      throw this.invalidManifest(file, `exceeds ${MAX_PASTE_MANIFEST_ENTRIES} entries`);
+    }
+    const serialized = JSON.stringify(manifest);
+    if (Buffer.byteLength(serialized, 'utf8') > MAX_PASTE_MANIFEST_BYTES) {
+      throw this.invalidManifest(file, `exceeds ${MAX_PASTE_MANIFEST_BYTES} bytes`);
+    }
     await fs.promises.mkdir(path.dirname(file), { recursive: true });
-    const temp = `${file}.${this.randomId()}.tmp`;
-    await fs.promises.writeFile(temp, JSON.stringify(manifest), { mode: 0o600 });
-    await fs.promises.rename(temp, file);
+    await replaceSessionFile(file, serialized, 'utf8');
   }
 
   /**
@@ -274,7 +372,10 @@ export class PasteStore implements PasteStoreLike {
 
     try {
       // wx: an existing file is left exactly as the user left it.
-      await fs.promises.writeFile(path.join(dir, '.gitignore'), GITIGNORE_BODY, { flag: 'wx' });
+      await fs.promises.writeFile(path.join(dir, '.gitignore'), GITIGNORE_BODY, {
+        flag: 'wx',
+        mode: 0o600,
+      });
     } catch (error) {
       const code = (error as NodeJS.ErrnoException).code;
       if (code !== 'EEXIST') {
@@ -329,6 +430,11 @@ export class PasteStore implements PasteStoreLike {
   }
 
   async save(session: PasteSessionRef, bytes: Buffer): Promise<PasteResult> {
+    if (session.persistenceUnavailable) {
+      throw Object.assign(new Error(session.persistenceUnavailable), {
+        code: 'SESSION_PERSISTENCE_UNAVAILABLE',
+      });
+    }
     if (bytes.length === 0) {
       throw Object.assign(new Error('Empty body'), { code: 'EMPTY_BODY' });
     }
@@ -345,7 +451,11 @@ export class PasteStore implements PasteStoreLike {
     // never results in a directory appearing.
     const manifestFile = this.manifestPath(session);
 
-    const workingDir = path.resolve(session.workingDir);
+    // The session's cwd can change; its immutable storage scope cannot. Keep
+    // paste bytes and their manifest in the same workspace for the lifetime
+    // of the session, falling back only for pre-scope legacy callers.
+    const immutableRoot = session.storageScope?.workspaceRoot ?? session.storageRoot;
+    const workingDir = path.resolve(immutableRoot ?? session.workingDir);
     if (!workingDir || workingDir === path.parse(workingDir).root) {
       throw Object.assign(new Error('Refusing to write to a filesystem root'), {
         code: 'UNSAFE_PASTE_DIR',
@@ -359,32 +469,18 @@ export class PasteStore implements PasteStoreLike {
         throw Object.assign(new Error('Session is gone'), { code: 'SESSION_GONE' });
       }
 
+      await ensureWorkspaceSessionDirectory(session);
+
       const manifest = await this.readManifest(manifestFile);
-      const used = manifest.entries.reduce((total, entry) => total + (entry.bytes || 0), 0);
-      if (used + bytes.length > this.sessionQuotaBytes) {
-        throw Object.assign(new Error('Session paste quota exceeded'), { code: 'QUOTA_EXCEEDED' });
+      let used = 0;
+      for (const entry of manifest.entries) {
+        if (entry.bytes > Number.MAX_SAFE_INTEGER - used) {
+          throw this.invalidManifest(manifestFile, 'contains an overflowing byte total');
+        }
+        used += entry.bytes;
       }
-
-      const container = path.join(workingDir, PASTE_DIR);
-      const root = path.join(container, PASTE_SUBDIR);
-
-      // One level at a time, each checked for a symlink first.
-      await this.ensureDir(container);
-      await this.ensureDir(root);
-      await this.ensureGitignore(container);
-
-      // path.resolve is purely lexical, so after the directories exist the
-      // real paths are compared too: the working directory itself may sit
-      // under a symlink, but the paste root must not escape it.
-      const realRoot = await fs.promises.realpath(root);
-      const realWorkingDir = await fs.promises.realpath(workingDir);
-      if (
-        realRoot !== realWorkingDir
-        && !realRoot.startsWith(realWorkingDir + path.sep)
-      ) {
-        throw Object.assign(new Error('Paste directory escapes the working directory'), {
-          code: 'UNSAFE_PASTE_DIR',
-        });
+      if (used > this.sessionQuotaBytes - bytes.length) {
+        throw Object.assign(new Error('Session paste quota exceeded'), { code: 'QUOTA_EXCEEDED' });
       }
 
       const stamp = this.now().toISOString().replace(/[:.]/g, '-');
@@ -395,26 +491,80 @@ export class PasteStore implements PasteStoreLike {
         throw new Error(`Refusing generated paste name: ${JSON.stringify(name)}`);
       }
 
+      const pasteLease = openWorkspacePasteDirectorySync(workingDir, {
+        forcePathFallback: this.forcePathFallback,
+      });
+      if (pasteLease.entryMutationPolicy === 'deny') {
+        pasteLease.close();
+        throw Object.assign(
+          new Error('Creating paste entries requires descriptor-relative workspace access'),
+          { code: 'UNSAFE_PASTE_DIR' },
+        );
+      }
+      try {
+        pasteLease.verify();
+      } catch (error) {
+        pasteLease.close();
+        throw error;
+      }
+      const realRoot = pasteLease.canonicalPath;
+      const accessRoot = pasteLease.accessPath;
+
       const absolutePath = path.resolve(realRoot, name);
       if (!absolutePath.startsWith(realRoot + path.sep)) {
+        pasteLease.close();
         throw new Error('Refusing a paste path outside the paste directory');
       }
+      const writePath = path.join(accessRoot, name);
 
       // wx never follows a symlink at the final component and never clobbers,
       // which closes the window the lstat checks above only narrow.
-      await fs.promises.writeFile(absolutePath, bytes, { mode: 0o600, flag: 'wx' });
-
-      manifest.entries.push({ path: absolutePath, root: realRoot, bytes: bytes.length });
+      let wroteFile = false;
       try {
+        pasteLease.verify();
+        const handle = await fs.promises.open(
+          writePath,
+          fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | NO_FOLLOW,
+          0o600,
+        );
+        wroteFile = true;
+        try {
+          const stat = await handle.stat();
+          if (!stat.isFile() || stat.nlink !== 1) {
+            throw Object.assign(new Error('Refusing an unsafe pasted image entry'), {
+              code: 'UNSAFE_PASTE_DIR',
+            });
+          }
+          await handle.chmod(0o600);
+          await handle.writeFile(bytes);
+        } finally {
+          await handle.close().catch(() => undefined);
+        }
+        pasteLease.verify();
+
+        manifest.entries.push({ path: absolutePath, root: realRoot, bytes: bytes.length });
         await this.writeManifest(manifestFile, manifest);
+        pasteLease.verify();
       } catch (error) {
-        // The image is already on disk and usable; an unrecorded entry only
-        // costs cleanup later, so this must not fail the paste.
-        console.error('Could not record the pasted image for cleanup:', error);
+        // Durability and cleanup are one operation. Returning a path here would
+        // leave an attachment the session can use but can never account for or
+        // retire. Unlink the unpredictable file we just created and surface a
+        // retryable failure instead.
+        if (wroteFile) {
+          await fs.promises.unlink(writePath).catch(() => undefined);
+        }
+        throw error;
+      } finally {
+        pasteLease.close();
       }
 
       return { absolutePath, insertText: insertTextFor(absolutePath), bytes: bytes.length };
     });
+  }
+
+  async flush(session: PasteSessionRef): Promise<void> {
+    const manifestFile = this.manifestPath(session);
+    await this.enqueue(manifestFile, async () => undefined);
   }
 
   /**
@@ -427,7 +577,7 @@ export class PasteStore implements PasteStoreLike {
    *
    * Never rejects — the caller is fire-and-forget.
    */
-  async deletePastes(session: Pick<PasteSessionRef, 'id' | 'ownerUserId'>): Promise<void> {
+  async deletePastes(session: Pick<PasteSessionRef, 'id' | 'ownerUserId'> & WorkspaceSessionStorageRef): Promise<void> {
     let manifestFile: string;
     try {
       manifestFile = this.manifestPath(session);
@@ -441,30 +591,76 @@ export class PasteStore implements PasteStoreLike {
     this.tombstoned.add(manifestFile);
 
     await this.enqueue(manifestFile, async () => {
+      const pasteLeases = new Map<string, WorkspaceStorageDirectoryLease>();
       try {
-        const manifest = await this.readManifest(manifestFile);
-        const roots = new Set<string>();
+        const manifest = await this.readManifest(manifestFile, true);
+        const immutableRoot = session.storageScope?.workspaceRoot ?? session.storageRoot;
+        const scopedRoot = immutableRoot
+          ? path.resolve(immutableRoot, PASTE_DIR, PASTE_SUBDIR)
+          : null;
+        const authorized: Array<{ root: string; candidate: string }> = [];
 
         for (const entry of manifest.entries) {
-          // The recorded root is server-generated and is what the file was
-          // actually written under; the live workingDir may have moved.
-          if (entry.path !== entry.root && !entry.path.startsWith(entry.root + path.sep)) {
-            continue;
+          const root = path.resolve(entry.root);
+          const candidate = path.resolve(entry.path);
+          // A workspace-local manifest is writable by the runtime and is not
+          // authority over the host filesystem. Recompute its only permitted
+          // root from immutable storageScope, then accept direct generated
+          // children only. Legacy global manifests retain their old root but
+          // still have to name a canonical `.cc-web/pasted` directory.
+          const legacyShape = !scopedRoot
+            && path.basename(root) === PASTE_SUBDIR
+            && path.basename(path.dirname(root)) === PASTE_DIR;
+          if (
+            (scopedRoot ? root !== scopedRoot : !legacyShape)
+            || entry.root !== root
+            || entry.path !== candidate
+            || path.dirname(candidate) !== root
+            || !/^[A-Za-z0-9._-]+\.(?:png|jpg|gif|webp|bmp)$/.test(path.basename(candidate))
+          ) continue;
+          authorized.push({ root, candidate });
+        }
+
+        // Resolve and pin every authorized root before the first deletion, so
+        // a later unsafe/missing root cannot leave a partially path-deleted
+        // cleanup. Legacy manifests may legitimately span prior working dirs.
+        for (const { root } of authorized) {
+          if (pasteLeases.has(root)) continue;
+          const workspaceRoot = scopedRoot
+            ? immutableRoot as string
+            : path.dirname(path.dirname(root));
+          const lease = openWorkspacePasteDirectorySync(workspaceRoot, {
+            forcePathFallback: this.forcePathFallback,
+            createIfMissing: false,
+          });
+          if (lease.canonicalPath !== root || lease.entryMutationPolicy === 'deny') {
+            lease.close();
+            throw Object.assign(new Error('Refusing an unsafe paste cleanup root'), {
+              code: 'UNSAFE_PASTE_DIR',
+            });
           }
-          roots.add(entry.root);
-          await fs.promises.rm(entry.path, { force: true });
+          lease.verify();
+          pasteLeases.set(root, lease);
         }
 
-        for (const root of roots) {
-          // Non-recursive on purpose: a directory that gained the user's own
-          // files must survive.
-          await fs.promises.rmdir(root).catch(() => undefined);
-          await this.removeContainerIfEmpty(path.dirname(root));
+        for (const { root, candidate } of authorized) {
+          const lease = pasteLeases.get(root);
+          if (!lease) throw new Error('Paste cleanup root lease is unavailable');
+          const entryPath = path.join(lease.accessPath, path.basename(candidate));
+          lease.verify();
+          const state = await fs.promises.lstat(entryPath).catch(() => null);
+          if (!state || state.isSymbolicLink() || !state.isFile()) continue;
+          await fs.promises.unlink(entryPath).catch((error: NodeJS.ErrnoException) => {
+            if (error.code !== 'ENOENT') throw error;
+          });
+          lease.verify();
         }
 
-        await fs.promises.rm(manifestFile, { force: true });
+        await unlinkSessionEntry(manifestFile);
       } catch (error) {
         console.error('Failed to delete pasted images:', error);
+      } finally {
+        for (const lease of pasteLeases.values()) lease.close();
       }
     }).catch(() => undefined);
   }

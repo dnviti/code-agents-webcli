@@ -10,6 +10,8 @@ export interface DialogProps {
   footer?: React.ReactNode;
   onClose?: React.MouseEventHandler<HTMLElement>;
   width?: React.CSSProperties['width'];
+  /** Override the overlay layer for a workflow that must cover app-owned chrome. */
+  overlayZIndex?: React.CSSProperties['zIndex'];
   /**
    * `bottom` anchors the panel to the bottom edge full-width — the sheet a
    * touch UI expects, where a centred panel puts its controls out of thumb
@@ -156,6 +158,7 @@ export function Dialog({
   footer,
   onClose,
   width = 440,
+  overlayZIndex = 'var(--z-modal)',
   placement = 'center',
   movable = false,
   height,
@@ -295,9 +298,9 @@ export function Dialog({
       // the top panel alone — and it stays swallowed there even when that panel
       // has no close button to run.
       const button = closeRef.current;
-      if (!button) return;
+      event.preventDefault();
       event.stopPropagation();
-      button.click();
+      button?.click();
     };
     const onFocusIn = (event: FocusEvent) => {
       if (!isTopmostPanel(panel) || panel.contains(event.target as Node | null)) return;
@@ -321,7 +324,7 @@ export function Dialog({
   // the overlay's flex centring is left alone.
   const placed = windowed && (maximised || box !== null);
   const overlayStyle: React.CSSProperties = {
-    position: 'fixed', inset: 0, zIndex: 'var(--z-modal)' as unknown as number, display: 'flex',
+    position: 'fixed', inset: 0, zIndex: overlayZIndex, display: 'flex',
     alignItems: bottom ? 'flex-end' : 'center', justifyContent: 'center',
     padding: bottom ? 0 : 24, background: 'var(--overlay)', animation: 'relay-fade-in var(--duration-base)',
   };

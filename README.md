@@ -39,6 +39,9 @@ GitHub OAuth is needed to launch the local experience.
 - **One desktop, several servers.** The installed app combines labeled local
   and remote sessions, keeps each server's sign-in and certificate decision
   isolated, and makes the target explicit before new work is created.
+- **Open Local computer on your phone, when you choose.** The desktop app can
+  show a one-use QR for an ephemeral LAN gateway, or guide you through private
+  outside-LAN access with Tailscale Serve. Sharing is off after every restart.
 - **Sessions that outlive the tab.** Reload, switch devices, come back tomorrow —
   the session is still there, with its scrollback.
 - **Scrollback that does not melt the browser.** The recent tail stays live;
@@ -134,6 +137,7 @@ The image ships the web server only — the agent CLIs are not bundled. See
 | Guide | What is in it |
 | --- | --- |
 | [Desktop app](docs/desktop.md) | Native downloads, the local-and-remote controller, sign-in and certificate isolation, LAN discovery, updates and troubleshooting |
+| [Open Local computer on a phone](docs/phone-access.md) | Desktop QR pairing on a LAN, its dedicated CA, private Tailscale Serve access, revoking and troubleshooting |
 | [Installation](docs/installation.md) | Every install path, platform support, uninstalling, install troubleshooting |
 | [GitHub OAuth](docs/github-oauth.md) | Creating the OAuth App, the allow-list, the installer account |
 | [Configuration](docs/configuration.md) | Every CLI flag and environment variable, the setup wizard, where state is stored |

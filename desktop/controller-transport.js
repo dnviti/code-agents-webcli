@@ -177,6 +177,11 @@ function cookieHeader(cookies) {
 function classifyTransportError(error, origin) {
   if (error instanceof ControllerTransportError) return error;
   const code = error && typeof error.code === 'string' ? error.code : '';
+  // Cancellation is caller intent, not target health.  Preserve the standard
+  // abort shape so the runtime can distinguish it from a network outage and
+  // callers can retry without translating it through a generic transport
+  // failure.
+  if (code === 'ABORT_ERR' || error?.name === 'AbortError') return error;
   if (code === 'ENOTFOUND' || code === 'EAI_AGAIN' || code === 'EAI_FAIL') {
     return new ControllerTransportError('DNS_FAILURE', 'The server name could not be resolved.', {
       cause: error,
@@ -209,6 +214,7 @@ function classifyTransportError(error, origin) {
   return new ControllerTransportError('REQUEST_FAILED', 'The request to the server failed.', {
     cause: error,
     origin,
+    statusCode: error?.statusCode,
   });
 }
 
@@ -234,7 +240,13 @@ function exactTargetUrl(origin, value, websocket = false) {
   return url;
 }
 
-function connectTls({ origin, ca, timeoutMs, tlsConnect }) {
+function abortedRequestError() {
+  const error = Object.assign(new Error('The request was aborted.'), { code: 'ABORT_ERR' });
+  error.name = 'AbortError';
+  return error;
+}
+
+function connectTls({ origin, ca, timeoutMs, tlsConnect, signal }) {
   const target = new URL(origin);
   const options = {
     host: target.hostname,
@@ -245,12 +257,23 @@ function connectTls({ origin, ca, timeoutMs, tlsConnect }) {
   };
 
   return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(abortedRequestError());
+      return;
+    }
     let settled = false;
     let socket;
+    const abort = () => {
+      const error = abortedRequestError();
+      socket?.destroy(error);
+      finishError(error);
+    };
+    const cleanup = () => signal?.removeEventListener?.('abort', abort);
     const finishError = (error) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      cleanup();
       reject(classifyTransportError(error, origin));
     };
     const timer = setTimeout(() => {
@@ -267,6 +290,7 @@ function connectTls({ origin, ca, timeoutMs, tlsConnect }) {
           const fingerprint256 = peerFingerprint256(certificate);
           settled = true;
           clearTimeout(timer);
+          cleanup();
           // Keep the now-inert error listener during the short interval between
           // certificate verification and handing the socket to HTTPS/ws. A
           // disconnect in that interval must become a request failure, not an
@@ -284,6 +308,7 @@ function connectTls({ origin, ca, timeoutMs, tlsConnect }) {
         }
       });
       socket.once('error', finishError);
+      signal?.addEventListener?.('abort', abort, { once: true });
     } catch (error) {
       finishError(error);
     }
@@ -329,17 +354,25 @@ function oneShotAgent(socket) {
   return agent;
 }
 
-function requestWithSocket({ requestImpl, url, method, headers, body, socket, timeoutMs }) {
+function requestWithSocket({ requestImpl, url, method, headers, body, socket, timeoutMs, signal }) {
   return new Promise((resolve, reject) => {
     const agent = oneShotAgent(socket);
     let request;
     let settled = false;
+    const abort = () => request?.destroy(abortedRequestError());
+    const cleanup = () => signal?.removeEventListener?.('abort', abort);
     const fail = (error) => {
       if (settled) return;
       settled = true;
+      cleanup();
       agent.destroy();
       reject(error);
     };
+    if (signal?.aborted) {
+      socket.destroy(abortedRequestError());
+      fail(abortedRequestError());
+      return;
+    }
     try {
       request = requestImpl(url, { method, headers, agent }, (response) => {
         if (settled) {
@@ -347,8 +380,10 @@ function requestWithSocket({ requestImpl, url, method, headers, body, socket, ti
           return;
         }
         settled = true;
+        cleanup();
         resolve(response);
       });
+      signal?.addEventListener?.('abort', abort, { once: true });
       request.once('error', fail);
       request.setTimeout?.(timeoutMs, () => {
         const error = Object.assign(new Error('HTTPS request timed out.'), { code: 'ETIMEDOUT' });
@@ -357,7 +392,14 @@ function requestWithSocket({ requestImpl, url, method, headers, body, socket, ti
       if (body === undefined || body === null) {
         request.end();
       } else if (body instanceof Readable || (body && typeof body.pipe === 'function')) {
+        const abortBody = () => request.destroy(Object.assign(new Error('The upload was aborted.'), { code: 'ECONNRESET' }));
         body.once?.('error', (error) => request.destroy(error));
+        body.once?.('aborted', abortBody);
+        request.once('close', () => {
+          if (!request.writableEnded && !body.destroyed) body.destroy?.();
+          body.removeListener?.('aborted', abortBody);
+          cleanup();
+        });
         body.pipe(request);
       } else {
         request.end(body);
@@ -468,12 +510,13 @@ function createControllerTransport(options = {}) {
   const createWebSocket = options.createWebSocket
     || ((url, protocols, wsOptions) => new WebSocket(url, protocols, wsOptions));
 
-  async function openApprovedSocket() {
+  async function openApprovedSocket(signal) {
     const connection = await connectTls({
       origin,
       ca: options.ca,
       timeoutMs,
       tlsConnect,
+      signal,
     });
     rejectInvalidCertificate(connection, origin, approvedFingerprint256);
     return connection;
@@ -504,7 +547,7 @@ function createControllerTransport(options = {}) {
 
   async function requestTarget(requestOptions = {}) {
     const url = exactTargetUrl(origin, requestOptions.url || requestOptions.path || '/');
-    const connection = await openApprovedSocket();
+    const connection = await openApprovedSocket(requestOptions.signal);
     try {
       const sourceHeaders = requestOptions.headers || {};
       const headers = sanitizeRequestHeaders(sourceHeaders, {
@@ -523,6 +566,7 @@ function createControllerTransport(options = {}) {
         body: requestOptions.body,
         socket: connection.socket,
         timeoutMs: requestOptions.timeoutMs || timeoutMs,
+        signal: requestOptions.signal,
       });
       if (requestOptions.useCookies !== false) {
         await setCookiesFromResponse(response, cookieSink, origin, url);

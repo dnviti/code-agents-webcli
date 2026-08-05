@@ -3,6 +3,7 @@
 const assert = require('node:assert');
 const {
   parseQualifiedSessionId,
+  qualifyOwnedAttachment,
   qualifyServerMessage,
   qualifySessionId,
   qualifySessionList,
@@ -103,6 +104,45 @@ describe('desktop controller protocol', function () {
       sessionId: message.sessionId,
       attachments: [{ url: `/api/sessions/${encodeURIComponent(qualifySessionId('other', 'same/id'))}/chat-attachments/image.png` }],
     }), /does not own/);
+  });
+
+  it('rejects upstream attachment capabilities outside the message session', function () {
+    const base = { type: 'chat_snapshot', sessionId: 'same/id' };
+    for (const url of [
+      '/api/sessions/other/chat-attachments/image.png',
+      '/api/sessions/same%2fid/chat-attachments/image.png',
+      `/api/sessions/${encodeURIComponent(qualifySessionId('remote', 'same/id'))}/chat-attachments/image.png`,
+      `/api/sessions/${encodeURIComponent(qualifySessionId('other', 'same/id'))}/chat-attachments/image.png`,
+    ]) {
+      assert.throws(() => qualifyServerMessage('remote', {
+        ...base, attachments: [{ url }],
+      }), /attachment URL|qualified session id/i);
+    }
+    assert.throws(() => qualifyServerMessage('remote', {
+      type: 'chat_snapshot', attachments: [{ url: '/api/sessions/same%2Fid/chat-attachments/image.png' }],
+    }), /message session/i);
+  });
+
+  it('accepts only the exact uploaded session capability from a target', function () {
+    const value = qualifyOwnedAttachment('remote', 'same/id', {
+      url: '/api/sessions/same%2Fid/chat-attachments/stored-image.png',
+      name: 'image.png', mime: 'image/png', size: 3,
+    });
+    const qualifiedId = decodeURIComponent(/^\/api\/sessions\/([^/]+)/.exec(value.url)[1]);
+    assert.deepStrictEqual(parseQualifiedSessionId(qualifiedId), {
+      serverId: 'remote', sessionId: 'same/id',
+    });
+    for (const url of [
+      'http://127.0.0.1:9999/private',
+      '/api/sessions/other/chat-attachments/stored-image.png',
+      `/api/sessions/${encodeURIComponent(qualifySessionId('other', 'same/id'))}/chat-attachments/stored-image.png`,
+      '/api/sessions/same%2Fid/chat-attachments/stored-image.png?target=other',
+      '/api/sessions/same%2Fid/chat-attachments/%2Fetc',
+    ]) {
+      assert.throws(() => qualifyOwnedAttachment('remote', 'same/id', {
+        url, name: 'image.png', mime: 'image/png', size: 3,
+      }), /attachment URL/i);
+    }
   });
 
   it('rejects cross-server writes while allowing a visual order to split locally', function () {

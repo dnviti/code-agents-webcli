@@ -136,7 +136,7 @@ exists: enter a valid name and email before confirming the recipe.
 | --- | --- | --- |
 | Owner home | Agent sign-ins, personal skills/settings, connected hosts, shell configuration, user-installed tooling, mise data and cache | Survives every container, project rebuild and reclaim for that owner. |
 | Project overlay (`/opt/code-agents-project`) | App-generated project settings and project-only additions | Survives that project's rebuild/reclaim; is mounted only into that project and is deleted with it. |
-| Workspace (`/workspace`) | Repository checkout and repository-carried agent files | Disposable; rebuilt from the inspected revision, with the preservation gate described above. |
+| Workspace (`/workspace`) | Root-level `.cc-web` session archive plus the repository checkout and repository-carried agent files | `.cc-web` survives rebuild/reclaim by being atomically staged outside the container-writable project root and restored as the same verified directory inode; other workspace contents are disposable and rebuilt from the inspected revision, with the preservation gate described above. |
 | Container/image outside those mounts | Operating-system and temporary container state | Disposable. |
 
 The owner home and project overlay must be reachable by both the server and the
@@ -147,6 +147,14 @@ same ReadWriteMany storage planning described in
 [Per-user environments](user-environments.md#storage-on-kubernetes); its pod
 UID/GID and `fsGroup` are aligned so the shared paths retain the same ownership
 semantics.
+
+The `.cc-web` staging slot has a deterministic name beside the project root, so
+a crash can be recovered without scanning or choosing between archives. Startup
+quiesces the managed runtime before restoring that plaintext archive. A failed
+or conflicting restore leaves the staged inode authoritative and the project
+unavailable; it never falls back to a new archive or installation-level session
+storage. See [What survives a rebuild](projects.md#what-survives-a-rebuild) for
+the complete lifecycle sequence.
 
 ## Storage usage and reclaiming space
 

@@ -3,6 +3,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { ChatStore } = require('../dist/server/chat/store.js');
+const safeSessionFiles = require('../dist/server/services/safe-session-file.js');
 
 function loadFixture(name) {
   const file = path.join(__dirname, 'fixtures', 'chat', name);
@@ -372,21 +373,21 @@ describe('ChatStore', function () {
 
       const base = path.join(dir, '1', 's1');
       const idxSizeBefore = fs.statSync(`${base}.idx`).size;
-      const originalAppendFile = fs.promises.appendFile;
+      const originalAppendFile = safeSessionFiles.appendSessionFile;
       let injected = false;
 
-      fs.promises.appendFile = async function (file, ...args) {
+      safeSessionFiles.appendSessionFile = async function (file, ...args) {
         if (!injected && String(file) === `${base}.idx`) {
           injected = true;
           throw new Error('injected index append failure');
         }
-        return originalAppendFile.call(fs.promises, file, ...args);
+        return originalAppendFile(file, ...args);
       };
 
       try {
         await assert.doesNotReject(() => store.append(session, makeEvents(4, 2)));
       } finally {
-        fs.promises.appendFile = originalAppendFile;
+        safeSessionFiles.appendSessionFile = originalAppendFile;
       }
 
       assert.strictEqual(injected, true, 'the index append failure must have been exercised');
@@ -431,27 +432,26 @@ describe('ChatStore', function () {
       const session = { id: 's1', ownerUserId: 1 };
       await store.append(session, makeEvents(1, 3));
       const base = path.join(dir, '1', 's1');
-      const originalAppendFile = fs.promises.appendFile;
+      const originalAppendFile = safeSessionFiles.appendSessionFile;
       let injected = false;
 
-      fs.promises.appendFile = async function (file, data, ...args) {
+      safeSessionFiles.appendSessionFile = async function (file, data, ...args) {
         if (!injected && String(file) === `${base}.jsonl`) {
           injected = true;
           const bytes = Buffer.from(String(data), 'utf8');
-          await originalAppendFile.call(
-            fs.promises,
+          await originalAppendFile(
             file,
             bytes.subarray(0, Math.max(1, Math.floor(bytes.length / 2))),
           );
           throw new Error('injected partial log append');
         }
-        return originalAppendFile.call(fs.promises, file, data, ...args);
+        return originalAppendFile(file, data, ...args);
       };
 
       try {
         await assert.rejects(() => store.append(session, makeEvents(4, 2)), /partial log append/);
       } finally {
-        fs.promises.appendFile = originalAppendFile;
+        safeSessionFiles.appendSessionFile = originalAppendFile;
       }
 
       await store.append(session, makeEvents(4, 2));
@@ -1219,6 +1219,25 @@ describe('ChatStore', function () {
 
       const page = await store.read({ id: 'gone', ownerUserId: 1 }, 1, 10);
       assert.deepStrictEqual(page.events, []);
+    });
+  });
+
+  describe('workspace-local storage', function () {
+    it('keeps chat artefacts in an owner-isolated workspace session directory across a cold read', async function () {
+      const first = { id: 'same-id', ownerUserId: 1, storageRoot: dir, ownerKey: 'account-a' };
+      const second = { id: 'same-id', ownerUserId: 2, storageRoot: dir, ownerKey: 'account-b' };
+      await store.append(first, makeEvents(1, 1));
+      await store.append(second, makeEvents(1, 1, 10));
+
+      const firstBase = path.join(dir, '.cc-web', 'sessions', 'account-a', 'same-id', 'chat');
+      const secondBase = path.join(dir, '.cc-web', 'sessions', 'account-b', 'same-id', 'chat');
+      assert.ok(fs.existsSync(`${firstBase}.jsonl`));
+      assert.ok(fs.existsSync(`${secondBase}.jsonl`));
+      assert.ok(fs.existsSync(path.join(dir, '.cc-web', '.gitignore')));
+
+      const reopened = new ChatStore({ storageDir: path.join(dir, 'legacy-server-store') });
+      assert.deepStrictEqual((await reopened.read(first, 1, 10)).events.map((event) => event.ts), [0]);
+      assert.deepStrictEqual((await reopened.read(second, 1, 10)).events.map((event) => event.ts), [10]);
     });
   });
 });

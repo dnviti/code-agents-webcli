@@ -366,6 +366,21 @@ export interface ImageBlock {
   alt?: string;
 }
 
+/**
+ * A file uploaded with a user turn.
+ *
+ * Kept distinct from an image emitted by a runtime: an attachment is a stored
+ * workspace artefact the user can fetch back, regardless of its media type.
+ * The bytes remain in `.cc-web`; only their canonical session URL is recorded.
+ */
+export interface AttachmentBlock {
+  kind: 'attachment';
+  mime: string;
+  url: string;
+  name: string;
+  size: number;
+}
+
 export interface PlanBlock {
   kind: 'plan';
   items: PlanItem[];
@@ -431,6 +446,7 @@ export type ChatBlock =
   | ThinkingBlock
   | ToolBlock
   | ImageBlock
+  | AttachmentBlock
   | PlanBlock
   | ErrorBlock
   | NoticeBlock

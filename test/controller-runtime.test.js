@@ -137,6 +137,36 @@ describe('desktop controller runtime', function () {
     assert.strictEqual(targets[1].identity.serverName, 'Build host');
   });
 
+  it('keeps Local computer ready when a downstream caller cancels one request', async function () {
+    let attempts = 0;
+    const runtime = createControllerRuntime({
+      catalog,
+      electronSessions: sessions,
+      createLocalTransport: () => ({
+        requestTarget: ({ signal }) => {
+          attempts += 1;
+          if (attempts > 1) return Promise.resolve(response({ retried: true }));
+          return new Promise((_resolve, reject) => {
+            signal.addEventListener('abort', () => reject(Object.assign(new Error('cancelled'), {
+              name: 'AbortError', code: 'ABORT_ERR',
+            })), { once: true });
+          });
+        },
+      }),
+    });
+    runtime.attachLocal({ origin: 'http://127.0.0.1:1', auth: { name: 'ignored', value: 'ignored' } });
+    const controller = new AbortController();
+    const pending = runtime.request('local', { path: '/api/config', signal: controller.signal });
+    controller.abort();
+    await assert.rejects(pending, (error) => error.code === 'ABORT_ERR');
+    assert.strictEqual(runtime.listTargets()[0].status, 'ready');
+    const retry = await runtime.request('local', { path: '/api/config' });
+    assert.strictEqual(retry.statusCode, 200);
+    retry.resume();
+    assert.strictEqual(runtime.listTargets()[0].status, 'ready');
+    assert.strictEqual(attempts, 2);
+  });
+
   it('never saves an unrelated or unapproved-certificate add and persists only after exact approval', async function () {
     const bad = new ControllerTransportError('UNRELATED_RESPONSE', 'Not CODE AGENTS');
     const tls = new ControllerTransportError('TLS_CERTIFICATE', 'Invalid certificate', {
@@ -646,6 +676,95 @@ describe('local controller transport', function () {
         () => transport.requestTarget({ path: 'http://127.0.0.1:1/steal' }),
         /crossed its server boundary/,
       );
+    } finally {
+      await new Promise((resolve) => server.close(resolve));
+    }
+  });
+
+  it('streams binary local uploads without changing their type or declared length', async function () {
+    const seen = {};
+    const server = http.createServer(async (req, res) => {
+      const chunks = [];
+      for await (const chunk of req) chunks.push(Buffer.from(chunk));
+      seen.bytes = Buffer.concat(chunks);
+      seen.type = req.headers['content-type'];
+      seen.length = req.headers['content-length'];
+      res.statusCode = 201;
+      res.end('stored');
+    });
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+    try {
+      const address = server.address();
+      const bytes = Buffer.from([0, 255, 1, 254, 2, 3, 4]);
+      const transport = createLocalControllerTransport({
+        origin: `http://127.0.0.1:${address.port}`,
+        auth: { name: 'desktop_auth', value: 'secret' },
+      });
+      const response = await transport.requestTarget({
+        path: '/api/sessions/raw%2Fid/chat-attachments', method: 'POST',
+        headers: { 'content-type': 'image/png', 'content-length': String(bytes.length) },
+        body: Readable.from([bytes.subarray(0, 3), bytes.subarray(3)]),
+      });
+      assert.strictEqual(response.statusCode, 201);
+      await new Promise((resolve) => { response.resume(); response.once('end', resolve); });
+      assert.deepStrictEqual(seen.bytes, bytes);
+      assert.strictEqual(seen.type, 'image/png');
+      assert.strictEqual(seen.length, String(bytes.length));
+    } finally {
+      await new Promise((resolve) => server.close(resolve));
+    }
+  });
+
+  it('makes only exact-local absolute redirects origin-relative', async function () {
+    let localOrigin;
+    const server = http.createServer((req, res) => {
+      res.statusCode = 302;
+      res.setHeader('location', req.url === '/local'
+        ? `${localOrigin}/next?value=1#result`
+        : 'https://outside.example/steal');
+      res.end();
+    });
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+    try {
+      const address = server.address();
+      localOrigin = `http://127.0.0.1:${address.port}`;
+      const transport = createLocalControllerTransport({
+        origin: localOrigin,
+        auth: { name: 'desktop_auth', value: 'secret' },
+      });
+      const local = await transport.requestTarget({ path: '/local' });
+      assert.strictEqual(local.headers.location, '/next?value=1#result');
+      local.resume();
+      const external = await transport.requestTarget({ path: '/external' });
+      assert.strictEqual(external.headers.location, 'https://outside.example/steal');
+      external.resume();
+    } finally {
+      await new Promise((resolve) => server.close(resolve));
+    }
+  });
+
+  it('aborts a request that is still waiting for local response headers', async function () {
+    let requestReceived;
+    const received = new Promise((resolve) => { requestReceived = resolve; });
+    let requestClosed;
+    const closed = new Promise((resolve) => { requestClosed = resolve; });
+    const server = http.createServer((req) => {
+      requestReceived();
+      req.once('close', requestClosed);
+    });
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+    try {
+      const address = server.address();
+      const transport = createLocalControllerTransport({
+        origin: `http://127.0.0.1:${address.port}`,
+        auth: { name: 'desktop_auth', value: 'secret' },
+      });
+      const controller = new AbortController();
+      const pending = transport.requestTarget({ path: '/api/config', signal: controller.signal });
+      await received;
+      controller.abort();
+      await assert.rejects(pending, (error) => error.code === 'ABORT_ERR');
+      await closed;
     } finally {
       await new Promise((resolve) => server.close(resolve));
     }

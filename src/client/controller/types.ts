@@ -59,3 +59,22 @@ export interface DiscoveredServerCandidate {
   capabilities?: string[];
   compatibility?: ServerCompatibilityStatus;
 }
+
+/** Renderer-safe phone access state. Pairing URLs are short-lived capabilities. */
+export type PhoneAccessState = 'off' | 'starting' | 'running' | 'error' | 'unavailable';
+export type PhoneAccessMode = 'lan' | 'tailscale' | 'both';
+export interface PhoneAccessInterface { name: string; address: string; family?: string; origin?: string; }
+export interface PhoneAccessDevice { id: string; label?: string; origin?: string; lastSeen?: string | number; }
+export interface PhoneAccessStatus {
+  state: PhoneAccessState;
+  available: boolean;
+  mode?: PhoneAccessMode;
+  port?: number;
+  interfaces: PhoneAccessInterface[];
+  origins: { lan?: string; tailscale?: string };
+  pairing?: { url: string; expiresAt?: string | number; origin?: string };
+  devices: PhoneAccessDevice[];
+  ca?: { downloadUrl?: string; fingerprint?: string };
+  tailscale?: { installed?: boolean; online?: boolean; serve?: boolean; funnel?: boolean; origin?: string; message?: string };
+  error?: string;
+}

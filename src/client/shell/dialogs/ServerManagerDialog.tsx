@@ -27,6 +27,8 @@ export interface ServerManagerDialogProps {
   onRequireValidCertificate?(id: string): void;
   onFindServers?(): void;
   onAddCandidate?(candidate: DiscoveredServerCandidate): void;
+  /** Available only to the installed desktop controller's permanent local target. */
+  onOpenPhoneAccess?(): void;
 }
 
 export interface ServerManagerMutationResult {
@@ -362,6 +364,9 @@ export function ServerManagerDialog(props: ServerManagerDialogProps): React.JSX.
                   </div>
 
                   <div style={{ display: 'flex', gap: isPhone ? TOUCH_GAP : 6, flexWrap: 'wrap' }}>
+                    {isLocal && props.onOpenPhoneAccess ? (
+                      <Button size="sm" variant="secondary" onClick={props.onOpenPhoneAccess}>Open on phone</Button>
+                    ) : null}
                     {target.canRetry ? (
                       <Button
                         size="sm"

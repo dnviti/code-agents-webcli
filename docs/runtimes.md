@@ -609,6 +609,17 @@ A **branch** opens on the model its source was actually running, for the same
 reason: the context estimate that decided whether the branch fits was measured
 against that model's window.
 
+Every app-owned attachment carried by the selected history is copied into the
+branch's own owner/session namespace before its log and session record are
+committed; carried URLs are rewritten to those new bytes. The copy is accepted
+only when two bounded reads agree on file identity, size, content hash and serve
+metadata, so deleting the source conversation cannot break the branch. In a
+managed project, the whole operation—including compensating cleanup—holds the
+project's no-start workspace lifecycle gate; branching does not start or rebuild
+a stopped project. If durable rollback or an artifact cleanup cannot be proved,
+the API returns the retained branch id with `recoveryPending` and preserves the
+ambiguous data for recovery instead of deleting it speculatively.
+
 Two deliberate omissions. A **terminal** session takes no standing choice: it
 runs the CLI's own interface, where the model is yours to change inside the tool
 and nothing here could keep a preference in step with it. (A profile's model and
@@ -1136,9 +1147,23 @@ the control on that.
 
 ## Working directories
 
-A session runs in the folder you pick, and that folder is what the session
-record, the transcript and pasted-image paths all refer to. The file browser is
-bounded by the working directory chosen during
+A session runs in the folder you pick, and its record and runtime paths continue
+to name that working directory. Separately, the session receives an immutable
+storage scope when it is created. A normal host session uses the validated
+folder from the launcher; a managed-project session uses the canonical project
+workspace even when it runs in a subfolder or a container-only path; a child
+shell inherits its owning conversation's scope. Changing cwd later therefore
+does not move a conversation between archives.
+
+Session/tab state, conversation events and indexes, Plan and question state,
+terminal transcript and history, paste metadata, and per-turn usage are kept
+under that scope's `.cc-web/`. The server combines authorised workspace
+databases for account-wide tab, conversation and usage views, and lazy-loads an
+authorised folder when it is opened. See [Where state
+lives](configuration.md#where-state-lives) for the layout, migration and backup
+requirements.
+
+The file browser is bounded by the working directory chosen during
 [setup](configuration.md#first-run-setup) — only that directory and its
 subdirectories are reachable.
 

@@ -79,6 +79,7 @@ export function blockDraws(block: ChatBlock): boolean {
       return block.text.trim().length > 0;
     case 'question':
       return block.request.question.trim().length > 0;
+    case 'attachment':
     case 'image':
     case 'error':
       return true;

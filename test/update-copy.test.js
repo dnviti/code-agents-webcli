@@ -87,11 +87,17 @@ describe('describeUpdate', function () {
     assert.match(view.text, /docker pull/);
   });
 
-  it('points a desktop install at release installers', function () {
-    const view = describeUpdate(response({ mode: 'desktop', canTrigger: false }));
+  it('hides stale embedded-desktop server statuses', function () {
+    const view = describeUpdate(response({
+      mode: 'desktop',
+      canTrigger: false,
+      running: true,
+      runnerState: 'restarting',
+      interrupted: { startedAt: 1, targetSha: 'b'.repeat(40) },
+    }));
     assert.strictEqual(view.action, null);
-    assert.match(view.text, /newer desktop build/);
-    assert.match(view.text, /github\.com\/dnviti\/code-agents-webcli\/releases/);
+    assert.strictEqual(view.visible, false);
+    assert.strictEqual(view.text, '');
   });
 
   it('points a source checkout at git pull', function () {

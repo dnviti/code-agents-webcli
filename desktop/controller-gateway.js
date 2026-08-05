@@ -5,12 +5,13 @@ const fs = require('node:fs');
 const http = require('node:http');
 const net = require('node:net');
 const path = require('node:path');
-const { Readable } = require('node:stream');
+const { Readable, Transform } = require('node:stream');
 const WebSocket = require('ws');
 
 const {
   parseQualifiedSessionId,
   qualifyAttachmentUrls,
+  qualifyOwnedAttachment,
   qualifyServerMessage,
   qualifySessionId,
   qualifySessionList,
@@ -22,6 +23,10 @@ const CONTROLLER_AUTH_HEADER = 'x-code-agents-controller-auth';
 const CONTROLLER_HEADER = 'x-controller-server-id';
 const MAX_ROUTING_BODY = 1024 * 1024;
 const MAX_AGGREGATE_BODY = 16 * 1024 * 1024;
+// Keep the desktop boundary aligned with the server attachment store.  This
+// is deliberately separate from MAX_ROUTING_BODY: attachment bytes are never
+// routing JSON and must not be buffered just to select their owner.
+const MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024;
 const DEFAULT_UPSTREAM_RECONNECT_MS = 5_000;
 const HOP_BY_HOP = new Set([
   'connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization',
@@ -180,6 +185,11 @@ function proxyResponseHeaders(headers = {}) {
     if (!name || HOP_BY_HOP.has(name) || connectionTokens.has(name) || name === 'set-cookie' || name === 'location') continue;
     result[name] = value;
   }
+  // Every proxied API payload is server-owned state. In Electron, accepting an
+  // upstream cache policy could persist conversations, attachment bytes, or
+  // workspace content beneath installation-level userData. Explicit downloads
+  // still work; only the implicit Chromium cache is disabled.
+  result['cache-control'] = 'no-store';
   return result;
 }
 
@@ -187,6 +197,105 @@ function bodyStream(body) {
   if (body == null) return Readable.from([]);
   if (typeof body.pipe === 'function') return body;
   return Readable.from([Buffer.isBuffer(body) ? body : Buffer.from(String(body))]);
+}
+
+function isAttachmentUpload(method, pathname) {
+  return method === 'POST' && /^\/api\/sessions\/[^/]+\/chat-attachments$/.test(pathname);
+}
+
+function declaredBodyLength(headers) {
+  const value = headers['content-length'];
+  if (value === undefined) return null;
+  if (Array.isArray(value) || !/^\d+$/.test(value)) {
+    const error = new Error('Content-Length must be a non-negative integer');
+    error.statusCode = 400;
+    throw error;
+  }
+  const length = Number(value);
+  if (!Number.isSafeInteger(length)) {
+    const error = new Error('Content-Length is too large');
+    error.statusCode = 413;
+    throw error;
+  }
+  return length;
+}
+
+function boundedAttachmentBody(body, headers, onLimit) {
+  const declared = declaredBodyLength(headers);
+  if (declared !== null && declared > MAX_ATTACHMENT_BYTES) {
+    const error = new Error('Attachment exceeds the 20 MiB limit');
+    error.statusCode = 413;
+    throw error;
+  }
+  // Chunked requests have no Content-Length. Count them while piping so the
+  // limit holds without collecting their bytes or defeating backpressure.
+  let length = 0;
+  const bounded = new Transform({
+    transform(chunk, _encoding, callback) {
+      length += chunk.length;
+      if (length > MAX_ATTACHMENT_BYTES) {
+        const error = new Error('Attachment exceeds the 20 MiB limit');
+        error.statusCode = 413;
+        callback(error);
+        onLimit?.(error);
+        return;
+      }
+      callback(null, chunk);
+    },
+  });
+  // pipe() deliberately does not forward source failures.  Preserve the
+  // browser abort all the way to the selected local/remote transport instead
+  // of leaving a bounded transform waiting forever.
+  const abort = () => bounded.destroy(Object.assign(new Error('The upload was aborted.'), { code: 'ECONNRESET' }));
+  const fail = (error) => bounded.destroy(error);
+  const cleanup = () => {
+    body.removeListener?.('aborted', abort);
+    body.removeListener?.('error', fail);
+  };
+  body.once?.('aborted', abort);
+  body.once?.('error', fail);
+  bounded.once('close', cleanup);
+  const completion = new Promise((resolve, reject) => {
+    let settled = false;
+    bounded.once('end', () => {
+      settled = true;
+      resolve({ complete: true, length });
+    });
+    bounded.once('error', (error) => {
+      settled = true;
+      reject(error);
+    });
+    // Both controller transports destroy an upload body when an upstream
+    // rejects before consuming it. A destroyed Transform emits `close` but
+    // neither `end` nor (necessarily) `error`; make that state explicit rather
+    // than leaving the gateway waiting forever.
+    bounded.once('close', () => {
+      if (settled) return;
+      settled = true;
+      resolve({ complete: false, length });
+    });
+  });
+  body.pipe(bounded);
+  const cancel = (error) => {
+    body.unpipe?.(bounded);
+    if (!bounded.destroyed) bounded.destroy(error);
+    // The gateway still owes the renderer an HTTP error response. Drain any
+    // bytes already in flight instead of leaving the socket backpressured on a
+    // transform whose target failed before it began consuming the upload.
+    body.resume?.();
+  };
+  return { body: bounded, completion, cancel };
+}
+
+function pipeResponseBody(source, res) {
+  const body = bodyStream(source);
+  const abortUpstream = () => {
+    if (!res.writableEnded) body.destroy();
+  };
+  res.once('close', abortUpstream);
+  body.once('error', (error) => res.destroy(error));
+  body.once('end', () => res.removeListener('close', abortUpstream));
+  body.pipe(res);
 }
 
 async function readBody(req, limit = MAX_ROUTING_BODY) {
@@ -299,6 +408,7 @@ function createControllerGateway(options = {}) {
   const {
     publicDir,
     controller,
+    phoneAccess = null,
     host = '127.0.0.1',
     randomBytes = crypto.randomBytes,
     port = 0,
@@ -344,14 +454,19 @@ function createControllerGateway(options = {}) {
 
   const server = http.createServer((req, res) => {
     void handleRequest(req, res).catch((error) => {
+      if (res.destroyed) return;
       if (res.headersSent) {
         res.destroy(error);
         return;
       }
-      json(res, error.statusCode || 502, {
-        error: error.statusCode === 400 ? 'invalid_request' : 'controller_request_failed',
+      const statusCode = error.statusCode || 502;
+      json(res, statusCode, {
+        error: statusCode === 400
+          ? 'invalid_request'
+          : statusCode === 413 ? 'file_too_large' : 'controller_request_failed',
         message: errorMessage(error),
-      });
+        ...(statusCode === 413 ? { limitBytes: MAX_ATTACHMENT_BYTES } : {}),
+      }, statusCode === 413 ? { connection: 'close' } : undefined);
     });
   });
   const wss = new WebSocket.Server({ noServer: true, clientTracking: false });
@@ -452,6 +567,56 @@ function createControllerGateway(options = {}) {
   }
 
   async function handleControllerAction(req, res, url) {
+    const phoneRoute = [
+      ['GET', /^\/api\/controller\/phone-access$/, 'status'],
+      ['GET', /^\/api\/controller\/phone-access\/ca$/, 'exportCa'],
+      ['POST', /^\/api\/controller\/phone-access\/start$/, 'start'],
+      ['POST', /^\/api\/controller\/phone-access\/pairing$/, 'createPairing'],
+      ['DELETE', /^\/api\/controller\/phone-access\/devices\/([^/]+)$/, 'revoke'],
+      ['DELETE', /^\/api\/controller\/phone-access$/, 'stop'],
+      ['POST', /^\/api\/controller\/phone-access\/tailscale\/check$/, 'checkTailscale'],
+      ['POST', /^\/api\/controller\/phone-access\/tailscale-origin$/, 'setTailscaleOrigin'],
+    ].map(([method, pattern, action]) => {
+      const match = pattern.exec(url.pathname);
+      return method === req.method && match ? { action, match } : null;
+    }).find(Boolean);
+    if (phoneRoute) {
+      if (!phoneAccess || typeof phoneAccess[phoneRoute.action] !== 'function') {
+        json(res, 501, { error: 'phone_access_unavailable', message: 'Phone access is unavailable in this desktop build.' });
+        return;
+      }
+      if (phoneRoute.action === 'exportCa') {
+        const certificate = await phoneAccess.exportCa();
+        if (!Buffer.isBuffer(certificate)) throw new TypeError('The phone-access CA export is invalid.');
+        res.writeHead(200, {
+          'content-type': 'application/x-x509-ca-cert',
+          'content-disposition': 'attachment; filename="code-agents-webcli-ca.crt"',
+          'content-length': String(certificate.length),
+          'cache-control': 'no-store',
+          'x-content-type-options': 'nosniff',
+        });
+        res.end(certificate);
+        return;
+      }
+      const buffer = req.method === 'GET' ? Buffer.alloc(0) : await readBody(req);
+      const input = buffer.length ? parseJsonBody(buffer) : {};
+      let deviceId;
+      if (phoneRoute.match[1]) {
+        try {
+          deviceId = decodeURIComponent(phoneRoute.match[1]);
+        } catch {
+          throw Object.assign(new Error('The phone device id is malformed.'), { statusCode: 400 });
+        }
+      }
+      const result = phoneRoute.action === 'revoke'
+        ? await phoneAccess.revoke(deviceId)
+        : phoneRoute.action === 'setTailscaleOrigin'
+          ? await phoneAccess.setTailscaleOrigin(input.origin)
+          : await phoneAccess[phoneRoute.action](input);
+      json(res, 200, result && typeof result === 'object' ? result : { success: true });
+      return;
+    }
+
     const routes = [
       ['POST', /^\/api\/controller\/targets\/test$/, 'test'],
       ['POST', /^\/api\/controller\/targets$/, 'add'],
@@ -640,6 +805,7 @@ function createControllerGateway(options = {}) {
     if (!parsed) return { error: 'unqualified' };
     return {
       serverId: parsed.serverId,
+      sessionId: parsed.sessionId,
       pathname: `/api/${match[1]}/${encodeURIComponent(parsed.sessionId)}${match[3] || ''}`,
     };
   }
@@ -744,34 +910,134 @@ function createControllerGateway(options = {}) {
     const upstreamPath = `${pathname}${url.search}`;
     const headers = proxyRequestHeaders(req.headers);
     if (buffer) headers['content-length'] = String(buffer.length);
-    const upstream = await controller.request(serverId, {
-      method: req.method,
-      path: upstreamPath,
-      headers,
-      body: buffer || req,
-    });
+    const attachmentUpload = isAttachmentUpload(req.method, pathname);
+    const requestAbort = attachmentUpload ? new AbortController() : null;
+    let attachmentLimitError = null;
+    const abortUpstream = () => requestAbort?.abort();
+    const rejectAttachmentLimit = (error) => {
+      attachmentLimitError = error;
+      abortUpstream();
+    };
+    const abortOnResponseClose = () => {
+      if (!res.writableEnded) abortUpstream();
+    };
+    if (requestAbort) {
+      req.once('aborted', abortUpstream);
+      res.once('close', abortOnResponseClose);
+      if (req.aborted) abortUpstream();
+    }
+    // Do not consume a raw attachment to route it.  The qualified path above
+    // already identifies its one owner; this transform only enforces the
+    // canonical 20 MiB limit as bytes flow to that owner.
+    const boundedUpload = attachmentUpload
+      ? boundedAttachmentBody(req, req.headers, rejectAttachmentLimit)
+      : null;
+    // The remote transport may still be proving TLS/cookies when the renderer
+    // disconnects and the body rejects. Observe that rejection immediately;
+    // a later explicit await still receives it for accepted (2xx) uploads.
+    const observedUploadCompletion = boundedUpload?.completion.catch(() => undefined);
+    const requestBody = buffer || boundedUpload?.body || req;
+    let upstream;
+    try {
+      try {
+        upstream = await controller.request(serverId, {
+          method: req.method,
+          path: upstreamPath,
+          headers,
+          body: requestBody,
+          ...(requestAbort ? { signal: requestAbort.signal } : {}),
+        });
+        if (attachmentLimitError) throw attachmentLimitError;
+        if (boundedUpload) {
+          const statusCode = upstream.statusCode || 502;
+          if (statusCode >= 200 && statusCode < 300) {
+            const completed = await boundedUpload.completion;
+            if (attachmentLimitError) throw attachmentLimitError;
+            if (!completed.complete) {
+              throw Object.assign(
+                new Error('The attachment server accepted an incomplete upload.'),
+                { statusCode: 502 },
+              );
+            }
+          } else {
+            // Authentication/session/quota middleware can reject from headers
+            // without reading a large file. Forward that exact response now;
+            // the transport/source close will settle in the background.
+            void observedUploadCompletion;
+          }
+        }
+      } catch (error) {
+        if (boundedUpload) {
+          boundedUpload.cancel(error);
+          await observedUploadCompletion;
+        }
+        throw attachmentLimitError || error;
+      }
+    } finally {
+      req.removeListener('aborted', abortUpstream);
+      res.removeListener('close', abortOnResponseClose);
+    }
 
     const rewritesJsonResponse = url.pathname === '/api/sessions/create'
       || url.pathname === '/api/sessions/resumable'
       || pathname.endsWith('/branch')
-      || (req.method === 'POST' && pathname.endsWith('/chat-attachments'));
+      || pathname.endsWith('/children')
+      // An accepted upload returns a small JSON descriptor whose attachment
+      // URL belongs in the renderer's qualified namespace.  Error bodies are
+      // opaque upstream bytes (often non-JSON) and must retain their status,
+      // content type, length, and payload exactly.
+      || (attachmentUpload && (upstream.statusCode || 502) >= 200 && (upstream.statusCode || 502) < 300);
     if (rewritesJsonResponse) {
       const responseBuffer = await collectResponse(upstream);
       let responseBody = responseBuffer;
+      let value;
+      let parsed = false;
       try {
-        const value = parseJsonBody(responseBuffer);
-        if ((url.pathname === '/api/sessions/create' || pathname.endsWith('/branch')) && typeof value.sessionId === 'string') {
-          value.sessionId = qualifySessionId(serverId, value.sessionId);
+        value = parseJsonBody(responseBuffer);
+        parsed = true;
+      } catch (error) {
+        if (attachmentUpload) {
+          throw Object.assign(
+            new Error('The attachment server returned an unsafe response.'),
+            { statusCode: 502, cause: error },
+          );
         }
-        if (url.pathname === '/api/sessions/resumable' && Array.isArray(value.conversations)) {
-          value.conversations = value.conversations.map((conversation) => (
-            conversation && typeof conversation === 'object' && typeof conversation.id === 'string'
-              ? { ...conversation, id: qualifySessionId(serverId, conversation.id), serverId, serverName: target.name }
-              : conversation
-          ));
+        // Preserve the historical tolerance for opaque/non-JSON bodies on the
+        // other rewritten endpoints. A valid JSON response is handled below,
+        // where unsafe capabilities are never allowed to fall back unchanged.
+      }
+      if (parsed) {
+        try {
+          let responseSessionId;
+          if ((url.pathname === '/api/sessions/create' || pathname.endsWith('/branch')) && typeof value.sessionId === 'string') {
+            responseSessionId = value.sessionId;
+            value.sessionId = qualifySessionId(serverId, value.sessionId);
+          }
+          if (url.pathname === '/api/sessions/resumable' && Array.isArray(value.conversations)) {
+            value.conversations = value.conversations.map((conversation) => (
+              conversation && typeof conversation === 'object' && typeof conversation.id === 'string'
+                ? { ...conversation, id: qualifySessionId(serverId, conversation.id), serverId, serverName: target.name }
+                : conversation
+            ));
+          }
+          if (pathname.endsWith('/children') && Array.isArray(value.sessionIds)) {
+            value.sessionIds = value.sessionIds.map((sessionId) =>
+              qualifySessionId(serverId, sessionId));
+          }
+          responseBody = encodeBody(
+            attachmentUpload
+              ? qualifyOwnedAttachment(serverId, sessionRoute.sessionId, value)
+              : qualifyAttachmentUrls(serverId, value, responseSessionId),
+          );
+        } catch (error) {
+          throw Object.assign(
+            new Error(attachmentUpload
+              ? 'The attachment server returned an unsafe response.'
+              : 'The target server returned an unsafe response.'),
+            { statusCode: 502, cause: error },
+          );
         }
-        responseBody = encodeBody(qualifyAttachmentUrls(serverId, value));
-      } catch { /* preserve a non-JSON upstream error */ }
+      }
       const headersOut = proxyResponseHeaders(upstream.headers);
       headersOut['content-length'] = String(responseBody.length);
       res.writeHead(upstream.statusCode || 502, headersOut);
@@ -779,7 +1045,7 @@ function createControllerGateway(options = {}) {
       return;
     }
     res.writeHead(upstream.statusCode || 502, proxyResponseHeaders(upstream.headers));
-    bodyStream(upstream.body ?? upstream).on('error', (error) => res.destroy(error)).pipe(res);
+    pipeResponseBody(upstream.body ?? upstream, res);
   }
 
   function minimalConfig(local) {
@@ -1065,6 +1331,7 @@ module.exports = {
   CONTROLLER_HEADER,
   CONTROLLER_AUTH_HEADER,
   DEFAULT_UPSTREAM_RECONNECT_MS,
+  MAX_ATTACHMENT_BYTES,
   MAX_AGGREGATE_BODY,
   createControllerGateway,
   isAttachedStreamMessage,

@@ -100,6 +100,21 @@ export interface ProjectsSessionApi {
     ownerUserId: number,
     projectId: string,
   ): { id: string; name?: string } | null;
+  /**
+   * Resolve the stable host root which owns project-scoped session storage.
+   * This is a pure catalog lookup: it must not start a runtime or acquire the
+   * lifecycle lock, so project deletion may call it while already exclusive.
+   */
+  projectWorkspaceRoot?(ownerUserId: number, projectId: string): string | null;
+  /**
+   * Run ordinary storage cleanup while holding the project's lifecycle gate.
+   * Unlike `ensureForSession`, this must neither start nor rebuild a project.
+   */
+  withProjectWorkspace?<T>(
+    ownerUserId: number,
+    projectId: string,
+    operation: (workspaceRoot: string) => Promise<T>,
+  ): Promise<T>;
   ensureForSession(
     ownerUserId: number,
     projectId: string,

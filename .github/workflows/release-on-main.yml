@@ -10,12 +10,15 @@ permissions:
   contents: read
 
 concurrency:
-  group: tagged-release-${{ github.ref }}
+  # GitHub Releases and Pages are shared stable feeds. Different version tags
+  # must never race each other while reading or replacing those global refs.
+  group: tagged-release-stable-feeds
   cancel-in-progress: false
 
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
+  FLATPAK_REPOSITORY_URL: https://dnviti.github.io/code-agents-webcli/flatpak/
 
 jobs:
   verify:
@@ -26,57 +29,109 @@ jobs:
       tag: ${{ steps.release.outputs.tag }}
       commit_sha: ${{ steps.release.outputs.commit_sha }}
       commit_date: ${{ steps.release.outputs.commit_date }}
-
+      resume_draft: ${{ steps.release.outputs.resume_draft }}
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: '24'
           cache: npm
-
       - name: Validate release tag and main ancestry
         id: release
         shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           VERSION="$(node -e 'process.stdout.write(require("./package.json").version)')"
-          EXPECTED_TAG="v${VERSION}"
-          if [ "$GITHUB_REF_TYPE" != "tag" ]; then
-            echo "Releases require a tag push; got $GITHUB_REF_TYPE $GITHUB_REF." >&2
+          if ! [[ "$VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "Stable feeds require an exact X.Y.Z semantic version; got $VERSION." >&2
             exit 1
           fi
-          if [ "$GITHUB_REF_NAME" != "$EXPECTED_TAG" ]; then
-            echo "Tag $GITHUB_REF_NAME does not match package.json version $VERSION; expected $EXPECTED_TAG." >&2
+          EXPECTED_TAG="v${VERSION}"
+          if [ "$GITHUB_REF_TYPE" != "tag" ] || [ "$GITHUB_REF_NAME" != "$EXPECTED_TAG" ]; then
+            echo "A release must be the matching v<package.json version> tag." >&2
             exit 1
           fi
           TAG_TARGET="$(git rev-parse "${GITHUB_REF_NAME}^{commit}")"
-          if [ "$(git rev-parse HEAD)" != "$TAG_TARGET" ]; then
-            echo "Checkout does not match the commit selected by $GITHUB_REF_NAME." >&2
-            exit 1
-          fi
+          test "$(git rev-parse HEAD)" = "$TAG_TARGET"
           git fetch origin main --no-tags --quiet
-          if ! git merge-base --is-ancestor "$TAG_TARGET" origin/main; then
-            echo "$GITHUB_REF_NAME points outside the main branch history." >&2
-            exit 1
+          git merge-base --is-ancestor "$TAG_TARGET" origin/main
+          gh api --paginate --slurp \
+            "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+            > "$RUNNER_TEMP/public-releases.json"
+          PUBLIC_RELEASES="$RUNNER_TEMP/public-releases.json" CANDIDATE_VERSION="$VERSION" node <<'NODE'
+          const fs = require('node:fs');
+          const pages = JSON.parse(fs.readFileSync(process.env.PUBLIC_RELEASES, 'utf8'));
+          const parse = (value) => {
+            const match = /^v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/.exec(String(value || ''));
+            return match ? match.slice(1).map(BigInt) : null;
+          };
+          const compare = (left, right) => {
+            for (let index = 0; index < 3; index += 1) {
+              if (left[index] !== right[index]) return left[index] > right[index] ? 1 : -1;
+            }
+            return 0;
+          };
+          const candidate = parse(`v${process.env.CANDIDATE_VERSION}`);
+          for (const release of pages.flat()) {
+            if (release.draft || release.prerelease) continue;
+            const published = parse(release.tag_name);
+            if (published && compare(candidate, published) <= 0) {
+              throw new Error(`Stable version ${process.env.CANDIDATE_VERSION} is not newer than public ${release.tag_name}.`);
+            }
+          }
+          NODE
+          release_status="$(curl --silent --show-error --location --proto '=https' --tlsv1.2 \
+            --output "$RUNNER_TEMP/existing-release.json" --write-out '%{http_code}' \
+            --header "Authorization: Bearer $GH_TOKEN" \
+            --header 'Accept: application/vnd.github+json' \
+            --header 'X-GitHub-Api-Version: 2022-11-28' \
+            "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/releases/tags/$EXPECTED_TAG")"
+          RESUME_DRAFT=false
+          case "$release_status" in
+            404) ;;
+            200)
+              RELEASE_FILE="$RUNNER_TEMP/existing-release.json" EXPECTED_TAG="$EXPECTED_TAG" \
+                EXPECTED_COMMIT="$TAG_TARGET" node <<'NODE'
+          const fs = require('node:fs');
+          const release = JSON.parse(fs.readFileSync(process.env.RELEASE_FILE, 'utf8'));
+          if (release.draft !== true || release.tag_name !== process.env.EXPECTED_TAG
+            || release.target_commitish !== process.env.EXPECTED_COMMIT) {
+            throw new Error('Only the exact unpublished draft from an interrupted promotion may be resumed.');
+          }
+          NODE
+              RESUME_DRAFT=true
+              ;;
+            *) echo "Could not prove release $EXPECTED_TAG is unused (HTTP $release_status)." >&2; exit 1 ;;
+          esac
+          {
+            echo "version=$VERSION"
+            echo "tag=$GITHUB_REF_NAME"
+            echo "commit_sha=$TAG_TARGET"
+            echo "commit_date=$(git show -s --format=%cI "$TAG_TARGET")"
+            echo "resume_draft=$RESUME_DRAFT"
+          } >> "$GITHUB_OUTPUT"
+      - name: Reject unapproved Flatpak permission expansion
+        shell: bash
+        env:
+          UPDATER_BRIDGE_TAG: ${{ vars.FLATPAK_UPDATER_BRIDGE_TAG }}
+        run: |
+          set -euo pipefail
+          previous="$(git tag --merged HEAD --sort=-version:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | grep -vx "$GITHUB_REF_NAME" | head -n1 || true)"
+          if [ -z "$previous" ]; then
+            echo 'No prior stable tag; Flatpak permission baseline is this release.'
+            exit 0
           fi
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "tag=$GITHUB_REF_NAME" >> "$GITHUB_OUTPUT"
-          echo "commit_sha=$TAG_TARGET" >> "$GITHUB_OUTPUT"
-          echo "commit_date=$(git show -s --format=%cI "$TAG_TARGET")" >> "$GITHUB_OUTPUT"
-
-      - name: Install dependencies
-        run: npm ci
-
-      - name: Typecheck
-        run: npm run typecheck
-
-      - name: Test
-        run: npm test
+          git show "$previous:electron-builder.yml" > "$RUNNER_TEMP/previous-electron-builder.yml"
+          node scripts/validate-flatpak-permissions.js \
+            "$RUNNER_TEMP/previous-electron-builder.yml" electron-builder.yml \
+            "$GITHUB_REF_NAME" "$UPDATER_BRIDGE_TAG"
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
 
   docker:
     name: Publish Docker image
@@ -85,35 +140,25 @@ jobs:
     permissions:
       contents: read
       packages: write
-
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ needs.verify.outputs.commit_sha }}
-
-      - name: Setup Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v3
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Compute Docker metadata
-        id: docker-meta
-        uses: docker/metadata-action@v5
+      - id: docker-meta
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
             type=raw,value=latest
             type=raw,value=${{ needs.verify.outputs.version }}
             type=raw,value=v${{ needs.verify.outputs.version }}
-
-      - name: Build and push Docker image
-        uses: docker/build-push-action@v6
+      - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: .
           push: true
@@ -125,230 +170,794 @@ jobs:
             BUILD_DATE=${{ needs.verify.outputs.commit_date }}
 
   desktop:
-    name: Build desktop (${{ matrix.label }})
+    name: Build signed desktop (${{ matrix.label }})
     needs: verify
     runs-on: ${{ matrix.os }}
+    environment: release
     strategy:
       fail-fast: false
       matrix:
         include:
           - os: ubuntu-latest
             label: Linux x64
-            args: --linux AppImage flatpak --x64
-            required: "*.AppImage *.flatpak"
-            package_count: 2
+            args: --linux AppImage flatpak --x64 --config.publish.channel=latest --config.forceCodeSigning=true
+            packages: 2
           - os: windows-latest
             label: Windows x64
-            args: --win nsis --x64
-            required: "*.exe"
-            package_count: 1
-          # Native runners matter here: @lydell/node-pty is selected by npm for
-          # the install host's architecture, so one cross-build job would put
-          # the wrong optional native package in one of the DMGs.
+            args: --win nsis --x64 --config.publish.channel=latest --config.forceCodeSigning=true
+            packages: 1
+          # These remain native builds because node-pty is selected for the
+          # build host. The channel names keep architecture feeds separate.
           - os: macos-15-intel
             label: macOS x64
-            args: --mac dmg --x64
-            required: "*.dmg"
-            package_count: 1
+            args: --mac dmg zip --x64 --config.publish.channel=latest-x64 --config.forceCodeSigning=true
+            packages: 1
           - os: macos-15
             label: macOS arm64
-            args: --mac dmg --arm64
-            required: "*.dmg"
-            package_count: 1
-
+            args: --mac dmg zip --arm64 --config.publish.channel=latest-arm64 --config.forceCodeSigning=true
+            packages: 1
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ needs.verify.outputs.commit_sha }}
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: '24'
           cache: npm
-
-      - name: Install dependencies
-        run: npm ci
-
-      # electron-builder's Flatpak target requires both tools and its selected
-      # Freedesktop runtime/SDK on the Linux build machine.
+      - run: npm ci
+      - name: Require Windows release identity
+        if: runner.os == 'Windows'
+        shell: bash
+        env:
+          WINDOWS_CSC_LINK: ${{ secrets.WINDOWS_CSC_LINK }}
+          WINDOWS_CSC_KEY_PASSWORD: ${{ secrets.WINDOWS_CSC_KEY_PASSWORD }}
+          WINDOWS_CERT_SUBJECT: ${{ vars.WINDOWS_CERT_SUBJECT }}
+        run: |
+          set -euo pipefail
+          for name in WINDOWS_CSC_LINK WINDOWS_CSC_KEY_PASSWORD WINDOWS_CERT_SUBJECT; do
+            test -n "${!name:-}" || { echo "Required protected release identity $name is not configured." >&2; exit 1; }
+          done
+      - name: Require macOS release identity
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          MACOS_CSC_LINK: ${{ secrets.MACOS_CSC_LINK }}
+          MACOS_CSC_KEY_PASSWORD: ${{ secrets.MACOS_CSC_KEY_PASSWORD }}
+          MACOS_TEAM_ID: ${{ vars.MACOS_TEAM_ID }}
+          MACOS_CERT_AUTHORITY: ${{ vars.MACOS_CERT_AUTHORITY }}
+          APPLE_API_KEY_BASE64: ${{ secrets.APPLE_API_KEY_BASE64 }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+        run: |
+          set -euo pipefail
+          for name in MACOS_CSC_LINK MACOS_CSC_KEY_PASSWORD MACOS_TEAM_ID MACOS_CERT_AUTHORITY APPLE_API_KEY_BASE64 APPLE_API_KEY_ID APPLE_API_ISSUER; do
+            test -n "${!name:-}" || { echo "Required protected release identity $name is not configured." >&2; exit 1; }
+          done
+      - name: Require Flatpak release identity
+        if: runner.os == 'Linux'
+        shell: bash
+        env:
+          FLATPAK_GPG_PRIVATE_KEY: ${{ secrets.FLATPAK_GPG_PRIVATE_KEY }}
+          FLATPAK_GPG_KEY_ID: ${{ secrets.FLATPAK_GPG_KEY_ID }}
+          FLATPAK_GPG_PASSPHRASE: ${{ secrets.FLATPAK_GPG_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+          for name in FLATPAK_GPG_PRIVATE_KEY FLATPAK_GPG_KEY_ID FLATPAK_GPG_PASSPHRASE; do
+            test -n "${!name:-}" || { echo "Required protected release identity $name is not configured." >&2; exit 1; }
+          done
+          [[ "$FLATPAK_GPG_KEY_ID" =~ ^[0-9A-Fa-f]{40}$ ]] || { echo 'Flatpak key id must be an exact fingerprint.' >&2; exit 1; }
+      - name: Prepare Apple notarization key
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          APPLE_API_KEY_BASE64: ${{ secrets.APPLE_API_KEY_BASE64 }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+        run: |
+          set -euo pipefail
+          key="$RUNNER_TEMP/AuthKey_${APPLE_API_KEY_ID}.p8"
+          printf '%s' "$APPLE_API_KEY_BASE64" | base64 --decode > "$key"
+          chmod 600 "$key"
+          echo "APPLE_API_KEY=$key" >> "$GITHUB_ENV"
       - name: Install Flatpak build requirements
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install --yes flatpak flatpak-builder xvfb xauth
-          # electron-builder updates these refs without privilege escalation,
-          # so install them for the runner user instead of system-wide.
           flatpak remote-add --user --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
           flatpak install --user --noninteractive flathub \
-            org.freedesktop.Platform//24.08 \
-            org.freedesktop.Sdk//24.08 \
+            org.freedesktop.Platform//24.08 org.freedesktop.Sdk//24.08 \
             org.electronjs.Electron2.BaseApp//24.08
-
-      - name: Build desktop packages
+      - name: Verify native attachment gestures and controller routing
+        run: npm run test:desktop-attachments
+      - name: Embed the trusted Flatpak manifest key
+        if: runner.os == 'Linux'
         shell: bash
         env:
-          # @malept/flatpak-bundler otherwise suppresses the command output that
-          # explains Flatpak failures; it is not loaded by the other targets.
-          DEBUG: "@malept/flatpak-bundler"
+          FLATPAK_GPG_PRIVATE_KEY: ${{ secrets.FLATPAK_GPG_PRIVATE_KEY }}
+          FLATPAK_GPG_KEY_ID: ${{ secrets.FLATPAK_GPG_KEY_ID }}
         run: |
           set -euo pipefail
-          # A tag checkout makes electron-builder publish implicitly unless this
-          # is disabled. The release job below is the sole asset publisher.
-          npm run desktop:dist -- ${{ matrix.args }} --publish never
-
-          for pattern in ${{ matrix.required }}; do
-            matches=(release/$pattern)
-            if [ "${#matches[@]}" -eq 0 ] || [ ! -e "${matches[0]}" ]; then
-              echo "Expected desktop artifact matching release/$pattern was not produced." >&2
-              exit 1
-            fi
-          done
-          package_count="$(find release -maxdepth 1 -type f \
-            \( -name '*.AppImage' -o -name '*.flatpak' -o -name '*.exe' -o -name '*.dmg' \) \
-            | wc -l | tr -d '[:space:]')"
-          if [ "$package_count" -ne "${{ matrix.package_count }}" ]; then
-            echo "Expected ${{ matrix.package_count }} desktop package(s); found $package_count." >&2
-            exit 1
+          key_home="$RUNNER_TEMP/flatpak-public-key"
+          mkdir -m 700 "$key_home"
+          printf '%s' "$FLATPAK_GPG_PRIVATE_KEY" | base64 --decode > "$RUNNER_TEMP/flatpak-private-key.asc"
+          chmod 600 "$RUNNER_TEMP/flatpak-private-key.asc"
+          gpg --batch --homedir "$key_home" --import "$RUNNER_TEMP/flatpak-private-key.asc" >/dev/null 2>&1
+          actual="$(gpg --batch --homedir "$key_home" --with-colons --list-secret-keys \
+            "$FLATPAK_GPG_KEY_ID" | awk -F: '$1 == "fpr" { print toupper($10); exit }')"
+          test "$actual" = "${FLATPAK_GPG_KEY_ID^^}"
+          gpg --batch --homedir "$key_home" --armor --export "$FLATPAK_GPG_KEY_ID" \
+            > build/flatpak-update-public-key.asc
+          grep -F 'BEGIN PGP PUBLIC KEY BLOCK' build/flatpak-update-public-key.asc >/dev/null
+      - name: Build signed desktop packages
+        shell: bash
+        env:
+          CODE_AGENTS_WEBCLI_RELEASE: '1'
+          CSC_LINK: ${{ runner.os == 'Windows' && secrets.WINDOWS_CSC_LINK || (runner.os == 'macOS' && secrets.MACOS_CSC_LINK || '') }}
+          CSC_KEY_PASSWORD: ${{ runner.os == 'Windows' && secrets.WINDOWS_CSC_KEY_PASSWORD || (runner.os == 'macOS' && secrets.MACOS_CSC_KEY_PASSWORD || '') }}
+          APPLE_API_KEY_ID: ${{ runner.os == 'macOS' && secrets.APPLE_API_KEY_ID || '' }}
+          APPLE_API_ISSUER: ${{ runner.os == 'macOS' && secrets.APPLE_API_ISSUER || '' }}
+          WINDOWS_CERT_SUBJECT: ${{ runner.os == 'Windows' && vars.WINDOWS_CERT_SUBJECT || '' }}
+          DEBUG: '@malept/flatpak-bundler'
+        run: |
+          set -euo pipefail
+          platform_config=()
+          if [ '${{ runner.os }}' = 'Windows' ]; then
+            platform_config+=("--config.win.signtoolOptions.publisherName=$WINDOWS_CERT_SUBJECT")
           fi
-
+          npm run desktop:dist -- ${{ matrix.args }} "${platform_config[@]}" --publish never
+      - name: Publish signed Flatpak repository artifacts
+        if: runner.os == 'Linux'
+        shell: bash
+        env:
+          FLATPAK_GPG_PRIVATE_KEY: ${{ secrets.FLATPAK_GPG_PRIVATE_KEY }}
+          FLATPAK_GPG_KEY_ID: ${{ secrets.FLATPAK_GPG_KEY_ID }}
+          FLATPAK_GPG_PASSPHRASE: ${{ secrets.FLATPAK_GPG_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+          input="$(find release -maxdepth 1 -name '*.flatpak' -print -quit)"
+          test -n "$input"
+          mv "$input" "${input}.electron-builder"
+          bash scripts/release-flatpak-repository.sh \
+            --input "${input}.electron-builder" --output release \
+            --repository release/flatpak-repository --url '${{ env.FLATPAK_REPOSITORY_URL }}'
+          rm "${input}.electron-builder"
+      - name: Verify package signing and updater metadata
+        shell: bash
+        env:
+          WINDOWS_CERT_SUBJECT: ${{ vars.WINDOWS_CERT_SUBJECT }}
+          MACOS_TEAM_ID: ${{ vars.MACOS_TEAM_ID }}
+          MACOS_CERT_AUTHORITY: ${{ vars.MACOS_CERT_AUTHORITY }}
+        run: |
+          set -euo pipefail
+          case '${{ runner.os }}' in
+            Linux)
+              test -f "$(find release -maxdepth 1 -name '*.AppImage' -print -quit)"
+              test -f release/latest-linux.yml
+              test -z "$(find release -maxdepth 1 -name '*.AppImage.blockmap' -print -quit)"
+              test -d release/flatpak-repository
+              test -f release/linux-unpacked/resources/flatpak-update-public-key.asc
+              embedded_fingerprint="$(gpg --batch --with-colons --show-keys \
+                release/linux-unpacked/resources/flatpak-update-public-key.asc \
+                | awk -F: '$1 == "fpr" { print toupper($10); exit }')"
+              repository_fingerprint="$(gpg --batch --with-colons --show-keys \
+                release/flatpak-repository/code-agents-webcli.gpg \
+                | awk -F: '$1 == "fpr" { print toupper($10); exit }')"
+              test "$embedded_fingerprint" = "$repository_fingerprint"
+              ;;
+            Windows)
+              exe="$(find release -maxdepth 1 -name '*.exe' -print -quit)"
+              EXE="$exe" powershell -NoProfile -Command '$s = Get-AuthenticodeSignature $env:EXE; if ($s.Status -ne "Valid" -or $s.SignerCertificate.Subject -cne $env:WINDOWS_CERT_SUBJECT) { throw "Invalid or unexpected Authenticode signature subject" }'
+              UPDATE_CONFIG=release/win-unpacked/resources/app-update.yml \
+                EXPECTED_PUBLISHER="$WINDOWS_CERT_SUBJECT" \
+                node -e 'const fs=require("fs"),YAML=require("yaml"); const v=YAML.parse(fs.readFileSync(process.env.UPDATE_CONFIG,"utf8")); const p=Array.isArray(v.publisherName)?v.publisherName:[v.publisherName]; if(p.length!==1||p[0]!==process.env.EXPECTED_PUBLISHER) throw new Error("Updater publisher pin mismatch")'
+              test -f release/latest.yml
+              test -f "$(find release -maxdepth 1 -name '*.exe.blockmap' -print -quit)"
+              ;;
+            macOS)
+              app="$(find release -type d -path '*.app' -print -quit)"
+              test -n "$app"
+              codesign --verify --deep --strict --verbose=2 "$app"
+              signature="$(codesign -dv --verbose=4 "$app" 2>&1)"
+              actual_team="$(sed -n 's/^TeamIdentifier=//p' <<<"$signature" | head -n1)"
+              actual_authority="$(sed -n 's/^Authority=//p' <<<"$signature" | head -n1)"
+              test "$actual_team" = "$MACOS_TEAM_ID"
+              test "$actual_authority" = "$MACOS_CERT_AUTHORITY"
+              spctl --assess --type execute --verbose=4 "$app"
+              xcrun stapler validate "$app"
+              test -f "$(find release -maxdepth 1 -name '*.zip' -print -quit)"
+              test -f "$(find release -maxdepth 1 -name '*.zip.blockmap' -print -quit)"
+              test -f "$(find release -maxdepth 1 -name 'latest-*-mac.yml' -print -quit)"
+              ;;
+          esac
       - name: Smoke the native packaged application
         shell: bash
         env:
-          CODE_AGENTS_WEBCLI_DESKTOP_SMOKE: "1"
+          CODE_AGENTS_WEBCLI_DESKTOP_SMOKE: '1'
         run: |
           set -euo pipefail
-          case "${{ runner.os }}" in
+          case '${{ runner.os }}' in
             Linux)
-              executable="release/linux-unpacked/code-agents-webcli"
-              sandbox="release/linux-unpacked/chrome-sandbox"
-              if [ ! -f "$sandbox" ]; then
-                echo "Could not find the packaged Chromium sandbox helper." >&2
-                exit 1
-              fi
-              # Chromium aborts instead of silently weakening its Linux
-              # sandbox unless this unpacked helper is root-owned and setuid.
-              # This changes only the disposable smoke-test directory; the
-              # AppImage and Flatpak artifacts were already built above.
+              sandbox='release/linux-unpacked/chrome-sandbox'
               sudo chown root:root "$sandbox"
               sudo chmod 4755 "$sandbox"
-              if [ "$(stat -c '%U:%G %a' "$sandbox")" != "root:root 4755" ]; then
-                echo "The packaged Chromium sandbox helper is not configured securely." >&2
-                exit 1
-              fi
-              output="$(xvfb-run -a "$executable")"
+              output="$(ELECTRON_OZONE_PLATFORM_HINT=x11 xvfb-run -a \
+                release/linux-unpacked/code-agents-webcli --ozone-platform=x11)"
               ;;
-            Windows)
-              executable="release/win-unpacked/code-agents-webcli.exe"
-              output="$("$executable")"
-              ;;
+            Windows) output="$(release/win-unpacked/code-agents-webcli.exe)" ;;
             macOS)
               executable="$(find release -type f -path '*/Code Agents Web CLI.app/Contents/MacOS/Code Agents Web CLI' -print -quit)"
-              if [ -z "$executable" ]; then
-                echo "Could not find the packaged macOS executable." >&2
-                exit 1
-              fi
               output="$("$executable")"
               ;;
           esac
+          grep -F 'DESKTOP_WORKSPACE_ATTACHMENT_SMOKE_OK' <<<"$output"
+          grep -F 'DESKTOP_PACKAGED_RENDERER_SMOKE_OK' <<<"$output"
+          grep -F 'DESKTOP_SMOKE_OK' <<<"$output"
+      - name: Smoke the installed Flatpak artifact
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          app_id='io.github.dnviti.code_agents_webcli'
+          app_data="$HOME/.var/app/$app_id"
+          bundle="$(find release -maxdepth 1 -type f \
+            -name 'Code-Agents-Web-CLI-*-linux-x64.flatpak' -print -quit)"
+          test -n "$bundle"
+          if flatpak info --user "$app_id" >/dev/null 2>&1 || [ -e "$app_data" ]; then
+            echo "Refusing to replace a pre-existing Flatpak smoke installation or its data." >&2
+            exit 1
+          fi
+
+          installed=0
+          cleanup_flatpak_smoke() {
+            if [ "$installed" -eq 1 ]; then
+              flatpak kill "$app_id" >/dev/null 2>&1 || true
+              flatpak uninstall --user --noninteractive --delete-data "$app_id" \
+                >/dev/null 2>&1 || true
+            fi
+          }
+          trap cleanup_flatpak_smoke EXIT
+
+          # The runtime is already installed above. Install the exact release
+          # bundle without reaching a feed that has not been promoted yet.
+          installed=1
+          flatpak install --user --noninteractive --no-deps --bundle "$bundle"
+          flatpak info --user "$app_id" >/dev/null
+
+          # This launches the installed sandbox and its real renderer. Native
+          # document-portal consent remains a manual packaged-platform check.
+          if ! output="$(timeout --signal=TERM 120s dbus-run-session -- \
+            xvfb-run -a flatpak run --user --die-with-parent \
+            --socket=x11 --nosocket=wayland \
+            --env=CODE_AGENTS_WEBCLI_DESKTOP_SMOKE=1 \
+            --env=ELECTRON_OZONE_PLATFORM_HINT=x11 \
+            "$app_id" --ozone-platform=x11 2>&1)"; then
+            printf '%s\n' "$output" >&2
+            exit 1
+          fi
           printf '%s\n' "$output"
+          grep -F 'DESKTOP_WORKSPACE_ATTACHMENT_SMOKE_OK' <<<"$output"
+          grep -F 'DESKTOP_PACKAGED_RENDERER_SMOKE_OK' <<<"$output"
           grep -F 'DESKTOP_SMOKE_OK' <<<"$output"
 
-      - name: Upload desktop packages
-        uses: actions/upload-artifact@v4
+          flatpak uninstall --user --noninteractive --delete-data "$app_id"
+          test ! -e "$app_data"
+          if flatpak info --user "$app_id" >/dev/null 2>&1; then
+            echo 'The Flatpak smoke application remained installed after cleanup.' >&2
+            exit 1
+          fi
+          installed=0
+          trap - EXIT
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: desktop-${{ matrix.os }}
           if-no-files-found: error
           path: |
             release/*.AppImage
             release/*.flatpak
+            release/*.flatpakref
+            release/*.flatpakrepo
             release/*.exe
+            release/*.exe.blockmap
             release/*.dmg
+            release/*.zip
+            release/*.zip.blockmap
+            release/latest*.yml
+            release/flatpak-repository/**
+            release/flatpak-repository-previous/**
 
-  release:
-    name: Attach desktop packages to GitHub release
-    needs:
-      - verify
-      - desktop
+  desktop-upgrade-qualification:
+    name: Verify installed old-to-new qualification
+    # The private draft and versioned Pages candidate are deliberately staged
+    # first, so the protected trials can bind to the exact bytes that promotion
+    # will expose. A first run normally stops here until those trials finish.
+    needs: [verify, desktop, flatpak-pages-stage]
+    runs-on: ubuntu-latest
+    # Approve this distinct environment only after the five trials and their
+    # protected attestation exist. Waiting retains the repo-wide feed lock.
+    environment: desktop-updater-qualification
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      attestation_run_id: ${{ steps.qualification.outputs.attestation_run_id }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.verify.outputs.commit_sha }}
+      - name: Download and verify the protected qualification
+        id: qualification
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          QUALIFICATION_RUN_ID: ${{ vars.DESKTOP_UPDATER_QUALIFICATION_RUN_ID }}
+          EXPECTED_COMMIT: ${{ needs.verify.outputs.commit_sha }}
+          EXPECTED_TAG: ${{ needs.verify.outputs.tag }}
+        run: |
+          set -euo pipefail
+          [[ "$QUALIFICATION_RUN_ID" =~ ^[1-9][0-9]*$ ]] \
+            || { echo 'Set DESKTOP_UPDATER_QUALIFICATION_RUN_ID after all five installed trials pass.' >&2; exit 1; }
+          run_file="$RUNNER_TEMP/qualification-run.json"
+          gh api "repos/$GH_REPO/actions/runs/$QUALIFICATION_RUN_ID" > "$run_file"
+          RUN_FILE="$run_file" node <<'NODE'
+          const fs = require('node:fs');
+          const run = JSON.parse(fs.readFileSync(process.env.RUN_FILE, 'utf8'));
+          if (run.name !== 'Desktop updater installed qualification'
+            || run.event !== 'workflow_dispatch' || run.conclusion !== 'success'
+            || run.head_sha !== process.env.EXPECTED_COMMIT) {
+            throw new Error('Qualification run is not a successful candidate-tag attestation.');
+          }
+          NODE
+          mkdir "$RUNNER_TEMP/qualification"
+          gh run download "$QUALIFICATION_RUN_ID" --repo "$GH_REPO" \
+            --name desktop-updater-qualification --dir "$RUNNER_TEMP/qualification"
+          qualification="$RUNNER_TEMP/qualification/desktop-updater-qualification.json"
+          mkdir "$RUNNER_TEMP/qualified-assets"
+          gh release download "$EXPECTED_TAG" --repo "$GH_REPO" --dir "$RUNNER_TEMP/qualified-assets"
+          mkdir "$RUNNER_TEMP/qualified-feed"
+          candidate_url="${FLATPAK_REPOSITORY_URL%flatpak/}flatpak-candidates/${EXPECTED_TAG}/"
+          for file in code-agents-webcli.gpg summary summary.sig update-info.json update-info.json.asc; do
+            curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+              "${candidate_url}${file}" -o "$RUNNER_TEMP/qualified-feed/$file"
+          done
+          node scripts/validate-desktop-updater-qualification.js \
+            "$qualification" "$EXPECTED_TAG" "$EXPECTED_COMMIT" \
+            "$RUNNER_TEMP/qualified-assets" "$RUNNER_TEMP/qualified-feed"
+          QUALIFICATION="$qualification" node -e '
+            const v=require(process.env.QUALIFICATION);
+            for(const [name,result] of Object.entries(v.results)) console.log(`${name} ${new URL(result.evidence).pathname.split("/").pop()}`);
+          ' | while read -r package_name evidence_run_id; do
+            evidence_file="$RUNNER_TEMP/evidence-$evidence_run_id.json"
+            gh api "repos/$GH_REPO/actions/runs/$evidence_run_id" > "$evidence_file"
+            RUN_FILE="$evidence_file" node <<'NODE'
+          const fs = require('node:fs');
+          const run = JSON.parse(fs.readFileSync(process.env.RUN_FILE, 'utf8'));
+          if (run.conclusion !== 'success' || run.head_sha !== process.env.EXPECTED_COMMIT) {
+            throw new Error('An installed-package evidence run is not successful for the candidate commit.');
+          }
+          NODE
+            evidence_directory="$RUNNER_TEMP/trial-$package_name"
+            mkdir "$evidence_directory"
+            gh run download "$evidence_run_id" --repo "$GH_REPO" \
+              --name "desktop-updater-evidence-$package_name" --dir "$evidence_directory"
+            test "$(find "$evidence_directory" -maxdepth 1 -type f -name desktop-updater-evidence.json | wc -l)" = 1
+            node scripts/validate-desktop-updater-trial-evidence.js \
+              "$evidence_directory/desktop-updater-evidence.json" "$package_name" "$qualification"
+          done
+          echo "attestation_run_id=$QUALIFICATION_RUN_ID" >> "$GITHUB_OUTPUT"
+
+  release-stage:
+    name: Stage complete signed desktop release
+    needs: [verify, desktop]
     runs-on: ubuntu-latest
     permissions:
       contents: write
-
     steps:
-      - name: Download desktop packages
-        uses: actions/download-artifact@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.verify.outputs.commit_sha }}
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           pattern: desktop-*
           path: release-assets
-
-      - name: Verify packages and write checksums
+      - name: Validate release set and write checksums
         shell: bash
         run: |
           set -euo pipefail
-          cd release-assets
-          mapfile -t packages < <(find . -type f \( -name '*.AppImage' -o -name '*.flatpak' -o -name '*.exe' -o -name '*.dmg' \) | sort)
-          if [ "${#packages[@]}" -ne 5 ]; then
-            echo "Expected AppImage, Flatpak, Windows NSIS, and two macOS DMG packages; found ${#packages[@]}." >&2
-            printf '%s\n' "${packages[@]}" >&2
-            exit 1
-          fi
-          mkdir published
-          declare -A names=()
-          for package in "${packages[@]}"; do
-            name="$(basename "$package")"
-            if [[ -v "names[$name]" ]]; then
-              echo "Duplicate published asset name: $name" >&2
-              exit 1
-            fi
-            names["$name"]=1
-            cp "$package" "published/$name"
-          done
-          (
-            cd published
-            find . -maxdepth 1 -type f \
-              \( -name '*.AppImage' -o -name '*.flatpak' -o -name '*.exe' -o -name '*.dmg' \) \
-              -printf '%f\0' | sort -z | xargs -0 sha256sum
-          ) > SHA256SUMS.tmp
-          mv SHA256SUMS.tmp published/SHA256SUMS
-          if [ "$(wc -l < published/SHA256SUMS | tr -d '[:space:]')" -ne 5 ]; then
-            echo "Expected five checksum entries." >&2
-            exit 1
-          fi
-          (cd published && sha256sum -c SHA256SUMS)
-
-      # This runs only after every required native package exists.  It creates
-      # the release on the first run and overwrites matching assets on reruns,
-      # so a transient upload failure can be repaired without retagging.
-      - name: Create or update GitHub release
-        uses: softprops/action-gh-release@v2
+          mkdir release-assets/published
+          declare -A seen=()
+          while IFS= read -r -d '' file; do
+            name="$(basename "$file")"
+            if [[ -v "seen[$name]" ]]; then echo "Duplicate release asset: $name" >&2; exit 1; fi
+            seen["$name"]=1
+            cp "$file" "release-assets/published/$name"
+          done < <(find release-assets -type f \
+            ! -path '*/flatpak-repository/*' \
+            ! -path '*/flatpak-repository-previous/*' \( \
+            -name '*.AppImage' -o -name '*.flatpak' -o \
+            -name '*.flatpakref' -o -name '*.flatpakrepo' -o -name '*.exe' -o \
+            -name '*.exe.blockmap' -o -name '*.dmg' -o -name '*.zip' -o \
+            -name '*.zip.blockmap' -o -name 'latest*.yml' \
+          \) -print0)
+          cd release-assets/published
+          find . -maxdepth 1 -type f \( -name '*.AppImage' -o -name '*.flatpak' -o -name '*.exe' -o -name '*.dmg' -o -name '*.flatpakref' -o -name '*.flatpakrepo' \) -printf '%f\0' | sort -z | xargs -0 sha256sum > SHA256SUMS
+          sha256sum -c SHA256SUMS
+          cd ../..
+          node scripts/validate-release-assets.js release-assets/published '${{ needs.verify.outputs.version }}'
+      - name: Verify the release staging slot
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          tag='${{ needs.verify.outputs.tag }}'
+          release_status="$(curl --silent --show-error --location --proto '=https' --tlsv1.2 \
+            --output "$RUNNER_TEMP/existing-release.json" --write-out '%{http_code}' \
+            --header "Authorization: Bearer $GH_TOKEN" \
+            --header 'Accept: application/vnd.github+json' \
+            --header 'X-GitHub-Api-Version: 2022-11-28' \
+            "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/releases/tags/$tag")"
+          case "$release_status:${{ needs.verify.outputs.resume_draft }}" in
+            404:false) ;;
+            200:true) ;;
+            200:false) echo "Release $tag already exists; published versions are immutable." >&2; exit 1 ;;
+            *) echo "Could not prove release $tag is unused (HTTP $release_status)." >&2; exit 1 ;;
+          esac
+      - name: Verify an interrupted draft is byte-identical
+        if: needs.verify.outputs.resume_draft == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          mkdir "$RUNNER_TEMP/existing-assets"
+          gh release download '${{ needs.verify.outputs.tag }}' --dir "$RUNNER_TEMP/existing-assets"
+          (cd release-assets/published && sha256sum * | sort) > "$RUNNER_TEMP/new-assets.sha256"
+          (cd "$RUNNER_TEMP/existing-assets" && sha256sum * | sort) > "$RUNNER_TEMP/existing-assets.sha256"
+          cmp "$RUNNER_TEMP/new-assets.sha256" "$RUNNER_TEMP/existing-assets.sha256"
+      - name: Create private staging release
+        if: needs.verify.outputs.resume_draft != 'true'
+        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v3.0.0
         with:
           tag_name: ${{ needs.verify.outputs.tag }}
           name: ${{ needs.verify.outputs.tag }}
           target_commitish: ${{ needs.verify.outputs.commit_sha }}
+          draft: true
           generate_release_notes: true
-          overwrite_files: true
           fail_on_unmatched_files: true
-          files: |
-            release-assets/published/*.AppImage
-            release-assets/published/*.flatpak
-            release-assets/published/*.exe
-            release-assets/published/*.dmg
-            release-assets/published/SHA256SUMS
+          overwrite_files: false
+          files: release-assets/published/*
           body: |
-            Automated desktop release for ${{ needs.verify.outputs.tag }}.
+            Signed desktop release for ${{ needs.verify.outputs.tag }}.
 
-            Desktop downloads (all are unsigned):
-            - `*.AppImage` — Linux x64, portable; make it executable and run it.
-            - `*.flatpak` — Linux x64, sandboxed Flatpak bundle.
-            - `*.exe` — Windows x64 NSIS installer.
-            - `*-x64.dmg` — macOS Intel (x64).
-            - `*-arm64.dmg` — macOS Apple Silicon (arm64).
-            - `SHA256SUMS` — SHA-256 checksums for every desktop package.
+            This release contains the five usual human-facing packages, updater
+            manifests/blockmaps, signed macOS ZIPs, and Flatpak remote descriptors.
+            The native app never downloads or installs an update until the user
+            confirms **Update and restart**.
 
-            Windows SmartScreen and macOS Gatekeeper will warn because these
-            packages are unsigned. Review the checksum before overriding a
-            warning. Release-download updates notify you; installing an update
-            is always a manual choice, never a silent automatic update.
+            **One-time updater bridge:** installations older than the first
+            updater-capable release must install this signed Windows, macOS, or
+            AppImage package manually over the existing application. Application
+            data is preserved. Existing remote-less Flatpak installations must add
+            the signed project remote by installing the `.flatpakref` (preferred)
+            or repository-aware `.flatpak` bundle. Do not uninstall with
+            `--delete-data`; Flatpak data remains under
+            `~/.var/app/io.github.dnviti.code_agents_webcli`.
 
-            Also published: `${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}`
+            From an updater-capable release onward, higher stable versions use the
+            in-app proposal, durable reminder, verified installation, and relaunch.
+            See https://github.com/dnviti/code-agents-webcli/blob/main/docs/desktop.md#one-time-updater-bridge.
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: flatpak-pages
+          if-no-files-found: error
+          path: |
+            release-assets/**/flatpak-repository
+            release-assets/**/flatpak-repository-previous
+
+  flatpak-pages-stage:
+    name: Stage and verify the signed Flatpak candidate
+    needs: [verify, release-stage]
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.verify.outputs.commit_sha }}
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: flatpak-pages
+          path: pages-input
+      - name: Prepare candidate Pages artifact without advancing stable
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir pages-root
+          cp -a docs/. pages-root/
+          repository="$(find pages-input -type d -name flatpak-repository -print -quit)"
+          test -n "$repository"
+          mkdir -p "pages-root/flatpak-candidates"
+          cp -a "$repository" "pages-root/flatpak-candidates/${{ needs.verify.outputs.tag }}"
+          previous="$(find pages-input -type d -name flatpak-repository-previous -print -quit)"
+          if [ -n "$previous" ]; then cp -a "$previous" pages-root/flatpak; fi
+      - uses: actions/upload-pages-artifact@56afc609e74202658d3ffba0e8f6dda462b719fa # v3
+        with:
+          name: github-pages-flatpak-stage
+          path: pages-root
+      - id: deployment
+        uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e # v4
+        with:
+          artifact_name: github-pages-flatpak-stage
+      - name: Verify the versioned HTTPS candidate and unchanged stable ref
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --yes flatpak
+          verify="$RUNNER_TEMP/flatpak-https-verification"
+          mkdir -p "$verify/data" "$verify/cache" "$verify/config"
+          candidate_url="${FLATPAK_REPOSITORY_URL%flatpak/}flatpak-candidates/${{ needs.verify.outputs.tag }}/"
+          curl_args=(--fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+            --retry 12 --retry-all-errors --retry-delay 5)
+          curl "${curl_args[@]}" "${candidate_url}code-agents-webcli.gpg" -o "$verify/repository.gpg"
+          curl "${curl_args[@]}" "${candidate_url}code-agents-webcli.flatpakref" -o "$verify/application.flatpakref"
+          curl "${curl_args[@]}" "${candidate_url}code-agents-webcli.flatpakrepo" -o "$verify/application.flatpakrepo"
+          curl "${curl_args[@]}" "${candidate_url}summary" -o "$verify/summary"
+          curl "${curl_args[@]}" "${candidate_url}summary.sig" -o "$verify/summary.sig"
+          curl "${curl_args[@]}" "${candidate_url}update-info.json" -o "$verify/update-info.json"
+          curl "${curl_args[@]}" "${candidate_url}update-info.json.asc" -o "$verify/update-info.json.asc"
+          local_repository="$(find pages-input -type d -name flatpak-repository -print -quit)"
+          test -n "$local_repository"
+          cmp "$local_repository/code-agents-webcli.gpg" "$verify/repository.gpg"
+          cmp "$local_repository/code-agents-webcli.flatpakref" "$verify/application.flatpakref"
+          cmp "$local_repository/code-agents-webcli.flatpakrepo" "$verify/application.flatpakrepo"
+          cmp "$local_repository/summary" "$verify/summary"
+          cmp "$local_repository/summary.sig" "$verify/summary.sig"
+          cmp "$local_repository/update-info.json" "$verify/update-info.json"
+          cmp "$local_repository/update-info.json.asc" "$verify/update-info.json.asc"
+          gpgv --keyring "$verify/repository.gpg" \
+            "$verify/update-info.json.asc" "$verify/update-info.json"
+          test -s "$verify/repository.gpg"
+          grep -Fx 'Name=io.github.dnviti.code_agents_webcli' "$verify/application.flatpakref"
+          grep -Fx 'Branch=stable' "$verify/application.flatpakref"
+          grep -Fx "Url=${FLATPAK_REPOSITORY_URL}" "$verify/application.flatpakref"
+          grep -Fx "Url=${FLATPAK_REPOSITORY_URL}" "$verify/application.flatpakrepo"
+          previous_repository="$(find pages-input -type d -name flatpak-repository-previous -print -quit)"
+          if [ -n "$previous_repository" ]; then
+            curl "${curl_args[@]}" "${FLATPAK_REPOSITORY_URL}summary" -o "$verify/stable-summary"
+            cmp "$previous_repository/summary" "$verify/stable-summary"
+          else
+            stable_status="$(curl --silent --show-error --location --proto '=https' --tlsv1.2 \
+              --output /dev/null --write-out '%{http_code}' "${FLATPAK_REPOSITORY_URL}summary")"
+            test "$stable_status" = 404
+          fi
+          env \
+            XDG_DATA_HOME="$verify/data" \
+            XDG_CACHE_HOME="$verify/cache" \
+            XDG_CONFIG_HOME="$verify/config" \
+            flatpak --user remote-add --gpg-import="$verify/repository.gpg" \
+              --if-not-exists code-agents-webcli-candidate "$candidate_url"
+          env \
+            XDG_DATA_HOME="$verify/data" \
+            XDG_CACHE_HOME="$verify/cache" \
+            XDG_CONFIG_HOME="$verify/config" \
+            flatpak --user remote-ls code-agents-webcli-candidate \
+            | grep -F 'io.github.dnviti.code_agents_webcli' >/dev/null
+
+  native-promote:
+    name: Promote the validated native release
+    needs: [verify, release-stage, flatpak-pages-stage, desktop-upgrade-qualification]
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.verify.outputs.commit_sha }}
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '24'
+          cache: npm
+      - run: npm ci --ignore-scripts
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: flatpak-pages
+          path: pages-input
+      - name: Revalidate every candidate byte and stable tip before promotion
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          EXPECTED_COMMIT: ${{ needs.verify.outputs.commit_sha }}
+          EXPECTED_TAG: ${{ needs.verify.outputs.tag }}
+          EXPECTED_VERSION: ${{ needs.verify.outputs.version }}
+          QUALIFICATION_RUN_ID: ${{ needs.desktop-upgrade-qualification.outputs.attestation_run_id }}
+        run: |
+          set -euo pipefail
+          mkdir "$RUNNER_TEMP/promotion-assets" "$RUNNER_TEMP/promotion-qualification" "$RUNNER_TEMP/promotion-feed"
+          gh release download "$EXPECTED_TAG" --repo "$GH_REPO" --dir "$RUNNER_TEMP/promotion-assets"
+          node scripts/validate-release-assets.js "$RUNNER_TEMP/promotion-assets" "$EXPECTED_VERSION"
+          gh run download "$QUALIFICATION_RUN_ID" --repo "$GH_REPO" \
+            --name desktop-updater-qualification --dir "$RUNNER_TEMP/promotion-qualification"
+          qualification="$RUNNER_TEMP/promotion-qualification/desktop-updater-qualification.json"
+          candidate_url="${FLATPAK_REPOSITORY_URL%flatpak/}flatpak-candidates/${EXPECTED_TAG}/"
+          curl_args=(--fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+            --retry 8 --retry-all-errors --retry-delay 5)
+          for file in code-agents-webcli.gpg summary summary.sig update-info.json update-info.json.asc; do
+            curl "${curl_args[@]}" "${candidate_url}${file}" -o "$RUNNER_TEMP/promotion-feed/$file"
+          done
+          node scripts/validate-desktop-updater-qualification.js \
+            "$qualification" "$EXPECTED_TAG" "$EXPECTED_COMMIT" \
+            "$RUNNER_TEMP/promotion-assets" "$RUNNER_TEMP/promotion-feed"
+          candidate_repository="$(find pages-input -type d -name flatpak-repository -print -quit)"
+          test -n "$candidate_repository"
+          for file in code-agents-webcli.gpg summary summary.sig update-info.json update-info.json.asc; do
+            cmp "$candidate_repository/$file" "$RUNNER_TEMP/promotion-feed/$file"
+          done
+          gpgv --keyring "$RUNNER_TEMP/promotion-feed/code-agents-webcli.gpg" \
+            "$RUNNER_TEMP/promotion-feed/update-info.json.asc" "$RUNNER_TEMP/promotion-feed/update-info.json"
+          gh api --paginate --slurp "repos/$GH_REPO/releases?per_page=100" \
+            > "$RUNNER_TEMP/public-releases.json"
+          PUBLIC_RELEASES="$RUNNER_TEMP/public-releases.json" node <<'NODE'
+          const fs = require('node:fs');
+          const parse = (value) => {
+            const match = /^v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/.exec(String(value || ''));
+            return match ? match.slice(1).map((part) => BigInt(part)) : null;
+          };
+          const compare = (left, right) => {
+            for (let index = 0; index < 3; index += 1) {
+              if (left[index] !== right[index]) return left[index] > right[index] ? 1 : -1;
+            }
+            return 0;
+          };
+          const candidate = parse(`v${process.env.EXPECTED_VERSION}`);
+          for (const release of JSON.parse(fs.readFileSync(process.env.PUBLIC_RELEASES, 'utf8')).flat()) {
+            if (release.draft || release.prerelease || release.tag_name === process.env.EXPECTED_TAG) continue;
+            const published = parse(release.tag_name);
+            if (published && compare(candidate, published) <= 0) {
+              throw new Error(`Candidate is no longer newer than public ${release.tag_name}.`);
+            }
+          }
+          NODE
+          previous_repository="$(find pages-input -type d -name flatpak-repository-previous -print -quit)"
+          stable_status="$(curl --silent --show-error --location --proto '=https' --tlsv1.2 \
+            --output "$RUNNER_TEMP/stable-update-info.json" --write-out '%{http_code}' \
+            "${FLATPAK_REPOSITORY_URL}update-info.json")"
+          if [ -n "$previous_repository" ]; then
+            test "$stable_status" = 200
+            cmp "$previous_repository/update-info.json" "$RUNNER_TEMP/stable-update-info.json"
+            curl "${curl_args[@]}" "${FLATPAK_REPOSITORY_URL}update-info.json.asc" \
+              -o "$RUNNER_TEMP/stable-update-info.json.asc"
+            cmp "$previous_repository/update-info.json.asc" "$RUNNER_TEMP/stable-update-info.json.asc"
+            gpgv --keyring "$previous_repository/code-agents-webcli.gpg" \
+              "$RUNNER_TEMP/stable-update-info.json.asc" "$RUNNER_TEMP/stable-update-info.json"
+          else
+            test "$stable_status" = 404
+          fi
+      - name: Publish staged release only after every stable feed is ready
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: gh release edit '${{ needs.verify.outputs.tag }}' --draft=false --repo "$GH_REPO"
+
+  flatpak-activate:
+    name: Activate the signed Flatpak stable repository
+    needs: [verify, release-stage, flatpak-pages-stage, native-promote]
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.verify.outputs.commit_sha }}
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: flatpak-pages
+          path: pages-input
+      - name: Prepare the already-verified stable Pages artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir pages-root
+          cp -a docs/. pages-root/
+          repository="$(find pages-input -type d -name flatpak-repository -print -quit)"
+          test -n "$repository"
+          cp -a "$repository" pages-root/flatpak
+          mkdir -p pages-root/flatpak-candidates
+          cp -a "$repository" "pages-root/flatpak-candidates/${{ needs.verify.outputs.tag }}"
+      - uses: actions/upload-pages-artifact@56afc609e74202658d3ffba0e8f6dda462b719fa # v3
+        with:
+          name: github-pages-flatpak-activation
+          path: pages-root
+      - id: deployment
+        uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e # v4
+        with:
+          artifact_name: github-pages-flatpak-activation
+      - name: Verify the activated signed stable ref over HTTPS
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --yes flatpak
+          verify="$RUNNER_TEMP/flatpak-stable-verification"
+          mkdir -p "$verify/data" "$verify/cache" "$verify/config"
+          repository="$(find pages-input -type d -name flatpak-repository -print -quit)"
+          test -n "$repository"
+          curl_args=(--fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+            --retry 12 --retry-all-errors --retry-delay 5)
+          for file in code-agents-webcli.gpg summary summary.sig update-info.json update-info.json.asc; do
+            curl "${curl_args[@]}" "${FLATPAK_REPOSITORY_URL}${file}" -o "$verify/$file"
+            cmp "$repository/$file" "$verify/$file"
+          done
+          gpgv --keyring "$verify/code-agents-webcli.gpg" \
+            "$verify/update-info.json.asc" "$verify/update-info.json"
+          env XDG_DATA_HOME="$verify/data" XDG_CACHE_HOME="$verify/cache" XDG_CONFIG_HOME="$verify/config" \
+            flatpak --user remote-add --gpg-import="$verify/code-agents-webcli.gpg" \
+              --if-not-exists code-agents-webcli-stable "$FLATPAK_REPOSITORY_URL"
+          env XDG_DATA_HOME="$verify/data" XDG_CACHE_HOME="$verify/cache" XDG_CONFIG_HOME="$verify/config" \
+            flatpak --user remote-ls code-agents-webcli-stable \
+            | grep -F 'io.github.dnviti.code_agents_webcli' >/dev/null
+
+  rollback-native-promotion:
+    name: Hide native feed if Flatpak activation fails
+    if: ${{ always() && needs.native-promote.result == 'success' && needs.flatpak-activate.result != 'success' }}
+    needs: [verify, native-promote, flatpak-activate]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Return the byte-identical release to its resumable draft
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: gh release edit '${{ needs.verify.outputs.tag }}' --draft=true --repo "$GH_REPO"
+
+  rollback-flatpak-pages:
+    name: Restore Flatpak feed if activation fails
+    if: ${{ always() && needs.native-promote.result == 'success' && needs.flatpak-activate.result != 'success' }}
+    needs: [verify, release-stage, native-promote, flatpak-activate]
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.verify.outputs.commit_sha }}
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: flatpak-pages
+          path: pages-input
+      - name: Restore the previous signed Pages ref
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p pages-root/flatpak-candidates
+          cp -a docs/. pages-root/
+          repository="$(find pages-input -type d -name flatpak-repository -print -quit)"
+          test -n "$repository"
+          cp -a "$repository" "pages-root/flatpak-candidates/${{ needs.verify.outputs.tag }}"
+          previous="$(find pages-input -type d -name flatpak-repository-previous -print -quit)"
+          if [ -n "$previous" ]; then cp -a "$previous" pages-root/flatpak; fi
+      - uses: actions/upload-pages-artifact@56afc609e74202658d3ffba0e8f6dda462b719fa # v3
+        with:
+          name: github-pages-flatpak-rollback
+          path: pages-root
+      - uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e # v4
+        with:
+          artifact_name: github-pages-flatpak-rollback

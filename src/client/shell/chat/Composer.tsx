@@ -11,10 +11,15 @@ import {
   SlashCommand,
 } from '../../../shared/chat-events.js';
 import { compactCount } from '../../chat/tool-meta.js';
+import { MAX_ATTACHMENT_BYTES, safeAttachmentDownloadUrl } from '../../chat/attachments-api.js';
 import { mentionAtCaret } from '../../../shared/file-match.js';
 import { tokenTotal } from '../../../shared/usage-records.js';
-import { classifyPaste, MAX_IMAGES_PER_PASTE, PasteCandidate } from '../../../shared/paste-classify.js';
-import { MAX_IMAGE_BYTES } from '../../terminal/paste.js';
+import {
+  classifyPaste,
+  MAX_IMAGES_PER_PASTE,
+  PasteCandidate,
+  PasteClassification,
+} from '../../../shared/paste-classify.js';
 import { detectMobile } from '../../ui/mobile.js';
 import { PHONE_TEXT, PhoneContext, TOUCH_GAP, TOUCH_TARGET, usePhone } from '../../ui/touch.js';
 import { showNotification } from '../../ui/notifications.js';
@@ -47,7 +52,7 @@ export interface ComposerProps {
   capabilities: ChatCapabilities;
   disabled?: boolean;
   placeholder?: string;
-  onUpload?: (file: File) => Promise<ChatAttachment>;
+  onUpload?: (file: File, signal?: AbortSignal) => Promise<ChatAttachment>;
   /** Controlled draft, so a session switch can restore what was half-typed. */
   draft?: string;
   onDraftChange?: (text: string) => void;
@@ -224,6 +229,8 @@ interface AttachmentEntry {
   /** Which pick this was, so the chip keeps one identity across the upload. */
   picked: number;
   file: File;
+  /** Stable identity shared by picker, drop and paste de-duplication. */
+  fingerprint: string;
   status: 'uploading' | 'error';
   error?: string;
 }
@@ -274,6 +281,117 @@ export function placeByPickOrder(
   });
   if (at === -1) return [...list, attachment];
   return [...list.slice(0, at), attachment, ...list.slice(at)];
+}
+
+/**
+ * A file identity that survives the different DOM paths which can produce it.
+ *
+ * This metadata is useful for diagnostics and stable display keys, but is not
+ * itself a file identity: two different directories can contain same-named,
+ * same-sized files with the same timestamp and different bytes.
+ */
+export function attachmentFileFingerprint(
+  file: Pick<File, 'name' | 'size' | 'type' | 'lastModified'>,
+): string {
+  return JSON.stringify([file.name, file.size, file.type, file.lastModified]);
+}
+
+export interface ReservedAttachmentFile {
+  file: File;
+  fingerprint: string;
+}
+
+/**
+ * Owns the two pieces of upload state which must change synchronously.
+ *
+ * React state updates are intentionally not used as the authority here: two
+ * input events can arrive before a render, and a removed upload can resolve
+ * after its chip is gone. Reserving before starting and matching the exact
+ * AbortSignal on settlement closes both races.
+ */
+export class AttachmentUploadGuard {
+  private readonly activeFiles = new WeakMap<object, string>();
+  private readonly fingerprints = new Set<string>();
+  private readonly attempts = new Map<string, AbortController>();
+  private fileSequence = 0;
+
+  reserve(files: File[]): ReservedAttachmentFile[] {
+    const reserved: ReservedAttachmentFile[] = [];
+    for (const file of files) {
+      let fingerprint = this.activeFiles.get(file);
+      if (fingerprint && this.fingerprints.has(fingerprint)) continue;
+      if (!fingerprint) {
+        this.fileSequence += 1;
+        fingerprint = `${attachmentFileFingerprint(file)}#${this.fileSequence}`;
+        this.activeFiles.set(file, fingerprint);
+      }
+      this.fingerprints.add(fingerprint);
+      reserved.push({ file, fingerprint });
+    }
+    return reserved;
+  }
+
+  release(fingerprint: string): void {
+    this.fingerprints.delete(fingerprint);
+  }
+
+  begin(key: string): AbortSignal | null {
+    // A rapid double-click on Retry can happen before React paints the
+    // uploading state. Only the first click is allowed to start a request.
+    if (this.attempts.has(key)) return null;
+    const controller = new AbortController();
+    this.attempts.set(key, controller);
+    return controller.signal;
+  }
+
+  settle(key: string, signal: AbortSignal): boolean {
+    const current = this.attempts.get(key);
+    if (!current || current.signal !== signal) return false;
+    this.attempts.delete(key);
+    return true;
+  }
+
+  cancel(key: string): boolean {
+    const current = this.attempts.get(key);
+    if (!current) return false;
+    this.attempts.delete(key);
+    current.abort();
+    return true;
+  }
+
+  cancelAll(): void {
+    for (const current of this.attempts.values()) current.abort();
+    this.attempts.clear();
+  }
+
+  clear(): void {
+    this.cancelAll();
+    this.fingerprints.clear();
+  }
+}
+
+/** Kept pure so the upload/error send gate is deterministic in non-DOM tests. */
+export function canSendComposerMessage(
+  disabled: boolean,
+  entries: ReadonlyArray<Pick<AttachmentEntry, 'status'>>,
+  text: string,
+  attachmentCount: number,
+): boolean {
+  // An error is still part of the unsent message until it is retried or
+  // removed. Sending around it would silently drop the file the chip names.
+  return !disabled && entries.length === 0 && (text.trim().length > 0 || attachmentCount > 0);
+}
+
+/** Chat attachment paste uses the route's 20 MiB cap, not terminal paste's cap. */
+export function classifyComposerClipboardFiles(
+  files: ReadonlyArray<Pick<File, 'type' | 'size'>>,
+): PasteClassification {
+  const candidates: PasteCandidate[] = files.map((file) => ({
+    kind: 'file',
+    type: file.type,
+    size: file.size,
+  }));
+  return classifyPaste(candidates, MAX_ATTACHMENT_BYTES);
 }
 
 /** DataTransfer -> File[], covering the Safari/Firefox split the same way paste.ts does. */
@@ -356,6 +474,7 @@ export function Composer({
   const textareaRef = React.useRef<HTMLTextAreaElement | null>(null);
   const fileInputRef = React.useRef<HTMLInputElement | null>(null);
   const keySeq = React.useRef(0);
+  const uploadGuard = React.useRef(new AttachmentUploadGuard());
   /** Where to put the caret after a completion rewrites the draft. */
   const pendingCaret = React.useRef<number | null>(null);
 
@@ -461,6 +580,8 @@ export function Composer({
    * by the name it arrived with.
    */
   const localFiles = React.useRef(new Map<string, File>());
+  /** Reservation to release when a locally uploaded attachment is removed. */
+  const localFingerprints = React.useRef(new Map<string, string>());
   /**
    * What order the files picked in this window were picked in.
    *
@@ -483,6 +604,25 @@ export function Composer({
     },
     [attachmentsControlled, onAttachmentsChange],
   );
+
+  // Abort requests on unmount. Some upload handlers (including the built-in
+  // one) honour the signal; handlers that do not are still tombstoned by the
+  // exact-signal check before their promise can update state.
+  React.useEffect(() => () => uploadGuard.current.clear(), []);
+
+  // A controlled attachment can be removed by another screen. Drop the local
+  // fingerprint then as well, otherwise picking that file again in this window
+  // would be mistaken for a duplicate of an attachment that no longer exists.
+  React.useEffect(() => {
+    const live = new Set(attachments.map((attachment) => attachment.url));
+    for (const [url, fingerprint] of localFingerprints.current) {
+      if (live.has(url)) continue;
+      localFingerprints.current.delete(url);
+      localFiles.current.delete(url);
+      pickOrder.current.delete(url);
+      uploadGuard.current.release(fingerprint);
+    }
+  }, [attachments]);
 
   // Grows to fit the message, capped in CSS (max-height: 40vh on the element
   // itself) so this never needs to know the viewport's actual pixel size.
@@ -617,10 +757,9 @@ export function Composer({
     setActiveIndex(0);
   }, [rowKey]);
 
-  const hasUploading = entries.some((e) => e.status === 'uploading');
   // Deliberately not gated on `busy`. A turn typed while the agent is working
   // is queued rather than refused, which is the whole point of the chips above.
-  const canSend = !disabled && !hasUploading && (text.trim().length > 0 || attachments.length > 0);
+  const canSend = canSendComposerMessage(disabled, entries, text, attachments.length);
 
   function closePicker() {
     setDismissed(true);
@@ -652,11 +791,13 @@ export function Composer({
     setText('');
     setAttachments([]);
     localFiles.current.clear();
+    localFingerprints.current.clear();
     pickOrder.current.clear();
     // Only this window's failures. A file that could not be uploaded was never
     // part of the message being sent, but the chip explaining that has no reason
     // to outlive the message it was attached to.
     setEntries([]);
+    uploadGuard.current.clear();
     setCaret(0);
     setCommandsForced(false);
   }
@@ -756,44 +897,98 @@ export function Composer({
 
   // ------------------------------------------------------------ attachments
 
-  function addFile(file: File) {
+  function startUpload(entry: AttachmentEntry) {
     if (!onUpload) return;
-    keySeq.current += 1;
-    const picked = keySeq.current;
-    const key = `${file.name}-${file.size}-${picked}`;
-    setEntries((prev) => [...prev, { key, picked, file, status: 'uploading' }]);
-    onUpload(file).then(
+    const signal = uploadGuard.current.begin(entry.key);
+    if (!signal) return;
+
+    // Retry keeps the same key, pick position and reservation. The synchronous
+    // guard above prevents a second retry while this state update is pending.
+    setEntries((prev) => prev.map((held) => (
+      held.key === entry.key ? { ...held, status: 'uploading', error: undefined } : held
+    )));
+
+    let request: Promise<ChatAttachment>;
+    try {
+      request = onUpload(entry.file, signal);
+    } catch (error) {
+      request = Promise.reject(error);
+    }
+
+    void request.then(
       (attachment) => {
+        // Removal aborts when possible and deletes this exact attempt. Even an
+        // upload handler which ignores AbortSignal cannot resurrect the chip.
+        if (!uploadGuard.current.settle(entry.key, signal)) return;
         // Handed over: the bytes are on the server under a url of its choosing,
         // so this stops being a file this window is holding and becomes one the
         // conversation has. The chip does not move — the one drawn from the
         // local `File` is replaced by one drawn from the attachment, in the same
         // place, with the same name on it.
-        setEntries((prev) => prev.filter((e) => e.key !== key));
-        localFiles.current.set(attachment.url, file);
-        pickOrder.current.set(attachment.url, picked);
-        setAttachments(placeByPickOrder(attachmentsRef.current, attachment, picked, pickOrder.current));
+        setEntries((prev) => prev.filter((held) => held.key !== entry.key));
+        localFiles.current.set(attachment.url, entry.file);
+        localFingerprints.current.set(attachment.url, entry.fingerprint);
+        pickOrder.current.set(attachment.url, entry.picked);
+        const existing = attachmentsRef.current.findIndex((held) => held.url === attachment.url);
+        if (existing >= 0) {
+          const next = [...attachmentsRef.current];
+          next[existing] = attachment;
+          setAttachments(next);
+        } else {
+          setAttachments(placeByPickOrder(
+            attachmentsRef.current,
+            attachment,
+            entry.picked,
+            pickOrder.current,
+          ));
+        }
       },
       (error: unknown) => {
+        if (!uploadGuard.current.settle(entry.key, signal)) return;
         const message = error instanceof Error ? error.message : 'That file could not be attached.';
-        setEntries((prev) => prev.map((e) => (e.key === key ? { ...e, status: 'error', error: message } : e)));
+        setEntries((prev) => prev.map((held) => (
+          held.key === entry.key ? { ...held, status: 'error', error: message } : held
+        )));
       },
     );
   }
 
   function addFiles(files: File[]) {
-    files.forEach(addFile);
+    if (!onUpload) return;
+    const next = uploadGuard.current.reserve(files).map(({ file, fingerprint }) => {
+      keySeq.current += 1;
+      const picked = keySeq.current;
+      return {
+        key: `${file.name}-${file.size}-${picked}`,
+        picked,
+        file,
+        fingerprint,
+        status: 'uploading' as const,
+      };
+    });
+    if (next.length === 0) return;
+    setEntries((prev) => [...prev, ...next]);
+    next.forEach(startUpload);
   }
 
   /** Take a file out of the message before it is sent, everywhere it is shown. */
   function removeAttachment(url: string) {
     localFiles.current.delete(url);
+    const fingerprint = localFingerprints.current.get(url);
+    if (fingerprint) uploadGuard.current.release(fingerprint);
+    localFingerprints.current.delete(url);
     pickOrder.current.delete(url);
     setAttachments(attachmentsRef.current.filter((attachment) => attachment.url !== url));
   }
 
-  function removeEntry(key: string) {
-    setEntries((prev) => prev.filter((e) => e.key !== key));
+  function removeEntry(entry: AttachmentEntry) {
+    uploadGuard.current.cancel(entry.key);
+    uploadGuard.current.release(entry.fingerprint);
+    setEntries((prev) => prev.filter((held) => held.key !== entry.key));
+  }
+
+  function retryEntry(entry: AttachmentEntry) {
+    startUpload(entry);
   }
 
   function onFileInputChange(e: React.ChangeEvent<HTMLInputElement>) {
@@ -809,15 +1004,14 @@ export function Composer({
 
     // Same classifier the terminal's image paste uses: a text-only paste must
     // come out of this exactly as if the handler were not attached at all.
-    const candidates: PasteCandidate[] = files.map((f) => ({ kind: 'file', type: f.type, size: f.size }));
-    const classification = classifyPaste(candidates, MAX_IMAGE_BYTES);
+    const classification = classifyComposerClipboardFiles(files);
     if (!classification.handled) return;
 
     e.preventDefault();
     for (const index of classification.oversize) {
       showNotification(
         `${files[index].name || 'That image'} is ${formatBytes(files[index].size)}, over the `
-          + `${formatBytes(MAX_IMAGE_BYTES)} limit.`,
+          + `${formatBytes(MAX_ATTACHMENT_BYTES)} limit.`,
         'error',
       );
     }
@@ -871,6 +1065,7 @@ export function Composer({
     preview?: string;
     status?: 'uploading' | 'error';
     error?: string;
+    onRetry?: () => void;
     onRemove: () => void;
   }[] = [
     ...attachments.map((attachment) => {
@@ -900,7 +1095,8 @@ export function Composer({
       file: entry.file,
       status: entry.status,
       error: entry.error,
-      onRemove: () => removeEntry(entry.key),
+      onRetry: entry.status === 'error' ? () => retryEntry(entry) : undefined,
+      onRemove: () => removeEntry(entry),
     })),
   ];
 
@@ -998,6 +1194,7 @@ export function Composer({
               preview={chip.preview}
               status={chip.status}
               error={chip.error}
+              onRetry={chip.onRetry}
               onRemove={chip.onRemove}
             />
           ))}
@@ -3221,7 +3418,7 @@ function QueuedChip({
  * else's screen and reached this one down the socket. What a chip needs is a
  * name, a size and something to draw, and both kinds can give all three.
  */
-function AttachmentChip({
+export function AttachmentChip({
   name,
   size,
   mime,
@@ -3229,6 +3426,7 @@ function AttachmentChip({
   preview: previewUrl,
   status = 'done',
   error,
+  onRetry,
   onRemove,
 }: {
   name: string;
@@ -3240,6 +3438,8 @@ function AttachmentChip({
   preview?: string;
   status?: 'uploading' | 'done' | 'error';
   error?: string;
+  /** Present for a failed local upload; retry reuses its identity and order. */
+  onRetry?: () => void;
   onRemove: () => void;
 }) {
   const failed = status === 'error';
@@ -3251,6 +3451,32 @@ function AttachmentChip({
   const objectUrl = useObjectUrl(isImage && !failed && file ? file : null);
   const preview = objectUrl ?? (isImage && !failed ? previewUrl : null) ?? null;
   const icon = failed ? 'circle-alert' : isImage ? 'image' : 'file-text';
+  const download = status === 'done' ? safeAttachmentDownloadUrl(previewUrl) : null;
+  const identity = (
+    <>
+      {preview ? (
+        // The picture itself, not an icon standing in for one. Attaching a
+        // screenshot and being shown a grey rectangle labelled "image" is a
+        // worse answer than the one the browser can give for free.
+        <img
+          src={preview}
+          alt=""
+          style={{ width: 24, height: 24, objectFit: 'cover', flex: '0 0 auto', display: 'block' }}
+        />
+      ) : (
+        <span
+          style={{
+            display: 'inline-flex',
+            flex: '0 0 auto',
+            animation: status === 'uploading' ? 'relay-pulse 1.2s var(--ease-in-out) infinite' : undefined,
+          }}
+        >
+          <Icon name={icon} size={11} />
+        </span>
+      )}
+      <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{name}</span>
+    </>
+  );
 
   return (
     <span
@@ -3273,28 +3499,50 @@ function AttachmentChip({
       }}
       title={failed ? error : `${name} (${formatBytes(size)})`}
     >
-      {preview ? (
-        // The picture itself, not an icon standing in for one. Attaching a
-        // screenshot and being shown a grey rectangle labelled "image" is a
-        // worse answer than the one the browser can give for free.
-        <img
-          src={preview}
-          alt=""
-          style={{ width: 24, height: 24, objectFit: 'cover', flex: '0 0 auto', display: 'block' }}
-        />
+      {download ? (
+        <a
+          href={download}
+          download={name}
+          aria-label={`Download ${name}`}
+          title={`Download ${name}`}
+          style={{
+            display: 'inline-flex',
+            alignItems: 'center',
+            gap: 6,
+            minWidth: 0,
+            color: 'inherit',
+            textDecoration: 'none',
+          }}
+        >
+          {identity}
+        </a>
       ) : (
-        <span
+        identity
+      )}
+      <span style={{ flex: '0 0 auto', color: 'var(--muted-foreground)' }}>{formatBytes(size)}</span>
+      {failed && onRetry ? (
+        <button
+          type="button"
+          onClick={onRetry}
+          aria-label={`Retry ${name}`}
+          title={`Retry uploading ${name}`}
           style={{
             display: 'inline-flex',
             flex: '0 0 auto',
-            animation: status === 'uploading' ? 'relay-pulse 1.2s var(--ease-in-out) infinite' : undefined,
+            alignItems: 'center',
+            justifyContent: 'center',
+            width: 16,
+            height: 16,
+            padding: 0,
+            background: 'transparent',
+            border: 'none',
+            color: 'inherit',
+            cursor: 'pointer',
           }}
         >
-          <Icon name={icon} size={11} />
-        </span>
-      )}
-      <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{name}</span>
-      <span style={{ flex: '0 0 auto', color: 'var(--muted-foreground)' }}>{formatBytes(size)}</span>
+          <Icon name="refresh-cw" size={10} />
+        </button>
+      ) : null}
       <button
         type="button"
         onClick={onRemove}

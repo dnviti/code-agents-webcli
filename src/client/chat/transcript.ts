@@ -90,6 +90,8 @@ function mergeQuestionHistory(...groups: QuestionRequest[][]): QuestionRequest[]
 
 export class ChatTranscript {
   private state: TranscriptState;
+  /** Session capability that owns every server-relative attachment URL. */
+  private hydratedSessionId = '';
   private listeners = new Set<Listener>();
   private messageListeners = new Map<string, Set<Listener>>();
 
@@ -177,6 +179,11 @@ export class ChatTranscript {
     return this.alive;
   }
 
+  /** Exact (and, in desktop, target-qualified) id from the latest snapshot. */
+  get sessionId(): string {
+    return this.hydratedSessionId;
+  }
+
   /**
    * True when resuming would give the agent its context back.
    *
@@ -222,6 +229,7 @@ export class ChatTranscript {
 
   /** Replace everything with a server snapshot, e.g. on join or reconnect. */
   hydrate(snapshot: ChatSnapshot): void {
+    this.hydratedSessionId = snapshot.sessionId;
     const pendingQuestions = snapshot.pendingQuestions || [];
     const questionHistory = mergeQuestionHistory(
       snapshot.questionHistory ?? this.state.questionHistory,

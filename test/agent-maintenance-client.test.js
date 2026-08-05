@@ -251,8 +251,11 @@ describe('launcher maintenance binding source', function () {
     assert.doesNotMatch(source, /targetId: targetId \|\| 'unavailable'/);
   });
 
-  it('names the durable slot by both server and target and surfaces the global operation lock', function () {
-    assert.match(source, /cc-agent-maintenance-operation:\$\{encodeURIComponent\(serverId\)\}:\$\{encodeURIComponent\(targetId\)\}/);
+  it('keys the in-memory operation handle by both server and target and surfaces the global operation lock', function () {
+    assert.match(source, /const operationKey = JSON\.stringify\(\[serverId, targetId\]\)/);
+    assert.match(source, /launcherMaintenanceOperations\.set\(operationKey, id\)/);
+    assert.match(source, /launcherMaintenanceOperations\.delete\(operationKey\)/);
+    assert.doesNotMatch(source, /localStorage\.setItem/);
     assert.match(source, /operationBusyReason: maintenance\.operationBusyReason/);
   });
 });

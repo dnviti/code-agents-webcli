@@ -277,6 +277,11 @@ describe('project session integration', function () {
         ['composed-chat', false],
       ]);
     } finally {
+      // This fixture intentionally inserts a synthetic unscoped record to test
+      // only the lifecycle seam. Production now refuses such a record during
+      // the final flush, so isolate shutdown from that deliberately invalid
+      // persistence shape.
+      server.saveSessionsToDisk = async () => true;
       await server.shutdown();
       // The constructor registers a beforeExit callback; make its eventual
       // invocation harmless after shutdown has closed this test database.
@@ -927,6 +932,86 @@ describe('project session integration', function () {
     assert(order.indexOf('stop:project-chat') < order.indexOf('release:project-chat'));
     assert(order.indexOf('release:project-chat') < order.indexOf('transcript:project-chat'));
     assert.strictEqual(saves, 1);
+  });
+
+  it('confirms a project recovery anchor before cleanup and removes it under the exclusive lifecycle', async function () {
+    const anchor = record({
+      id: 'project-recovery',
+      projectId: 'project-1',
+      surface: 'chat',
+      rollbackRecoveryPending: true,
+      tabOpen: false,
+    });
+    const other = record({ id: 'other-project', projectId: 'project-2' });
+    const sessions = new Map([[anchor.id, anchor], [other.id, other]]);
+    const order = [];
+    const contexts = [];
+    let saves = 0;
+    const retired = await retireProjectSessions({
+      claudeSessions: sessions,
+      webSocketConnections: new Map(),
+      saveSessionsToDisk: async () => { saves += 1; return true; },
+      transcriptStore: {
+        deleteTranscript: async (session) => { order.push(`transcript:${session.id}`); },
+      },
+      historyStore: {
+        deleteHistory: async (session) => { order.push(`history:${session.id}`); },
+      },
+      sessionTeardown: {
+        async disposeStrict(session, context) {
+          order.push(`teardown:${session.id}`);
+          contexts.push(context);
+          return { failures: [] };
+        },
+        async dispose() { throw new Error('non-strict recovery cleanup was used'); },
+      },
+      disposeRecorder: (id) => { order.push(`recorder:${id}`); },
+    }, 'project-1');
+
+    assert.deepStrictEqual(retired, [anchor.id]);
+    assert.strictEqual(saves, 2, 'the first save confirms the anchor; the second removes its row');
+    assert.deepStrictEqual(order, [
+      `transcript:${anchor.id}`,
+      `history:${anchor.id}`,
+      `teardown:${anchor.id}`,
+      `recorder:${anchor.id}`,
+    ]);
+    assert.deepStrictEqual(contexts, [{ projectLifecycleExclusive: true }]);
+    assert.deepStrictEqual([...sessions.keys()], [other.id]);
+  });
+
+  it('blocks project recovery cleanup when workspace persistence is unavailable', async function () {
+    const anchor = record({
+      id: 'unavailable-project-recovery',
+      projectId: 'project-1',
+      surface: 'chat',
+      rollbackRecoveryPending: true,
+      persistenceUnavailable: 'workspace is read-only',
+      tabOpen: false,
+    });
+    const sessions = new Map([[anchor.id, anchor]]);
+    let saves = 0;
+    let cleanup = 0;
+    await assert.rejects(
+      retireProjectSessions({
+        claudeSessions: sessions,
+        webSocketConnections: new Map(),
+        saveSessionsToDisk: async () => { saves += 1; return true; },
+        transcriptStore: { deleteTranscript: async () => { cleanup += 1; } },
+        historyStore: { deleteHistory: async () => { cleanup += 1; } },
+        sessionTeardown: {
+          async disposeStrict() { cleanup += 1; return { failures: [] }; },
+          async dispose() { cleanup += 1; },
+        },
+        disposeRecorder: () => { cleanup += 1; },
+      }, 'project-1'),
+      /rollback recovery .* unavailable/i,
+    );
+
+    assert.strictEqual(saves, 0);
+    assert.strictEqual(cleanup, 0);
+    assert.strictEqual(sessions.get(anchor.id), anchor);
+    assert.strictEqual(anchor.retiring, false);
   });
 
   it('suspends project runtimes without deleting their sessions or transcripts', async function () {

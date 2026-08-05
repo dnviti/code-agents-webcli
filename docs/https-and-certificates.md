@@ -81,6 +81,54 @@ Step 3 is easy to miss and nothing works without it.
 Settings → Security → Encryption & credentials → Install a certificate → **CA
 certificate**.
 
+### Windows
+
+Open the certificate file, choose **Install Certificate**, install it for the
+current user, and explicitly place it in **Trusted Root Certification
+Authorities**. Verify the fingerprint before accepting the warning for a new
+root.
+
+## The desktop phone-access CA
+
+**Open on phone** uses a separate CA owned by the installed desktop app. It does
+not reuse the normal server CA, the embedded Local computer cookie, or a saved
+remote server's certificate decision. The desktop persists that CA so a trusted
+phone does not need to be enrolled after every launch, but rotates the leaf
+certificate when the advertised LAN address changes. The listener and all
+pairing sessions remain off after a restart.
+
+Prefer exporting the CA directly from the trusted desktop dialog. The active
+LAN gateway also exposes `/ca.crt` without a phone session because a phone must
+obtain the CA before it can trust the pairing page. In either case, compare its
+SHA-256 fingerprint with the value displayed by the desktop before installing
+it. See the complete [Open Local computer on a phone](phone-access.md) flow.
+
+Tailscale Serve terminates HTTPS with the tailnet machine name and does not
+require this private CA. A LAN address and a `ts.net` address are different
+browser origins, so their cookies, service workers, installed PWAs, and pairing
+sessions do not transfer between them.
+
+## Removing a local CA
+
+Remove a private CA when you no longer use it. Make sure you remove the root CA,
+not only a leaf/server certificate:
+
+- **iOS / iPadOS:** Settings → General → VPN & Device Management → select the
+  downloaded profile → **Remove Profile**. Also confirm it no longer appears as
+  enabled under Certificate Trust Settings.
+- **Android:** Settings → Security → Encryption & credentials → Trusted
+  credentials → **User**, select the CA, then remove or disable it. Labels vary
+  slightly by Android vendor.
+- **macOS:** open Keychain Access, locate the CA in the login or System
+  keychain, verify its fingerprint, then delete it.
+- **Windows:** open **Manage user certificates**, expand Trusted Root
+  Certification Authorities → Certificates, verify the fingerprint, then
+  delete the matching CA.
+- **Linux (Chrome/Chromium NSS):** run `certutil -d sql:$HOME/.pki/nssdb -D -n
+  "Code Agents Web CLI local CA"`. For a system CA, remove the file you installed
+  from the distribution's trust-anchor directory and rerun its trust-update
+  command.
+
 ## Using your own certificate
 
 Pass both flags and nothing is generated:

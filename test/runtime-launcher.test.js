@@ -160,6 +160,23 @@ describe('RuntimeLauncher', function () {
     );
   });
 
+  it('shows a recovery anchor but disables resuming it', function () {
+    const html = render(undefined, {
+      conversations: [conversation({
+        rollbackRecoveryPending: true,
+        events: 0,
+        firstMessage: null,
+        canResume: false,
+      })],
+      onResume() {},
+    });
+
+    assert.match(html, /rollback cleanup pending/i);
+    assert.match(html, /disabled=""/);
+    assert.match(html, /Delete this recovery entry to retry cleanup/i);
+    assert.doesNotMatch(html, /transcript only/i);
+  });
+
   it('describes what the bypass actually does, not just that it is dangerous', function () {
     // "Dangerous" tells a user nothing about what they are agreeing to.
     const html = render();

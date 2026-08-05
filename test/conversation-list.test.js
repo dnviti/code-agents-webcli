@@ -165,6 +165,51 @@ describe('listing every conversation by project', function () {
     assert.deepStrictEqual(flat(got.body), ['dov’è finito lo script di release?']);
   });
 
+  it('keeps a migration-blocked conversation visible with its retry reason', async function () {
+    const reason = 'Workspace archive is unavailable';
+    await conversation('blocked', 'conversation still discoverable', {
+      persistenceUnavailable: reason,
+    });
+    const log = path.join(storageDir, '7', 'blocked.jsonl');
+    const index = path.join(storageDir, '7', 'blocked.idx');
+    fs.rmSync(index);
+    const beforeLog = fs.readFileSync(log);
+    const beforeEntries = fs.readdirSync(path.dirname(log)).sort();
+
+    const got = await list();
+
+    assert.strictEqual(got.status, 200);
+    assert.strictEqual(got.body.total, 1);
+    const blocked = got.body.projects[0].conversations[0];
+    assert.strictEqual(blocked.persistenceUnavailable, reason);
+    assert.strictEqual(blocked.canResume, false);
+    assert.strictEqual(blocked.running, false);
+    assert.strictEqual(fs.existsSync(index), false, 'listing does not rebuild a legacy global index');
+    assert.deepStrictEqual(fs.readFileSync(log), beforeLog, 'listing does not repair/truncate the legacy log');
+    assert.deepStrictEqual(
+      fs.readdirSync(path.dirname(log)).sort(),
+      beforeEntries,
+      'listing creates no legacy sidecar',
+    );
+  });
+
+  it('keeps an empty-log recovery anchor visible for definitive deletion', async function () {
+    sessions.set('recovery-anchor', record('recovery-anchor', {
+      rollbackRecoveryPending: true,
+      tabOpen: false,
+    }));
+
+    const got = await list();
+
+    assert.strictEqual(got.status, 200);
+    assert.strictEqual(got.body.total, 1);
+    const anchor = got.body.projects[0].conversations[0];
+    assert.strictEqual(anchor.id, 'recovery-anchor');
+    assert.strictEqual(anchor.rollbackRecoveryPending, true);
+    assert.strictEqual(anchor.events, 0);
+    assert.strictEqual(anchor.firstMessage, null);
+  });
+
   it('groups conversations under the folder they belong to', async function () {
     await conversation('a1', 'alpha uno', { workingDir: '/projects/alpha' });
     await conversation('a2', 'alpha due', { workingDir: '/projects/alpha' });

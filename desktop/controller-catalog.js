@@ -79,8 +79,9 @@ function sanitizeSession(metadata) {
   return Object.keys(result).length ? result : null;
 }
 
-// The shape is intentionally narrow.  In particular it cannot accidentally
-// retain transcripts, terminal output, file contents, cookies, or credentials.
+// The shape is intentionally narrow. It is an in-memory availability aid for
+// the current controller process only; session metadata must never enter the
+// installation-wide desktop catalog under Electron userData.
 function sanitizeOfflineMetadataCache(metadata) {
   const sessions = Array.isArray(metadata) ? metadata : metadata && metadata.sessions;
   if (!Array.isArray(sessions)) return { sessions: [] };
@@ -137,8 +138,21 @@ function persistedTarget(target) {
   if (target.certificateOverride && target.certificateOverride.origin === target.origin && typeof target.certificateOverride.fingerprint === 'string') {
     result.certificateOverride = { origin: target.origin, fingerprint: target.certificateOverride.fingerprint };
   }
-  if (target.offlineMetadataCache) result.offlineMetadataCache = sanitizeOfflineMetadataCache(target.offlineMetadataCache);
   return result;
+}
+
+function hasPersistedOfflineMetadata(filename, fileSystem = fs) {
+  try {
+    const parsed = JSON.parse(fileSystem.readFileSync(filename, 'utf8'));
+    return parsed?.version === SCHEMA_VERSION
+      && Array.isArray(parsed.targets)
+      && parsed.targets.some((target) => (
+        target && typeof target === 'object'
+        && Object.prototype.hasOwnProperty.call(target, 'offlineMetadataCache')
+      ));
+  } catch {
+    return false;
+  }
 }
 
 function readCatalog(filename, fileSystem = fs) {
@@ -182,7 +196,13 @@ class ControllerCatalog {
     this.fileSystem = fileSystem;
     this.randomUUID = randomUUID;
     this.now = now;
+    const removeLegacySessionMetadata = hasPersistedOfflineMetadata(filename, fileSystem);
     this.targets = readCatalog(filename, fileSystem);
+    // Older desktop builds wrote session ids, names, runtimes and activity into
+    // servers.json. Rewrite a structurally readable legacy catalog immediately
+    // through the metadata-free serializer; target configuration and trust are
+    // retained, while the session cache is not even rehydrated into memory.
+    if (removeLegacySessionMetadata) writeCatalog(filename, this.targets, fileSystem);
   }
 
   list() { return [LOCAL_TARGET, ...this.targets.map(clone)]; }
@@ -261,7 +281,17 @@ class ControllerCatalog {
     this._replace(id, updated); return clone(updated);
   }
   clearCertificateOverride(id) { this._assertRemote(id); const updated = { ...this._find(id) }; delete updated.certificateOverride; this._replace(id, updated); return clone(updated); }
-  setOfflineMetadata(id, metadata) { this._assertRemote(id); const updated = { ...this._find(id), offlineMetadataCache: sanitizeOfflineMetadataCache(metadata) }; this._replace(id, updated); return clone(updated); }
+  setOfflineMetadata(id, metadata) {
+    this._assertRemote(id);
+    const updated = {
+      ...this._find(id),
+      offlineMetadataCache: sanitizeOfflineMetadataCache(metadata),
+    };
+    // `_replace` keeps the cache in this process, while `persistedTarget`
+    // deliberately omits it from the atomic servers.json write.
+    this._replace(id, updated);
+    return clone(updated);
+  }
   setIdentity(id, identity) {
     this._assertRemote(id);
     const current = this._find(id);

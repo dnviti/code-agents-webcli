@@ -512,7 +512,7 @@ function ProjectGroup({
   );
 }
 
-function ConversationRow({
+export function ConversationRow({
   conversation,
   hasTab,
   isActive,
@@ -529,6 +529,10 @@ function ConversationRow({
   const [hover, setHover] = React.useState(false);
   const label = conversationLabel(conversation);
   const when = new Date(conversation.lastActivity);
+  const blockedReason = conversation.persistenceUnavailable
+    || (conversation.rollbackRecoveryPending
+      ? 'Rollback cleanup is pending. Delete this recovery entry to retry cleanup.'
+      : undefined);
   // Whether it is running, and in what mode, is live session information — and
   // the phone rule for that is explicit: never below the body size. A badge
   // draws itself at the app-wide caption size, which is 10px, so the two facts
@@ -550,10 +554,11 @@ function ConversationRow({
     >
       <button
         type="button"
+        disabled={Boolean(blockedReason)}
         onClick={onOpen}
         onMouseEnter={() => setHover(true)}
         onMouseLeave={() => setHover(false)}
-        title={label}
+        title={blockedReason || label}
         aria-label={rowDescription(conversation, hasTab)}
         style={{
           flex: 1,
@@ -568,7 +573,8 @@ function ConversationRow({
           color: 'var(--foreground)',
           font: 'inherit',
           textAlign: 'left',
-          cursor: 'pointer',
+          cursor: blockedReason ? 'not-allowed' : 'pointer',
+          opacity: blockedReason ? 0.7 : 1,
         }}
       >
         <span
@@ -600,11 +606,17 @@ function ConversationRow({
           {conversation.running ? (
             <Badge variant="success" style={badgeStyle}>running</Badge>
           ) : null}
+          {conversation.persistenceUnavailable ? (
+            <Badge variant="destructive" style={badgeStyle}>migration blocked</Badge>
+          ) : null}
+          {conversation.rollbackRecoveryPending ? (
+            <Badge variant="destructive" style={badgeStyle}>rollback cleanup pending</Badge>
+          ) : null}
           {/* Said before the choice is made, not discovered on arrival: the
               transcript comes back either way, and this is the difference
               between an agent that remembers it and one reading it for the
               first time. */}
-          {!conversation.running && !conversation.canResume ? (
+          {!conversation.rollbackRecoveryPending && !conversation.running && !conversation.canResume ? (
             <Badge variant="outline" style={badgeStyle}>transcript only</Badge>
           ) : null}
           {conversation.bypassPermissions ? (
@@ -618,6 +630,7 @@ function ConversationRow({
 
       <IconButton
         label={`Delete “${label}”`}
+        disabled={Boolean(conversation.persistenceUnavailable)}
         onClick={onDelete}
         style={{ alignSelf: 'center', flex: '0 0 auto', marginRight: 2 }}
       >
@@ -639,6 +652,10 @@ function rowDescription(conversation: ConversationSummary, hasTab: boolean): str
   parts.push(conversation.runtimeLabel || conversation.runtime || 'chat');
   parts.push(`last active ${new Date(conversation.lastActivity).toLocaleString()}`);
   if (conversation.running) parts.push('running now');
+  if (conversation.persistenceUnavailable) parts.push('workspace migration blocked');
+  else if (conversation.rollbackRecoveryPending) {
+    parts.push('rollback cleanup pending; delete this entry to retry cleanup');
+  }
   else if (!conversation.canResume) parts.push('the agent cannot carry on from where it left off');
   if (conversation.bypassPermissions) parts.push('approvals bypassed');
   if (hasTab) parts.push('already open');

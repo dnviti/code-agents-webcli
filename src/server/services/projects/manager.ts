@@ -14,7 +14,9 @@ import {
   ProjectContainerStateUnknownError,
   ProjectEnvironmentResult,
   ProjectEnvironmentManager,
+  ProjectWorkspaceSessionStorageError,
   ProjectTrackedSpawnDescriptor,
+  WorkspaceSessionStorageIdentity,
   FORGE_SCRATCH,
   validateProjectContainerPath,
 } from './environment.js';
@@ -182,6 +184,29 @@ export interface ProjectManagerDeps {
   deleteProjectSessions?(projectId: string, ownerUserId: number): Promise<void> | void;
   /** Stop attached runtimes and detach their live claims without deleting history. */
   suspendProjectSessions?(projectId: string, ownerUserId: number): Promise<void> | void;
+  /** Flush and close workspace-local SQLite handles before a checkout is removed. */
+  /** Return exact authority when a loaded archive was suspended and is mandatory. */
+  beforeWorkspaceReplacement?(
+    project: Project,
+  ): Promise<boolean | ProjectWorkspaceReplacementAuthority> | boolean | ProjectWorkspaceReplacementAuthority;
+  /** Reopen workspace-local stores while binding SQLite to retained authority. */
+  afterWorkspaceRestored?(
+    project: Project,
+    expected?: WorkspaceSessionStorageIdentity,
+  ): Promise<WorkspaceSessionStorageIdentity | void> | WorkspaceSessionStorageIdentity | void;
+  /** Reverify the reopened live lease after the durable intent is retired. */
+  confirmWorkspaceRestored?(
+    project: Project,
+    expected: WorkspaceSessionStorageIdentity,
+  ): Promise<WorkspaceSessionStorageIdentity> | WorkspaceSessionStorageIdentity;
+  /** Close a reopened store when final authority verification fails. */
+  rejectWorkspaceRestore?(project: Project, reason: string): Promise<void> | void;
+  /** Close the empty archive immediately before explicit project deletion. */
+  beforeWorkspaceDeletion?(project: Project): Promise<void> | void;
+  /** Legacy import rows make physical replacement unsafe until migration succeeds. */
+  hasLegacyProjectSessions?(projectId: string, ownerUserId: number): boolean;
+  /** Binary rollback authority may survive after the legacy SQLite row was cut over. */
+  hasIncompleteProjectSessionMigration?(project: Project): Promise<boolean> | boolean;
   /** Attached clients, commands or agent turns not yet represented by DB active=1. */
   hasLiveProjectWork?(projectId: string): boolean;
   fetch?: FetchLike;
@@ -194,6 +219,11 @@ export interface ProjectManagerDeps {
   compositionRuntime?: CompositionRuntimeAdapter;
   /** Test/embedding override; the server default is the OS user's ~/.cc-web/workspaces. */
   localWorkspaceRoot?: string;
+}
+
+export interface ProjectWorkspaceReplacementAuthority {
+  readonly required: boolean;
+  readonly identity?: WorkspaceSessionStorageIdentity;
 }
 
 export class ProjectManager {
@@ -216,6 +246,27 @@ export class ProjectManager {
   constructor(private readonly deps: ProjectManagerDeps) {
     this.projects = new ProjectEnvironmentManager(deps.environments, deps.localWorkspaceRoot);
     this.now = deps.now || (() => new Date());
+  }
+
+  private async projectSessionMigrationIsIncomplete(project: Project): Promise<boolean> {
+    try {
+      return Boolean(
+        this.deps.hasLegacyProjectSessions?.(project.id, project.ownerUserId)
+        || await this.deps.hasIncompleteProjectSessionMigration?.(project),
+      );
+    } catch (error) {
+      throw new ProjectWorkspaceSessionStorageError(
+        `Project session migration could not be verified: ${(error as Error).message}`,
+      );
+    }
+  }
+
+  private async assertProjectSessionMigrationComplete(project: Project): Promise<void> {
+    if (await this.projectSessionMigrationIsIncomplete(project)) {
+      throw new ProjectWorkspaceSessionStorageError(
+        'Project session migration is incomplete; restore the workspace and retry before replacing it',
+      );
+    }
   }
 
   /**
@@ -988,9 +1039,11 @@ export class ProjectManager {
     });
     if (!reclaimed.ok) return reclaimed;
     try {
+      await this.deps.beforeWorkspaceDeletion?.(project);
+      await this.projects.removeWorkspace(project, this.owner(ownerUserId));
       await this.projects.removeOverlay(project);
     } catch (error) {
-      const detail = `project overlay could not be removed: ${(error as Error).message}`;
+      const detail = `project workspace could not be removed: ${(error as Error).message}`;
       this.deps.store.setState(project.id, 'stopped', detail);
       this.publish(this.deps.store.getProject(project.id) as Project);
       return { ok: false, reason: 'invalid_state', detail };
@@ -1045,6 +1098,36 @@ export class ProjectManager {
 
   getForUser(ownerUserId: number, projectId: string): Project | null {
     return this.deps.store.getProjectForUser(projectId, ownerUserId);
+  }
+
+  /**
+   * Stable host root for workspace-local session data.
+   *
+   * This deliberately performs no lifecycle admission. Project removal already
+   * owns `exclusiveFor(projectId)` when it tears sessions down, so attempting to
+   * reacquire that gate here would deadlock the deletion which needs the path.
+   */
+  projectWorkspaceRoot(ownerUserId: number, projectId: string): string | null {
+    const project = this.deps.store.getProjectForUser(projectId, ownerUserId);
+    if (!project) return null;
+    return this.projects.worktreePath(project, this.owner(ownerUserId));
+  }
+
+  /**
+   * Pin ordinary session-file cleanup against rebuild/reclaim without starting
+   * a stopped project. The project-delete path uses `projectWorkspaceRoot`
+   * directly because its caller already holds this same exclusive gate.
+   */
+  async withProjectWorkspace<T>(
+    ownerUserId: number,
+    projectId: string,
+    operation: (workspaceRoot: string) => Promise<T>,
+  ): Promise<T> {
+    return this.exclusiveFor([projectId], async () => {
+      const workspaceRoot = this.projectWorkspaceRoot(ownerUserId, projectId);
+      if (!workspaceRoot) throw new Error('project is unavailable');
+      return operation(workspaceRoot);
+    });
   }
 
   targetNameFor(project: Project): string | null {
@@ -1109,9 +1192,14 @@ export class ProjectManager {
     }
 
     if (input.repoUrl !== undefined && nextRepo !== project.repoUrl && project.repoUrl) {
+      try {
+        await this.assertProjectSessionMigrationComplete(project);
+      } catch (error) {
+        return { ok: false, reason: 'preserve_failed', detail: (error as Error).message };
+      }
       const preserved = await this.snapshotBeforeRepositoryChange(project);
       if (!preserved.ok) return preserved;
-      await this.projects.clearCheckout(project, this.owner(ownerUserId));
+      await this.clearCheckout(project, this.owner(ownerUserId));
     }
     this.deps.store.updateProject(project.id, {
       name,
@@ -1157,7 +1245,7 @@ export class ProjectManager {
       try {
         if (project.executionKind === 'host') {
           const result = await this.projects.ensureLocal(project, this.owner(ownerUserId));
-          this.deps.store.touchActivity(project.id, this.now());
+          await this.restoreWorkspaceSessionStorage(project, this.owner(ownerUserId));
           this.issuedHostLeases.set(lease.leaseId, { ownerUserId, projectId });
           return { ok: true, ...result, leaseId: lease.leaseId };
         }
@@ -1187,7 +1275,7 @@ export class ProjectManager {
           if (!started.ok && started.reason === 'run_limit') return { ok: false, reason: 'run_limit', running: started.running };
           return { ok: false, reason: started.ok ? 'building' : 'failed', detail: started.ok ? undefined : started.detail || started.reason };
         }
-        this.deps.store.touchActivity(project.id, this.now());
+        await this.restoreWorkspaceSessionStorage(project, this.owner(ownerUserId));
         this.issuedLeases.set(lease.leaseId, {
           ownerUserId,
           projectId,
@@ -1211,6 +1299,9 @@ export class ProjectManager {
       } catch (error) {
         if (error instanceof ProjectContainerStateUnknownError) {
           this.deps.store.setContainer(project.id, { name: error.containerName });
+          this.deps.store.setState(project.id, 'running', error.message);
+          this.publish(this.deps.store.getProject(project.id) as Project);
+        } else if (error instanceof ProjectWorkspaceSessionStorageError) {
           this.deps.store.setState(project.id, 'running', error.message);
           this.publish(this.deps.store.getProject(project.id) as Project);
         }
@@ -1986,6 +2077,12 @@ export class ProjectManager {
       if (missingRecordedDockerRuntime) this.deps.store.setRebuildRequired(project.id, true);
       const current = this.deps.store.getProject(project.id) as Project;
       const requiresWorkspaceRebuild = current.rebuildRequired;
+      if (requiresWorkspaceRebuild) {
+        await this.assertProjectSessionMigrationComplete(current);
+      }
+      if (!requiresWorkspaceRebuild) {
+        await this.restoreWorkspaceSessionStorage(current, owner);
+      }
       if (current.repoUrl) {
         if (requiresWorkspaceRebuild && hadValidCheckout) {
           this.event(current, { t: 'preserve', message: 'Preserving work before replacing the project container' });
@@ -2024,6 +2121,9 @@ export class ProjectManager {
         prepared = await this.projects.ensure({ ...current, container: { name: prepared.containerName } }, owner);
         workingProject = { ...current, container: { name: prepared.containerName } };
         this.deps.store.setContainer(current.id, workingProject.container);
+        if (!current.repoUrl) {
+          await this.restoreWorkspaceSessionStorage(current, owner);
+        }
       }
       let composition: ProjectComposition | null = null;
       let installationResults: CompositionInstallation[] = [];
@@ -2068,7 +2168,7 @@ export class ProjectManager {
           // cleanup cannot turn a partial `.git` directory into boot evidence.
           this.deps.store.setRebuildRequired(current.id, true);
           checkoutReplacementStarted = true;
-          await this.projects.clearCheckout(current, owner);
+          await this.clearCheckout(current, owner);
           this.event(current, { t: 'step', step: 'clone', percent: 45, message: 'Cloning repository' });
           await cloneRepository({
             engine: this.deps.environments.projectTarget(current.targetId).engine,
@@ -2084,6 +2184,7 @@ export class ProjectManager {
         if (!(await this.projects.hasValidCheckout(current, owner))) {
           throw new Error('Repository clone completed without a valid .git checkout');
         }
+        await this.restoreWorkspaceSessionStorage(current, owner);
         checkoutReplacementStarted = false;
       }
       const failedInstallations = installationResults.filter((item) => item.status === 'failed');
@@ -2114,10 +2215,14 @@ export class ProjectManager {
       });
     } catch (error) {
       const message = (error as Error).message;
+      if (error instanceof ProjectWorkspaceSessionStorageError) {
+        failureState = 'blocked';
+        failureEvent = 'preserve';
+      }
       if (error instanceof CloneSourceChangedError) {
         try {
           if (checkoutReplacementStarted) {
-            await this.projects.clearCheckout(project, this.owner(ownerUserId));
+            await this.clearCheckout(project, this.owner(ownerUserId));
             checkoutReplacementStarted = false;
           }
           if (workingProject) await this.projects.stop(workingProject);
@@ -2137,7 +2242,7 @@ export class ProjectManager {
       }
       if (checkoutReplacementStarted) {
         try {
-          await this.projects.clearCheckout(project, this.owner(ownerUserId));
+          await this.clearCheckout(project, this.owner(ownerUserId));
           checkoutReplacementStarted = false;
         } catch {
           failureState = 'blocked';
@@ -2199,7 +2304,7 @@ export class ProjectManager {
           if (!access.ok) throw new Error(access.message);
           this.deps.store.setRebuildRequired(current.id, true);
           replacementStarted = true;
-          await this.projects.clearCheckout(current, owner);
+          await this.clearCheckout(current, owner);
           this.event(current, { t: 'step', step: 'clone', percent: 45, message: 'Cloning repository into the local workspace' });
           await cloneRepositoryOnHost({
             repoUrl: current.repoUrl!,
@@ -2211,6 +2316,7 @@ export class ProjectManager {
         });
         replacementStarted = false;
       }
+      await this.restoreWorkspaceSessionStorage(current, owner);
       if (composition && !this.deps.store.markCompositionApplied(project.id, project.ownerUserId, composition.id)) {
         throw new Error('Active build recipe changed before its result could be recorded');
       }
@@ -2222,11 +2328,14 @@ export class ProjectManager {
         t: 'state', state: 'running', percent: 100, message: 'Local project ready',
       });
     } catch (error) {
-      if (replacementStarted) await this.projects.clearCheckout(project, owner).catch(() => undefined);
+      if (replacementStarted) await this.clearCheckout(project, owner).catch(() => undefined);
       const message = (error as Error).message;
-      this.deps.store.setState(project.id, error instanceof CloneSourceChangedError ? 'composition_pending' : 'failed', message);
+      const state: ProjectState = error instanceof CloneSourceChangedError
+        ? 'composition_pending'
+        : error instanceof ProjectWorkspaceSessionStorageError ? 'blocked' : 'failed';
+      this.deps.store.setState(project.id, state, message);
       this.event(this.deps.store.getProject(project.id) as Project, {
-        t: 'error', state: error instanceof CloneSourceChangedError ? 'composition_pending' : 'failed', message,
+        t: error instanceof ProjectWorkspaceSessionStorageError ? 'preserve' : 'error', state, message,
       });
     }
   }
@@ -2316,6 +2425,18 @@ export class ProjectManager {
     beforeDestroy?: () => Promise<void>,
     alreadyClaimed = false,
   ): Promise<SimpleResult> {
+    if (await this.projectSessionMigrationIsIncomplete(project)) {
+      const detail = 'Project session migration is incomplete; restore the workspace and retry before reclaiming it';
+      // `tryClaimIdleReclaim` may already have moved the durable row into the
+      // counted transition state. Put it back exactly where the claim found it
+      // (running/stopped/blocked/reclaiming) and expose the migration reason;
+      // an import guard must not strand an idle project in a fake in-flight
+      // reclaim or make a still-running runtime uncounted.
+      this.deps.store.setRebuildRequired(project.id, project.rebuildRequired);
+      this.deps.store.setState(project.id, project.state, detail);
+      this.publish(this.deps.store.getProject(project.id) as Project);
+      return { ok: false, reason: 'preserve_failed', detail };
+    }
     if (project.container?.reconciliationConflict === 'unverified_runtime') {
       return { ok: false, reason: 'invalid_state', detail: 'project runtime ownership is unverified; wait for a complete boot reconciliation' };
     }
@@ -2436,7 +2557,7 @@ export class ProjectManager {
       // Reclaim has durably committed a true-rebuild cause before touching the
       // runtime/workspace. Any failure remains counted until boot or an
       // explicit retry can prove what survived; never publish reusable state.
-      let state: ProjectState = 'reclaiming';
+      let state: ProjectState = error instanceof ProjectWorkspaceSessionStorageError ? 'blocked' : 'reclaiming';
       let detail = (error as Error).message;
       if (workingProject.container) {
         try {
@@ -2450,8 +2571,10 @@ export class ProjectManager {
         }
       }
       this.deps.store.setState(project.id, state, detail);
-      this.event(this.deps.store.getProject(project.id) as Project, { t: 'error', state, message: detail });
-      return { ok: false, reason: 'invalid_state', detail };
+      this.event(this.deps.store.getProject(project.id) as Project, {
+        t: error instanceof ProjectWorkspaceSessionStorageError ? 'preserve' : 'error', state, message: detail,
+      });
+      return { ok: false, reason: error instanceof ProjectWorkspaceSessionStorageError ? 'preserve_failed' : 'invalid_state', detail };
     }
   }
 
@@ -2491,19 +2614,144 @@ export class ProjectManager {
       return { ok: true };
     } catch (error) {
       const detail = (error as Error).message;
-      this.deps.store.setState(project.id, 'reclaiming', detail);
-      this.event(this.deps.store.getProject(project.id) as Project, { t: 'error', state: 'reclaiming', message: detail });
-      return { ok: false, reason: 'invalid_state', detail };
+      const state: ProjectState = error instanceof ProjectWorkspaceSessionStorageError ? 'blocked' : 'reclaiming';
+      this.deps.store.setState(project.id, state, detail);
+      this.event(this.deps.store.getProject(project.id) as Project, {
+        t: error instanceof ProjectWorkspaceSessionStorageError ? 'preserve' : 'error', state, message: detail,
+      });
+      return { ok: false, reason: error instanceof ProjectWorkspaceSessionStorageError ? 'preserve_failed' : 'invalid_state', detail };
+    }
+  }
+
+  private async workspaceReplacementAuthority(
+    project: Project,
+  ): Promise<ProjectWorkspaceReplacementAuthority> {
+    const prepared = await this.deps.beforeWorkspaceReplacement?.(project);
+    if (prepared === true) return { required: true };
+    if (!prepared) return { required: false };
+    return {
+      required: prepared.required === true,
+      ...(prepared.identity ? { identity: prepared.identity } : {}),
+    };
+  }
+
+  private async clearCheckout(project: Project, owner: EnvironmentOwner): Promise<void> {
+    await this.assertProjectSessionMigrationComplete(project);
+    const authority = await this.workspaceReplacementAuthority(project);
+    const archiveRequired = authority.required;
+    const expectedStorage = authority.identity;
+    let replacementError: unknown;
+    try {
+      await this.projects.clearCheckout(project, owner, archiveRequired, expectedStorage);
+    } catch (error) {
+      replacementError = error;
+    }
+    // `.cc-web` now lives beside the disposable checkout, not inside it. Once
+    // the old checkout is gone the retained archive is already back in its
+    // canonical place, so reopen it immediately even if the following clone
+    // later fails. This also prevents repository changes from leaving an
+    // otherwise healthy session database suspended until the next build.
+    try {
+      await this.restoreWorkspaceSessionStorage(project, owner, archiveRequired, expectedStorage);
+    } catch (restoreError) {
+      if (replacementError) {
+        throw new ProjectWorkspaceSessionStorageError(
+          `checkout replacement failed and workspace session storage could not be restored: ${(replacementError as Error).message}; ${(restoreError as Error).message}`,
+        );
+      }
+      throw restoreError;
+    }
+    if (replacementError) throw replacementError;
+  }
+
+  private async restoreWorkspaceSessionStorage(
+    project: Project,
+    owner: EnvironmentOwner,
+    required = false,
+    expected?: WorkspaceSessionStorageIdentity,
+  ): Promise<void> {
+    if (required && !expected) {
+      throw new ProjectWorkspaceSessionStorageError(
+        'workspace session storage could not be restored with its pre-suspension identity',
+      );
+    }
+    const restored = await this.projects.restoreWorkspaceSessionStorage(project, owner, expected);
+    if (required && !restored) {
+      throw new ProjectWorkspaceSessionStorageError(
+        'workspace session storage was not restored after project replacement',
+      );
+    }
+    if (!restored) return;
+
+    const recoveryIdentity = await this.projects.workspaceSessionStorageRecoveryIdentity(project, owner)
+      || expected;
+    try {
+      const reopened = await this.deps.afterWorkspaceRestored?.(project, recoveryIdentity);
+      if (!recoveryIdentity) return;
+      if (
+        !reopened
+        || reopened.dev !== recoveryIdentity.dev
+        || reopened.ino !== recoveryIdentity.ino
+      ) {
+        throw new ProjectWorkspaceSessionStorageError(
+          'workspace session storage reopen did not prove the retained archive inode',
+        );
+      }
+      await this.projects.completeWorkspaceSessionStorageRestore(project, owner, reopened);
+      const confirmed = await this.deps.confirmWorkspaceRestored?.(project, recoveryIdentity);
+      if (
+        !confirmed
+        || confirmed.dev !== recoveryIdentity.dev
+        || confirmed.ino !== recoveryIdentity.ino
+      ) {
+        throw new ProjectWorkspaceSessionStorageError(
+          'workspace session storage lease changed after restore completion',
+        );
+      }
+    } catch (error) {
+      if (recoveryIdentity) {
+        await this.projects.recordWorkspaceSessionStorageIntent(
+          project,
+          owner,
+          recoveryIdentity,
+        ).catch(() => undefined);
+      }
+      await this.deps.rejectWorkspaceRestore?.(
+        project,
+        error instanceof Error ? error.message : String(error),
+      );
+      throw error;
     }
   }
 
   private async wipe(project: Project): Promise<void> {
-    const root = this.projects.worktreePath(project, this.owner(project.ownerUserId));
+    await this.assertProjectSessionMigrationComplete(project);
+    const owner = this.owner(project.ownerUserId);
+    const root = this.projects.worktreePath(project, owner);
     // `project.id` is a UUID from our store, nevertheless retain the parent
     // check: no malformed row may turn lifecycle recovery into a broad wipe.
     const parent = path.dirname(root);
     if (path.basename(root) !== project.id || path.resolve(root) === path.resolve(parent)) throw new Error('refusing unsafe project workspace removal');
-    await fsp.rm(root, { recursive: true, force: true });
+    const authority = await this.workspaceReplacementAuthority(project);
+    const archiveRequired = authority.required;
+    const expectedStorage = authority.identity;
+    let replacementError: unknown;
+    try {
+      await this.projects.clearWorkspaceForRebuild(project, owner, archiveRequired, expectedStorage);
+    } catch (error) {
+      replacementError = error;
+    }
+    try {
+      await this.restoreWorkspaceSessionStorage(project, owner, archiveRequired, expectedStorage);
+    } catch (restoreError) {
+      if (replacementError) {
+        throw new ProjectWorkspaceSessionStorageError(
+          `project rebuild cleanup failed and workspace session storage could not be restored: ${(replacementError as Error).message}; ${(restoreError as Error).message}`,
+        );
+      }
+      throw restoreError;
+    }
+    if (replacementError) throw replacementError;
   }
 
   private async sweepIdle(): Promise<void> {
@@ -2534,7 +2782,7 @@ export class ProjectManager {
     }
   }
 
-  /** Session integration calls this on runtime activity and on runtime exit. */
+  /** Project-management navigation may refresh lifecycle recency; session traffic never does. */
   touchActivity(projectId: string, when?: Date): void {
     if (this.shuttingDown) return;
     this.deps.store.touchActivity(projectId, when || this.now());

@@ -26,6 +26,8 @@ import { ConversationsDialog } from './dialogs/ConversationsDialog';
 import { ChatSettingsDialog } from './dialogs/ChatSettingsDialog';
 import { SettingsDialog } from './dialogs/SettingsDialog';
 import { removalDescription, ServerManagerDialog } from './dialogs/ServerManagerDialog';
+import { PhoneAccessDialog } from './dialogs/PhoneAccessDialog';
+import type { PhoneAccessStatus } from '../controller/types';
 import { ServerTargetBadge, serverTargetAvailability } from './ServerTargetBadge';
 import { UsageDashboardDialog } from './dialogs/UsageDashboardDialog';
 import { TerminalOptionsDialog } from './dialogs/TerminalOptionsDialog';
@@ -51,6 +53,7 @@ import type { ConversationList, ConversationSummary } from '../../shared/convers
 import { CHAT_PANEL_ICONS, type ChatPanelId, type ChatViewSettings } from '../chat/view-settings';
 import { Toasts } from './Toasts';
 import { UpdateBannerView } from './UpdateBannerView';
+import { DesktopUpdateDialog } from './DesktopUpdateDialog';
 import { ActiveAgentMaintenance } from './ActiveAgentMaintenance';
 import { shellStore, type ShellState, type ShellTab } from './store';
 import {
@@ -163,6 +166,12 @@ export interface ShellActions {
   updateAction(serverId?: string): void;
   updateToggleLog(serverId?: string): void;
   updateDismiss(serverId?: string): void;
+
+  // Native desktop package update (Electron preload only).
+  desktopUpdateOpen(): void;
+  desktopUpdateDefer(): void;
+  desktopUpdateInstall(): void;
+  desktopUpdateRetry(): void;
 
   // Agent maintenance
   restartAgent(sessionId: string, automatic: boolean, allowFreshContext: boolean): void;
@@ -417,6 +426,19 @@ export function AppShell({ terminalNode, actions, launcher }: AppShellProps): Re
     (target) => target.id === controller.selectedServerId,
   ) || null;
   const rememberedNewSessionServerId = controller.enabled ? lastNewSessionServerId() : null;
+  const [phoneAccessOpen, setPhoneAccessOpen] = React.useState(false);
+  const [phoneAccessStatus, setPhoneAccessStatus] = React.useState<PhoneAccessStatus | null>(null);
+  const phoneAccessRequestSequence = React.useRef(0);
+  const refreshPhoneAccess = React.useCallback(async (): Promise<void> => {
+    const request = ++phoneAccessRequestSequence.current;
+    const next = await controllerActions.phoneAccessStatus();
+    if (request === phoneAccessRequestSequence.current) setPhoneAccessStatus(next);
+  }, []);
+  const phoneAction = React.useCallback(async (work: () => Promise<PhoneAccessStatus>): Promise<void> => {
+    const request = ++phoneAccessRequestSequence.current;
+    const next = await work();
+    if (request === phoneAccessRequestSequence.current) setPhoneAccessStatus(next);
+  }, []);
 
   const active = state.tabs.find((t) => t.id === state.activeId) || null;
   const activeControllerServerId = active?.id ? parseQualifiedSessionId(active.id)?.serverId : null;
@@ -516,7 +538,6 @@ export function AppShell({ terminalNode, actions, launcher }: AppShellProps): Re
     state.isMobile,
     state.keysVisible,
     state.banner !== null,
-    state.desktopBanner !== null,
     titleBarGeometry.visible,
     titleBarGeometry.height,
     titleBarGeometry.y,
@@ -640,6 +661,26 @@ export function AppShell({ terminalNode, actions, launcher }: AppShellProps): Re
     ...(state.user ? [{ children: `@${state.user}` }] : []),
     { children: state.theme === 'dark' ? 'Dark' : 'Light' },
   ];
+
+  const desktopUpdate = state.desktopUpdate;
+  const desktopReminderVisible = Boolean(
+    desktopUpdate?.targetVersion
+    && !desktopUpdate.promptOpen
+    && !['disabled', 'idle', 'checking', 'up_to_date'].includes(desktopUpdate.phase),
+  );
+  const desktopReminderLabel = desktopUpdate?.phase === 'error'
+    ? desktopUpdate.retryable ? 'Update failed — retry' : 'Update needs attention'
+    : `Update v${desktopUpdate?.targetVersion ?? ''}`;
+  if (desktopReminderVisible) {
+    statusRight.push({
+      icon: <Icon name={desktopUpdate?.phase === 'error' ? 'refresh-cw' : 'download'} size={12} />,
+      children: desktopReminderLabel,
+      title: `${desktopReminderLabel}. Open the desktop update dialog.`,
+      color: desktopUpdate?.phase === 'error' ? 'var(--destructive)' : 'var(--ansi-yellow)',
+      ariaHasPopup: 'dialog',
+      onClick: actions.desktopUpdateOpen,
+    });
+  }
 
   /**
    * Where a phone can be, and where it is.
@@ -1007,13 +1048,6 @@ export function AppShell({ terminalNode, actions, launcher }: AppShellProps): Re
       ) : null}
 
       <UpdateBannerView
-        banner={state.desktopBanner}
-        onAction={() => actions.updateAction('local')}
-        onToggleLog={() => actions.updateToggleLog('local')}
-        onDismiss={() => actions.updateDismiss('local')}
-      />
-
-      <UpdateBannerView
         banner={state.banner}
         onAction={() => actions.updateAction(state.banner?.ownerId || undefined)}
         onToggleLog={() => actions.updateToggleLog(state.banner?.ownerId || undefined)}
@@ -1152,7 +1186,19 @@ export function AppShell({ terminalNode, actions, launcher }: AppShellProps): Re
       ) : null}
 
       {state.isMobile ? (
-        <BottomNav destinations={destinations} hidden={keyboardUp} />
+        <BottomNav
+          destinations={destinations}
+          hidden={keyboardUp}
+          trailingAction={desktopReminderVisible ? {
+            label: desktopUpdate?.phase === 'error'
+              ? desktopUpdate.retryable ? 'Retry update' : 'Update notice'
+              : `Update ${desktopUpdate?.targetVersion ?? ''}`,
+            icon: desktopUpdate?.phase === 'error' ? 'refresh-cw' : 'download',
+            ariaLabel: `${desktopReminderLabel}. Open the desktop update dialog.`,
+            tone: desktopUpdate?.phase === 'error' ? 'error' : 'warning',
+            onPress: actions.desktopUpdateOpen,
+          } : undefined}
+        />
       ) : (
         <StatusBar left={statusLeft} right={statusRight} />
       )}
@@ -1199,6 +1245,7 @@ export function AppShell({ terminalNode, actions, launcher }: AppShellProps): Re
           targets={controller.targets}
           candidates={controller.candidates}
           onClose={() => closeDialogs({ servers: false })}
+          onOpenPhoneAccess={() => setPhoneAccessOpen(true)}
           onAdd={async (target) => {
             try {
               const result = await controllerActions.add(target);
@@ -1281,6 +1328,20 @@ export function AppShell({ terminalNode, actions, launcher }: AppShellProps): Re
           onFindServers={() => void controllerActions.discover().catch((error: Error) => showError(error.message))}
         />
       ) : null}
+
+      {controller.enabled ? <PhoneAccessDialog
+        open={phoneAccessOpen}
+        status={phoneAccessStatus}
+        onClose={() => setPhoneAccessOpen(false)}
+        onRefresh={refreshPhoneAccess}
+        onStart={(value) => phoneAction(() => controllerActions.startPhoneAccess(value))}
+        onPair={(origin) => phoneAction(() => controllerActions.createPhonePairing(origin))}
+        onRevoke={(id) => phoneAction(() => controllerActions.revokePhoneDevice(id))}
+        onStop={() => phoneAction(() => controllerActions.stopPhoneAccess())}
+        onCheckTailscale={() => phoneAction(() => controllerActions.checkTailscale())}
+        onSetTailscaleOrigin={(origin) => phoneAction(() => controllerActions.setTailscaleOrigin(origin))}
+        onExportCa={() => controllerActions.exportPhoneAccessCa()}
+      /> : null}
 
       <UsageDashboardDialog
         key={`usage-${controller.selectedServerId || 'browser'}`}
@@ -1511,6 +1572,17 @@ export function AppShell({ terminalNode, actions, launcher }: AppShellProps): Re
         actions={menuActions}
         theme={state.theme}
         hasTerminal={state.tabs.some((tab) => tab.id === state.activeId && tab.surface !== 'chat')}
+      />
+
+      {/* Intentionally last: an update accepted by the native main process is
+          the one modal that must cover and trap focus above every app-owned
+          dialog while download, verification, and restart are in progress. */}
+      <DesktopUpdateDialog
+        update={desktopUpdate}
+        localRunningWorkCount={controller.targets.find((target) => target.id === 'local')?.runningWorkCount ?? null}
+        onDefer={actions.desktopUpdateDefer}
+        onInstall={actions.desktopUpdateInstall}
+        onRetry={actions.desktopUpdateRetry}
       />
     </div>
     </PhoneContext.Provider>

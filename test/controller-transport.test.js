@@ -2,12 +2,13 @@
 
 const assert = require('node:assert');
 const { execFileSync } = require('node:child_process');
+const crypto = require('node:crypto');
 const { EventEmitter } = require('node:events');
 const fs = require('node:fs');
 const https = require('node:https');
 const os = require('node:os');
 const path = require('node:path');
-const { PassThrough } = require('node:stream');
+const { PassThrough, Readable } = require('node:stream');
 const WebSocket = require('ws');
 
 const {
@@ -109,7 +110,8 @@ function fakeRequest(response, observations) {
     const chunks = [];
     request.on('data', (chunk) => chunks.push(chunk));
     request.on('finish', () => {
-      observations.body = Buffer.concat(chunks).toString('utf8');
+      observations.bodyBytes = Buffer.concat(chunks);
+      observations.body = observations.bodyBytes.toString('utf8');
       options.agent.createConnection({}, (error, socket) => {
         if (error) request.emit('error', error);
         else {
@@ -285,6 +287,30 @@ describe('desktop controller transport boundary', function () {
       ]]);
     });
 
+    it('pipes binary upload chunks with their declared type and length intact', async function () {
+      const tlsFixture = fakeTlsConnection({
+        authorized: true,
+        fingerprint: first,
+      });
+      const observations = { calls: 0 };
+      const bytes = Buffer.from([0, 255, 1, 254, 2, 3, 4]);
+      const transport = createControllerTransport({
+        origin: 'https://server.example',
+        tlsConnect: tlsFixture.connect,
+        requestImpl: fakeRequest(fakeResponse(201, {}, 'stored'), observations),
+      });
+      const response = await transport.requestTarget({
+        path: '/api/sessions/raw%2Fid/chat-attachments',
+        method: 'POST',
+        headers: { 'content-type': 'image/png', 'content-length': String(bytes.length) },
+        body: Readable.from([bytes.subarray(0, 2), bytes.subarray(2, 5), bytes.subarray(5)]),
+      });
+      assert.strictEqual(response.statusCode, 201);
+      assert.deepStrictEqual(observations.bodyBytes, bytes);
+      assert.strictEqual(observations.options.headers['content-type'], 'image/png');
+      assert.strictEqual(observations.options.headers['content-length'], String(bytes.length));
+    });
+
     it('refuses external OAuth and other cross-origin destinations before opening TLS', async function () {
       let connects = 0;
       const transport = createControllerTransport({
@@ -390,6 +416,97 @@ describe('desktop controller transport boundary', function () {
         assert.strictEqual(probe.valid, true);
         const response = await transport.requestTarget({ path: '/' });
         assert.strictEqual(await responseBody(response), 'trusted');
+      } finally {
+        await close(server);
+      }
+    });
+
+    it('streams fixed and chunked 20 MiB uploads byte-identically through real HTTPS backpressure', async function () {
+      const observed = [];
+      const server = serverFor('valid', async (request, response) => {
+        const hash = crypto.createHash('sha256');
+        let bytes = 0;
+        let chunks = 0;
+        for await (const chunk of request) {
+          hash.update(chunk);
+          bytes += chunk.length;
+          chunks += 1;
+          // A deliberately slower consumer proves the request source follows
+          // the HTTPS socket's backpressure instead of being eagerly buffered.
+          if (chunks % 32 === 0) await new Promise((resolve) => setTimeout(resolve, 1));
+        }
+        observed.push({
+          bytes,
+          sha256: hash.digest('hex'),
+          length: request.headers['content-length'],
+          transferEncoding: request.headers['transfer-encoding'],
+          type: request.headers['content-type'],
+        });
+        response.statusCode = 201;
+        response.end('stored');
+      });
+      const origin = await listen(server);
+      const total = 20 * 1024 * 1024;
+      const expected = crypto.createHash('sha256');
+      const chunks = [];
+      for (let offset = 0; offset < total; offset += 64 * 1024) {
+        const chunk = Buffer.alloc(Math.min(64 * 1024, total - offset));
+        for (let index = 0; index < chunk.length; index += 1) {
+          chunk[index] = (offset + index) % 251;
+        }
+        expected.update(chunk);
+        chunks.push(chunk);
+      }
+      const digest = expected.digest('hex');
+      try {
+        const transport = createControllerTransport({ origin, ca });
+        const fixed = await transport.requestTarget({
+          path: '/fixed', method: 'POST',
+          headers: { 'content-type': 'application/octet-stream', 'content-length': String(total) },
+          body: Readable.from(chunks),
+        });
+        assert.strictEqual(fixed.statusCode, 201);
+        assert.strictEqual(await responseBody(fixed), 'stored');
+
+        const chunked = await transport.requestTarget({
+          path: '/chunked', method: 'POST',
+          headers: { 'content-type': 'application/octet-stream' },
+          body: Readable.from(chunks),
+        });
+        assert.strictEqual(chunked.statusCode, 201);
+        assert.strictEqual(await responseBody(chunked), 'stored');
+
+        assert.deepStrictEqual(observed.map(({ bytes, sha256, type }) => ({ bytes, sha256, type })), [
+          { bytes: total, sha256: digest, type: 'application/octet-stream' },
+          { bytes: total, sha256: digest, type: 'application/octet-stream' },
+        ]);
+        assert.strictEqual(observed[0].length, String(total));
+        assert.strictEqual(observed[0].transferEncoding, undefined);
+        assert.strictEqual(observed[1].length, undefined);
+        assert.strictEqual(observed[1].transferEncoding, 'chunked');
+      } finally {
+        await close(server);
+      }
+    });
+
+    it('aborts an in-flight remote HTTPS request without turning cancellation into a transport outage', async function () {
+      let markReceived;
+      const received = new Promise((resolve) => { markReceived = resolve; });
+      let markClosed;
+      const closed = new Promise((resolve) => { markClosed = resolve; });
+      const server = serverFor('valid', (request) => {
+        markReceived();
+        request.once('close', markClosed);
+      });
+      const origin = await listen(server);
+      try {
+        const transport = createControllerTransport({ origin, ca });
+        const controller = new AbortController();
+        const pending = transport.requestTarget({ path: '/slow-upload', signal: controller.signal });
+        await received;
+        controller.abort();
+        await assert.rejects(pending, (error) => error.name === 'AbortError' && error.code === 'ABORT_ERR');
+        await closed;
       } finally {
         await close(server);
       }

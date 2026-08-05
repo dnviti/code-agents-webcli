@@ -1,9 +1,26 @@
 const assert = require('assert');
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
 const { ClaudeCodeWebServer } = require('../dist/server/index.js');
 
 describe('Server Aliases', function() {
+  const fixtures = [];
+  const makeServer = (options) => {
+    const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'server-alias-'));
+    const server = new ClaudeCodeWebServer({ ...options, dataDir });
+    fixtures.push({ server, dataDir });
+    return server;
+  };
+  afterEach(async function () {
+    for (const fixture of fixtures.splice(0)) {
+      await fixture.server.shutdown();
+      fs.rmSync(fixture.dataDir, { recursive: true, force: true });
+    }
+  });
+
   it('should set aliases from options', function() {
-    const server = new ClaudeCodeWebServer({
+    const server = makeServer({
       claudeAlias: 'Buddy',
       codexAlias: 'Robo',
       agentAlias: 'Helper',
@@ -28,7 +45,7 @@ describe('Server Aliases', function() {
   });
 
   it('should default aliases when not provided', function() {
-    const server = new ClaudeCodeWebServer({ noAuth: true });
+    const server = makeServer({ noAuth: true });
     for (const kind of ['claude', 'codex', 'agent', 'pi', 'grok', 'qwen', 'kimi', 'omp', 'antigravity']) {
       assert.ok(
         server.aliases[kind] && server.aliases[kind].length > 0,
@@ -38,7 +55,7 @@ describe('Server Aliases', function() {
   });
 
   it('resolves a bridge for every agent kind', function() {
-    const server = new ClaudeCodeWebServer({ noAuth: true });
+    const server = makeServer({ noAuth: true });
     // A kind with no bridge fails at start time with a confusing message
     // rather than here, so the mapping is asserted directly.
     for (const kind of ['claude', 'codex', 'agent', 'pi', 'grok', 'qwen', 'kimi', 'omp', 'antigravity', 'terminal']) {
@@ -53,7 +70,7 @@ describe('Server Aliases', function() {
     // union but forgotten in one of those switches is invisible: the runtime
     // starts and simply reports itself as Claude. Asserting the bridges are
     // distinct objects catches a case that was pasted but not re-pointed.
-    const server = new ClaudeCodeWebServer({ noAuth: true });
+    const server = makeServer({ noAuth: true });
     const kinds = ['claude', 'codex', 'agent', 'pi', 'grok', 'qwen', 'kimi', 'omp', 'antigravity', 'terminal'];
     const seen = new Map();
     for (const kind of kinds) {
@@ -87,7 +104,7 @@ describe('Server Aliases', function() {
   };
 
   function serverWithExplicitAliases() {
-    return new ClaudeCodeWebServer({
+    return makeServer({
       noAuth: true,
       claudeAlias: EXPLICIT.claude,
       codexAlias: EXPLICIT.codex,

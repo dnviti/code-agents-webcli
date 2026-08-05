@@ -206,9 +206,9 @@ describe('controller-owned update banners', function () {
         () => mod.shellStore.getSnapshot().banner?.text.includes('Server update · Alpha'),
         'Alpha did not own its initial banner',
       );
-      await waitFor(
-        () => /Desktop package update:/.test(mod.shellStore.getSnapshot().desktopBanner?.text || ''),
-        'the desktop package channel did not load independently',
+      assert.ok(
+        !requestCalls.some((call) => call.url === '/api/update/status' && call.serverId === 'local'),
+        'the server updater must not prefetch a native desktop-package status',
       );
 
       const beforeUnqualified = mod.shellStore.getSnapshot().banner.text;
@@ -225,7 +225,6 @@ describe('controller-owned update banners', function () {
         () => mod.shellStore.getSnapshot().banner?.text.includes('Server update · Beta'),
         'Beta did not receive its own status',
       );
-      assert.match(mod.shellStore.getSnapshot().desktopBanner.text, /Desktop package update:/);
 
       mod.applyUpdateStatus(updateStatus({ behindBy: 9 }), 'alpha');
       mod.appendUpdateLog('alpha-only-log', 'alpha');
@@ -268,17 +267,18 @@ describe('controller-owned update banners', function () {
         `health polling must carry the restarting server id (saw ${JSON.stringify(healthCalls)})`,
       );
 
-      // A desktop-mode response names the package, not Local computer's server,
-      // and dismissing it must not hide another server at the same remote SHA.
+      // Local computer never enters the commit-based server channel. Native
+      // packages use the Electron bridge, while another remote server remains
+      // independently visible.
+      const localRequestsBefore = requestCalls.filter((call) => call.serverId === 'local').length;
       mod.selectControllerServer('local');
       assert.strictEqual(mod.shellStore.getSnapshot().banner, null, 'the previous remote notice must leave the server channel');
-      await waitFor(
-        () => /Desktop package update:/.test(mod.shellStore.getSnapshot().desktopBanner?.text || ''),
-        'desktop package notice was not distinguished',
+      await new Promise((resolve) => setImmediate(resolve));
+      assert.strictEqual(
+        requestCalls.filter((call) => call.serverId === 'local').length,
+        localRequestsBefore,
+        'Local selection must not fetch server update status',
       );
-      assert.doesNotMatch(mod.shellStore.getSnapshot().desktopBanner.text, /Server update/);
-      mod.onBannerDismiss('local');
-      assert.strictEqual(mod.shellStore.getSnapshot().desktopBanner, null);
 
       responses.set('beta', updateResponse('systemd'));
       await mod.refresh(app, 'beta');

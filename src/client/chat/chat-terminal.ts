@@ -431,43 +431,32 @@ export class ChatTerminal {
 const BY_CHAT = new Map<string, ChatTerminal[]>();
 const MAX_CHATS = 4;
 
-/**
- * Which server sessions a conversation's panes are attached to.
- *
- * Session storage, so a reload reattaches rather than opening a second pty
- * beside the one it left running — the same leak the registry fixes for a
- * collapse, one level up. Session-scoped rather than local: a shell from a
- * browser session that has ended is not something to reconnect to a week later.
- */
+/** Browser key used by old builds; session ids now stay in workspace SQLite. */
 const REMEMBERED = 'cc-web-chat-terminals';
 
-function readRemembered(): Record<string, string[]> {
+function forgetLegacyRememberedTerminals(): void {
   try {
-    const raw = sessionStorage.getItem(REMEMBERED);
-    const parsed = raw ? JSON.parse(raw) : null;
-    return parsed && typeof parsed === 'object' ? (parsed as Record<string, string[]>) : {};
+    sessionStorage.removeItem(REMEMBERED);
   } catch {
-    return {};
+    // Storage may be unavailable; there is no new browser-side write.
   }
 }
 
-/** The sessions this conversation's panes were attached to, if any. */
-export function rememberedTerminals(chatSessionId: string): string[] {
-  const ids = readRemembered()[chatSessionId];
-  return Array.isArray(ids) ? ids.filter((id) => typeof id === 'string') : [];
+/** Ask the owning workspace record which durable child shells belong here. */
+export async function rememberedTerminals(chatSessionId: string): Promise<string[]> {
+  forgetLegacyRememberedTerminals();
+  const response = await controllerFetch(
+    `/api/sessions/${encodeURIComponent(chatSessionId)}/children`,
+  );
+  // Compatibility with a server from before workspace-owned child discovery.
+  if (response.status === 404) return [];
+  if (!response.ok) throw new Error(`Could not restore conversation terminals (${response.status})`);
+  const body = await response.json() as { sessionIds?: unknown };
+  if (!Array.isArray(body.sessionIds)) return [];
+  return body.sessionIds.filter((id): id is string => typeof id === 'string' && id.length > 0);
 }
 
-export function rememberTerminals(chatSessionId: string, sessionIds: string[]): void {
-  try {
-    const all = readRemembered();
-    if (sessionIds.length) all[chatSessionId] = sessionIds;
-    else delete all[chatSessionId];
-    sessionStorage.setItem(REMEMBERED, JSON.stringify(all));
-  } catch {
-    // Without storage the split simply opens a fresh shell after a reload,
-    // which is the behaviour it had before this existed.
-  }
-}
+forgetLegacyRememberedTerminals();
 
 export function terminalsFor(chatSessionId: string): ChatTerminal[] {
   const existing = BY_CHAT.get(chatSessionId);
@@ -502,7 +491,6 @@ export function terminalsFor(chatSessionId: string): ChatTerminal[] {
  */
 export function forgetTerminals(chatSessionId: string): void {
   releaseTerminals(chatSessionId);
-  rememberTerminals(chatSessionId, []);
 }
 
 /**

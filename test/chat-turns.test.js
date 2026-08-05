@@ -128,6 +128,11 @@ describe('groupTurns', function () {
   it('names an attachments-only turn rather than leaving it blank', function () {
     const messages = [msg('user', [{ kind: 'image', mime: 'image/png', url: '/a.png' }])];
     assert.strictEqual(mod.groupTurns(messages, 'idle')[0].label, 'attachment');
+
+    const files = [msg('user', [{
+      kind: 'attachment', mime: 'text/plain', url: '/a.txt', name: 'a.txt', size: 1,
+    }])];
+    assert.strictEqual(mod.groupTurns(files, 'idle')[0].label, 'attachment');
   });
 
   it('returns nothing for an empty transcript', function () {
