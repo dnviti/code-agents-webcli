@@ -65,9 +65,11 @@ describe('Electron desktop helpers', function () {
     );
     for (const workflow of [ci, release]) {
       assert.match(workflow, /sandbox='node_modules\/electron\/dist\/chrome-sandbox'/);
+      assert.match(workflow, /\[ -L "\$sandbox" \]/);
       assert.match(workflow, /sudo chown root:root "\$sandbox"/);
       assert.match(workflow, /sudo chmod 4755 "\$sandbox"/);
-      assert.match(workflow, /stat -c '%U:%G %a' "\$sandbox"/);
+      assert.match(workflow, /stat -c '%u:%g %a' "\$sandbox"/);
+      assert.match(workflow, /test "\$sandbox_mode" = '0:0 4755'/);
     }
     assert.match(release, /push:\s*\n\s*tags:\s*\n\s*- ['"]v\*\.\*\.\*['"]/);
     assert.match(release, /- ['"]!v\*\.\*\.\*-staging['"]/);

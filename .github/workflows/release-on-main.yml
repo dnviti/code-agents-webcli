@@ -135,10 +135,15 @@ jobs:
         run: |
           set -euo pipefail
           sandbox='node_modules/electron/dist/chrome-sandbox'
-          test -f "$sandbox"
+          if [ ! -f "$sandbox" ] || [ -L "$sandbox" ]; then
+            echo 'Missing or invalid Electron sandbox helper.' >&2
+            exit 1
+          fi
           sudo chown root:root "$sandbox"
           sudo chmod 4755 "$sandbox"
-          test "$(stat -c '%U:%G %a' "$sandbox")" = 'root:root 4755'
+          sandbox_mode="$(stat -c '%u:%g %a' "$sandbox")"
+          echo "Electron sandbox helper: $sandbox_mode"
+          test "$sandbox_mode" = '0:0 4755'
       - run: npm run typecheck
       - run: npm test
 
@@ -222,10 +227,15 @@ jobs:
         run: |
           set -euo pipefail
           sandbox='node_modules/electron/dist/chrome-sandbox'
-          test -f "$sandbox"
+          if [ ! -f "$sandbox" ] || [ -L "$sandbox" ]; then
+            echo 'Missing or invalid Electron sandbox helper.' >&2
+            exit 1
+          fi
           sudo chown root:root "$sandbox"
           sudo chmod 4755 "$sandbox"
-          test "$(stat -c '%U:%G %a' "$sandbox")" = 'root:root 4755'
+          sandbox_mode="$(stat -c '%u:%g %a' "$sandbox")"
+          echo "Electron sandbox helper: $sandbox_mode"
+          test "$sandbox_mode" = '0:0 4755'
       - name: Require Windows release identity
         if: runner.os == 'Windows'
         shell: bash
