@@ -117,7 +117,12 @@ jobs:
       - name: Reject unapproved Flatpak permission expansion
         shell: bash
         env:
-          UPDATER_BRIDGE_TAG: ${{ vars.FLATPAK_UPDATER_BRIDGE_TAG }}
+          # The one-time updater-portal exception is granted to the release tag
+          # that is running, automatically — never a hand-set variable, which is
+          # how a stale/manual bridge tag drifts from the version being released.
+          # The guard still only auto-allows the single updater portal D-Bus
+          # permission; any other Flatpak permission expansion fails hard.
+          UPDATER_BRIDGE_TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
           previous="$(git tag --merged HEAD --sort=-version:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | grep -vx "$GITHUB_REF_NAME" | head -n1 || true)"
