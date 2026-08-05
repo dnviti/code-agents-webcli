@@ -41,18 +41,7 @@ jobs:
       # configuring the helper exactly as Chromium requires.
       - name: Configure Electron sandbox helper
         shell: bash
-        run: |
-          set -euo pipefail
-          sandbox='node_modules/electron/dist/chrome-sandbox'
-          if [ ! -f "$sandbox" ] || [ -L "$sandbox" ]; then
-            echo 'Missing or invalid Electron sandbox helper.' >&2
-            exit 1
-          fi
-          sudo chown root:root "$sandbox"
-          sudo chmod 4755 "$sandbox"
-          sandbox_mode="$(stat -c '%u:%g %a' "$sandbox")"
-          echo "Electron sandbox helper: $sandbox_mode"
-          test "$sandbox_mode" = '0:0 4755'
+        run: bash scripts/configure-ci-electron-sandbox.sh
 
       - name: Typecheck
         run: npm run typecheck

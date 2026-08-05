@@ -63,14 +63,19 @@ describe('Electron desktop helpers', function () {
       path.join(__dirname, '..', '.github', 'workflows', 'ci.yml'),
       'utf8',
     );
+    const ciSandbox = fs.readFileSync(
+      path.join(__dirname, '..', 'scripts', 'configure-ci-electron-sandbox.sh'),
+      'utf8',
+    );
     for (const workflow of [ci, release]) {
-      assert.match(workflow, /sandbox='node_modules\/electron\/dist\/chrome-sandbox'/);
-      assert.match(workflow, /\[ -L "\$sandbox" \]/);
-      assert.match(workflow, /sudo chown root:root "\$sandbox"/);
-      assert.match(workflow, /sudo chmod 4755 "\$sandbox"/);
-      assert.match(workflow, /stat -c '%u:%g %a' "\$sandbox"/);
-      assert.match(workflow, /test "\$sandbox_mode" = '0:0 4755'/);
+      assert.match(workflow, /bash scripts\/configure-ci-electron-sandbox\.sh/);
     }
+    assert.match(ciSandbox, /sandbox="\$\{1:-node_modules\/electron\/dist\/chrome-sandbox\}"/);
+    assert.match(ciSandbox, /if \[ -L "\$sandbox" \]; then[\s\S]*install -m 0755[\s\S]*mv -f/);
+    assert.match(ciSandbox, /sudo chown root:root -- "\$sandbox"/);
+    assert.match(ciSandbox, /sudo chmod 4755 -- "\$sandbox"/);
+    assert.match(ciSandbox, /stat -c '%u:%g %a' -- "\$sandbox"/);
+    assert.match(ciSandbox, /test "\$sandbox_mode" = '0:0 4755'/);
     assert.match(release, /push:\s*\n\s*tags:\s*\n\s*- ['"]v\*\.\*\.\*['"]/);
     assert.match(release, /- ['"]!v\*\.\*\.\*-staging['"]/);
     assert.doesNotMatch(release, /push:\s*\n\s*branches:/);
