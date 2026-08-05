@@ -35,9 +35,18 @@ function electronAttachmentCommand(environment = process.env) {
 }
 
 function runElectronAttachmentE2E(options = {}) {
-  const selected = electronAttachmentCommand(options.env || process.env);
-  if (selected.skipped) return selected;
-  const env = { ...process.env, ...(options.env || {}) };
+  const requestedEnvironment = { ...process.env, ...(options.env || {}) };
+  const selected = electronAttachmentCommand(requestedEnvironment);
+  if (selected.skipped) {
+    if (!requestedEnvironment.CI) return selected;
+    const message = `Electron attachment renderer is required in CI: ${selected.reason}`;
+    return {
+      status: 1,
+      output: message,
+      error: new Error(message),
+    };
+  }
+  const env = { ...requestedEnvironment };
   delete env.ELECTRON_RUN_AS_NODE;
   env.ELECTRON_DISABLE_SECURITY_WARNINGS = 'true';
   const result = spawnSync(selected.command, selected.args, {

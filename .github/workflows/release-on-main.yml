@@ -210,10 +210,6 @@ jobs:
           node-version: '24'
           cache: npm
       - run: npm ci
-      - name: Configure Electron sandbox helper
-        if: runner.os == 'Linux'
-        shell: bash
-        run: bash scripts/configure-ci-electron-sandbox.sh
       - name: Require Windows release identity
         if: runner.os == 'Windows'
         shell: bash
@@ -280,8 +276,6 @@ jobs:
           flatpak install --user --noninteractive flathub \
             org.freedesktop.Platform//24.08 org.freedesktop.Sdk//24.08 \
             org.electronjs.Electron2.BaseApp//24.08
-      - name: Verify native attachment gestures and controller routing
-        run: npm run test:desktop-attachments
       - name: Embed the trusted Flatpak manifest key
         if: runner.os == 'Linux'
         shell: bash
@@ -318,6 +312,15 @@ jobs:
             platform_config+=("--config.win.signtoolOptions.publisherName=$WINDOWS_CERT_SUBJECT")
           fi
           npm run desktop:dist -- ${{ matrix.args }} "${platform_config[@]}" --publish never
+      # Package from the unmodified Electron distribution. The root-owned
+      # setuid helper below exists only for the real renderer harness and is
+      # never an input to an AppImage, Flatpak, NSIS, DMG, or ZIP artifact.
+      - name: Configure Electron sandbox helper
+        if: runner.os == 'Linux'
+        shell: bash
+        run: bash scripts/configure-ci-electron-sandbox.sh
+      - name: Verify native attachment gestures and controller routing
+        run: npm run test:desktop-attachments
       - name: Publish signed Flatpak repository artifacts
         if: runner.os == 'Linux'
         shell: bash

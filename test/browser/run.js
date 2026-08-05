@@ -281,6 +281,27 @@ function connectCdp(endpoint) {
   }), 10_000, 'Chrome DevTools connection');
 }
 
+function waitForChildExit(child, milliseconds) {
+  if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve(true);
+  return new Promise((resolve) => {
+    let settled = false;
+    let timer;
+    const finish = (exited) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      child.off('exit', onExit);
+      resolve(exited);
+    };
+    const onExit = () => finish(true);
+    child.once('exit', onExit);
+    timer = setTimeout(() => finish(false), milliseconds);
+    // Close the listener-registration race if Chrome exited between the first
+    // state check and child.once().
+    if (child.exitCode !== null || child.signalCode !== null) finish(true);
+  });
+}
+
 async function runInstalledWorkerCheck(chrome, port) {
   const profile = fs.mkdtempSync(path.join(os.tmpdir(), 'cc-web-worker-check-'));
   const child = spawn(chrome, [
@@ -327,10 +348,20 @@ async function runInstalledWorkerCheck(chrome, port) {
   } catch (error) {
     return `FAIL :: the installed worker keeps pairing network-only :: ${String(error?.message || error).replace(/[\r\n]+/g, ' ').slice(0, 500)}`;
   } finally {
-    try { await cdp?.send('Browser.close'); } catch { child.kill(); }
+    try {
+      if (cdp) await timeout(cdp.send('Browser.close'), 2_000, 'Chrome shutdown');
+    } catch {}
     cdp?.close();
-    if (!child.killed) child.kill();
-    fs.rmSync(profile, { recursive: true, force: true });
+    if (!(await waitForChildExit(child, 1_000))) {
+      try { child.kill('SIGTERM'); } catch {}
+      if (!(await waitForChildExit(child, 2_000))) {
+        try { child.kill('SIGKILL'); } catch {}
+        await waitForChildExit(child, 2_000);
+      }
+    }
+    // Chrome may finish an atomic profile write just after its parent exits.
+    // Node retries ENOTEMPTY for recursive removals when maxRetries is set.
+    fs.rmSync(profile, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 });
   }
 }
 

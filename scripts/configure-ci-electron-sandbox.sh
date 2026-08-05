@@ -19,24 +19,30 @@ if [ "$package_root" != "$expected_package_root" ]; then
 fi
 
 node -e 'require("electron")'
-electron_executable="$(realpath -e -- "$(node -p 'require("electron")')")"
+electron_candidate="$(node -p 'require("electron")')"
+if [ ! -f "$electron_candidate" ] || [ -L "$electron_candidate" ]; then
+  echo "Electron executable is missing or is a symbolic link: $electron_candidate" >&2
+  exit 1
+fi
+electron_executable="$(realpath -e -- "$electron_candidate")"
 dist_root="$(realpath -e -- "$package_root/dist")"
 if [ "$(dirname -- "$electron_executable")" != "$dist_root" ] \
-  || [ ! -f "$electron_executable" ] || [ -L "$electron_executable" ]; then
+  || [ ! -f "$electron_executable" ]; then
   echo "Electron executable is not a regular immediate child of its distribution: $electron_executable" >&2
   exit 1
 fi
 
-candidate="$(dirname -- "$electron_executable")/chrome-sandbox"
-if [ ! -e "$candidate" ]; then
-  echo "Electron sandbox helper is missing: $candidate" >&2
+candidate="$dist_root/chrome-sandbox"
+if [ ! -f "$candidate" ] || [ -L "$candidate" ]; then
+  echo "Electron sandbox helper is missing, non-regular, or symbolic: $candidate" >&2
   exit 1
 fi
 target="$(realpath -e -- "$candidate")"
-candidate_link="$(readlink -- "$candidate" 2>/dev/null || printf '<regular>')"
-printf 'Electron sandbox candidate: %s -> %s\n' "$candidate_link" "$target"
-if [ "$(dirname -- "$target")" != "$dist_root" ] || [ ! -f "$target" ] || [ -L "$target" ]; then
-  echo "Electron sandbox helper escapes its distribution or is not a regular file: $target" >&2
+link_count="$(stat -c '%h' -- "$target")"
+printf 'Electron sandbox candidate: %s (links=%s)\n' "$target" "$link_count"
+if [ "$target" != "$candidate" ] || [ "$(dirname -- "$target")" != "$dist_root" ] \
+  || [ ! -f "$target" ] || [ "$link_count" != '1' ]; then
+  echo "Electron sandbox helper is not the unique regular package file: $target" >&2
   exit 1
 fi
 

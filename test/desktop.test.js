@@ -67,6 +67,10 @@ describe('Electron desktop helpers', function () {
       path.join(__dirname, '..', 'scripts', 'configure-ci-electron-sandbox.sh'),
       'utf8',
     );
+    const attachmentRunner = fs.readFileSync(
+      path.join(__dirname, 'electron-attachment', 'run.js'),
+      'utf8',
+    );
     assert.strictEqual(
       (ci.match(/bash scripts\/configure-ci-electron-sandbox\.sh/g) || []).length,
       1,
@@ -80,22 +84,52 @@ describe('Electron desktop helpers', function () {
     for (const workflow of [ci, release]) {
       assert.match(workflow, /bash scripts\/configure-ci-electron-sandbox\.sh/);
     }
+    const ciInstall = ci.indexOf('run: npm ci');
+    const ciConfigure = ci.indexOf('run: bash scripts/configure-ci-electron-sandbox.sh');
+    const ciTest = ci.indexOf('run: npm test');
+    assert.ok(ciInstall >= 0 && ciInstall < ciConfigure && ciConfigure < ciTest,
+      'ordinary CI configures the helper after install and before tests');
+
+    const releaseVerify = release.slice(release.indexOf('\n  verify:'), release.indexOf('\n  docker:'));
+    assert.ok(
+      releaseVerify.indexOf('run: npm ci') < releaseVerify.indexOf('run: bash scripts/configure-ci-electron-sandbox.sh')
+        && releaseVerify.indexOf('run: bash scripts/configure-ci-electron-sandbox.sh')
+          < releaseVerify.indexOf('run: npm test'),
+      'tag verification configures the helper after install and before tests',
+    );
+    const releaseDesktop = release.slice(
+      release.indexOf('\n  desktop:'),
+      release.indexOf('\n  desktop-upgrade-qualification:'),
+    );
+    assert.ok(
+      releaseDesktop.indexOf('name: Build signed desktop packages')
+        < releaseDesktop.indexOf('name: Configure Electron sandbox helper')
+        && releaseDesktop.indexOf('name: Configure Electron sandbox helper')
+          < releaseDesktop.indexOf('name: Verify native attachment gestures and controller routing'),
+      'desktop artifacts are built before the helper is elevated for the renderer harness',
+    );
     assert.match(ciSandbox, /ELECTRON_OVERRIDE_DIST_PATH is not allowed/);
     assert.match(ciSandbox, /package_entry="\$\(node -p 'require\.resolve\("electron"\)'\)"/);
     assert.match(ciSandbox, /expected_package_root="\$workspace_root\/node_modules\/electron"/);
     assert.match(ciSandbox, /node -e 'require\("electron"\)'/);
-    assert.match(ciSandbox, /electron_executable="\$\(realpath -e -- "\$\(node -p 'require\("electron"\)'\)"\)"/);
+    assert.match(ciSandbox, /electron_candidate="\$\(node -p 'require\("electron"\)'\)"/);
+    assert.match(ciSandbox, /\[ ! -f "\$electron_candidate" \] \|\| \[ -L "\$electron_candidate" \]/);
+    assert.match(ciSandbox, /electron_executable="\$\(realpath -e -- "\$electron_candidate"\)"/);
     assert.match(ciSandbox, /dist_root="\$\(realpath -e -- "\$package_root\/dist"\)"/);
     assert.match(ciSandbox, /dirname -- "\$electron_executable"\)" != "\$dist_root"/);
-    assert.match(ciSandbox, /candidate="\$\(dirname -- "\$electron_executable"\)\/chrome-sandbox"/);
+    assert.match(ciSandbox, /candidate="\$dist_root\/chrome-sandbox"/);
+    assert.match(ciSandbox, /\[ ! -f "\$candidate" \] \|\| \[ -L "\$candidate" \]/);
     assert.match(ciSandbox, /target="\$\(realpath -e -- "\$candidate"\)"/);
-    assert.match(ciSandbox, /dirname -- "\$target"\)" != "\$dist_root"/);
-    assert.match(ciSandbox, /\[ ! -f "\$target" \] \|\| \[ -L "\$target" \]/);
+    assert.match(ciSandbox, /link_count="\$\(stat -c '%h' -- "\$target"\)"/);
+    assert.match(ciSandbox, /"\$target" != "\$candidate"/);
+    assert.match(ciSandbox, /"\$link_count" != '1'/);
     assert.match(ciSandbox, /sudo chown root:root -- "\$target"/);
     assert.match(ciSandbox, /sudo chmod 4755 -- "\$target"/);
     assert.match(ciSandbox, /stat -c '%u:%g:%a' -- "\$target"/);
     assert.match(ciSandbox, /sandbox_mode" != '0:0:4755'/);
     assert.match(ciSandbox, /Electron sandbox helper has insecure identity or mode/);
+    assert.match(attachmentRunner, /Electron attachment renderer is required in CI/);
+    assert.match(attachmentRunner, /if \(!requestedEnvironment\.CI\) return selected/);
     assert.match(release, /push:\s*\n\s*tags:\s*\n\s*- ['"]v\*\.\*\.\*['"]/);
     assert.match(release, /- ['"]!v\*\.\*\.\*-staging['"]/);
     assert.doesNotMatch(release, /push:\s*\n\s*branches:/);
