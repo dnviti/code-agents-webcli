@@ -211,7 +211,10 @@ export function TurnStrip({
         {meta.reasoning ? <span style={{ flex: '0 0 auto' }}>{meta.reasoning}</span> : null}
         {meta.duration ? <span style={{ flex: '0 0 auto' }}>{meta.duration}</span> : null}
         {meta.cost ? (
-          <span style={{ flex: '0 0 auto', color: past ? 'var(--muted-foreground)' : 'var(--foreground)' }}>
+          <span
+            title={meta.costTitle}
+            style={{ flex: '0 0 auto', color: past ? 'var(--muted-foreground)' : 'var(--foreground)' }}
+          >
             {meta.cost}
           </span>
         ) : null}

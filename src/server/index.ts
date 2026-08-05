@@ -68,6 +68,7 @@ import {
   closeWorkspaceSessionDirectoryLeasesForScope,
 } from './services/workspace-session-storage.js';
 import { WorkspaceUsageCoordinator } from './services/workspace-usage-coordinator.js';
+import { CodexPricing } from './services/codex-pricing.js';
 import { TranscriptStore } from './services/transcript-store.js';
 import { HistoryStore } from './services/history-store.js';
 import { SessionTeardownRegistry } from './services/session-teardown.js';
@@ -292,6 +293,7 @@ export class ClaudeCodeWebServer {
     reject: (error: unknown) => void;
   } | null;
   private usageStore: WorkspaceUsageCoordinator;
+  private codexPricing: CodexPricing;
   private sessionStore: SessionStore;
   private workspaceCatalog: WorkspaceCatalog;
   private workspaceArtifactMigrator: WorkspaceSessionArtifactMigrator;
@@ -476,6 +478,10 @@ export class ClaudeCodeWebServer {
       legacyStorageDir: this.database.storageDir,
     });
     this.usageStore = new WorkspaceUsageCoordinator();
+    // The codex list-price catalogue (issue #182). Constructed with the app
+    // database so fetched official prices persist across restarts; `start()` is
+    // called once the server is up (see setupExpress) and `stop()` on shutdown.
+    this.codexPricing = new CodexPricing({ database: this.database });
 
     // Per-user environments. Off unless an administrator asked for them, in
     // which case every process this server starts on a user's behalf goes into
@@ -700,6 +706,8 @@ export class ClaudeCodeWebServer {
       // and therefore whether "the browsable area" is one shared folder or a
       // different home for every account.
       userBaseFolder: (userId) => this.getUserBaseFolder(userId),
+      // Issues codex list-price estimates to every session (issue #182).
+      codexPricing: this.codexPricing,
     });
     this.runtimeProfiles = new RuntimeProfileStore({ database: this.database });
     this.tierContext = defaultTierContext(this.database.storageDir);
@@ -991,6 +999,21 @@ export class ClaudeCodeWebServer {
     this.app = express();
     this.setupExpress();
     this.setupEnvironmentSweep();
+    // Kick off the daily OpenAI list-price refresh (issue #182) once the server
+    // is up; the interval is unref'd and torn down on shutdown.
+    this.codexPricing.start();
+    // One-time retrospective backfill of historical codex turns. Attaching the
+    // estimator backfills every already-registered workspace now and any
+    // workspace as it opens later (the coordinator keeps per-workspace marks),
+    // so history in a workspace that was not open at boot still gets priced.
+    // All passes are guarded: unpriced rows are retried once a rate exists,
+    // while priced rows are never touched again.
+    try {
+      this.usageStore.attachCodexEstimator(this.codexPricing);
+      this.usageStore.backfillCodex(this.codexPricing);
+    } catch (error) {
+      console.warn(`codex cost backfill failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
     } catch (error) {
       // Before the first possible writer, cleanup is provably safe. Once
       // AppDatabase construction began, a partially-created native handle may
@@ -1018,6 +1041,7 @@ export class ClaudeCodeWebServer {
     if (this.autoSaveInterval) clearInterval(this.autoSaveInterval);
     if (this.environmentSweep) clearInterval(this.environmentSweep);
     if (this.environmentScale) clearInterval(this.environmentScale);
+    try { this.codexPricing?.stop(); } catch { /* fail-stop continues */ }
     try { this.listener?.close(); } catch { /* fail-stop continues */ }
     try { this.server?.closeAllConnections?.(); } catch { /* fail-stop continues */ }
     for (const socket of this.listenerSockets || []) {
@@ -2980,6 +3004,7 @@ export class ClaudeCodeWebServer {
     }
     this.updateChecker.stop();
     this.lanDiscovery.stop();
+    this.codexPricing.stop();
 
     if (this.wss) {
       // Stop already-connected clients from creating more work while the rest

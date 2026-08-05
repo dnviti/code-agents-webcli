@@ -9,7 +9,8 @@ import type {
   ChatUsage,
   ContextWindowSource,
 } from '../../../shared/chat-events.js';
-import { tokenTotal, type UsageBurn } from '../../../shared/usage-records.js';
+import { describeCodexEstimate } from '../../../shared/codex-pricing.js';
+import { markEstimatedCost, tokenTotal, type UsageBurn } from '../../../shared/usage-records.js';
 import { PanelBody, PanelHeader, PanelNote, useWorkspaceData } from './PanelShell.js';
 
 /**
@@ -149,9 +150,9 @@ function Quiet({ children }: { children: React.ReactNode }): React.JSX.Element {
   );
 }
 
-function Row({ label, value, tone }: { label: string; value: React.ReactNode; tone?: string }) {
+function Row({ label, value, tone, title }: { label: string; value: React.ReactNode; tone?: string; title?: string }) {
   return (
-    <div style={{ display: 'flex', alignItems: 'baseline', gap: 8, fontSize: 'var(--text-xs)' }}>
+    <div title={title} style={{ display: 'flex', alignItems: 'baseline', gap: 8, fontSize: 'var(--text-xs)' }}>
       <span style={{ color: 'var(--muted-foreground)' }}>{label}</span>
       <span
         style={{
@@ -318,29 +319,36 @@ function windowLabel(window: AccountLimitWindow): string {
  * and it is drawn from a statement the session makes after watching a turn end
  * in silence rather than from anything a capability flag claims in advance.
  *
- * Nothing here is ever estimated. The runtime's figure or no figure.
+ * Every figure here is the runtime's own — except codex cost, which this app
+ * estimates at OpenAI's published list price from the tokens codex did report
+ * (#182).
  */
 function UsageSection({ usage }: { usage: ChatUsage }): React.JSX.Element {
   const total = tokenTotal(usage);
+  const isEstimated = usage.costEstimate !== undefined || usage.costSource === 'estimated';
   const tokensSilent = total === null && usage.usageSource === 'none';
   const costSilent = usage.costUsd === undefined && usage.costSource === 'none';
 
   return (
     <>
       {total !== null ? <Row label="Tokens" value={formatTokens(total)} /> : null}
-      {usage.costUsd !== undefined ? <Row label="Cost" value={formatCost(usage.costUsd)} /> : null}
+      {usage.costUsd !== undefined ? (
+        <Row
+          label="Cost"
+          value={isEstimated ? markEstimatedCost(formatCost(usage.costUsd)) : formatCost(usage.costUsd)}
+          title={isEstimated && usage.costEstimate ? describeCodexEstimate(usage.costEstimate) : undefined}
+        />
+      ) : null}
       {tokensSilent && costSilent ? (
         <Quiet>
           This runtime reports neither token counts nor costs, so there is nothing honest to show
-          here. Nothing on this screen is estimated.
+          here. Where a figure does appear, codex cost is an estimate at OpenAI&rsquo;s published
+          list price.
         </Quiet>
       ) : tokensSilent ? (
         <Quiet>This runtime reports what a turn costs but not how many tokens it used.</Quiet>
       ) : costSilent ? (
-        <Quiet>
-          This runtime reports token counts but never a price, and this app does not price a turn
-          itself.
-        </Quiet>
+        <Quiet>This runtime reports tokens but no price is available for its model here.</Quiet>
       ) : total === null && usage.costUsd === undefined ? (
         <Quiet>Nothing has been reported yet in this conversation.</Quiet>
       ) : null}
@@ -549,7 +557,8 @@ function MeasuredSection({
       <Quiet>
         What went through this app on this agent, for you, over the last {hours} hours. Costs are
         published list prices, not a bill, and a turn whose runtime reported nothing contributes
-        nothing rather than a zero.
+        nothing rather than a zero. Codex figures are estimates at OpenAI&rsquo;s published list
+        price, not a bill.
       </Quiet>
     </>
   );

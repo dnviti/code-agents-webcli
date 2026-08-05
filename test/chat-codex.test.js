@@ -199,8 +199,9 @@ describe('codex app-server adapter', function () {
       assert.strictEqual(adapter.capabilities.usage, true);
       // thread/fork forks the current head only, not a chosen earlier point.
       assert.strictEqual(adapter.capabilities.fork, false);
-      // Tokens only; nothing in the schema prices a turn.
-      assert.strictEqual(adapter.capabilities.cost, false);
+      // issue #182: codex now reports an API-list-price estimate computed by
+      // this app from the confirmed model and reported tokens.
+      assert.strictEqual(adapter.capabilities.cost, true);
     });
 
     it('offers the app-owned commands and installed skills before the handshake', function () {
@@ -709,6 +710,38 @@ describe('codex app-server adapter', function () {
       await feed(h, fixture('codex-appserver-text-turn'));
       assert.strictEqual(only(h.events, 'msg_end').pop().usage, undefined);
       assert.strictEqual(only(h.events, 'turn_end').pop().usage, undefined);
+    });
+
+    it('leaves usage unpriced when no estimator is provided', async function () {
+      const h = harness();
+      await boot(h);
+      await feed(h, fixture('codex-appserver-text-turn'));
+      const usage = only(h.events, 'usage').pop().usage;
+      assert.strictEqual(usage.costUsd, undefined);
+      assert.strictEqual(usage.costSource, undefined);
+    });
+
+    it('prices reported usage at list price when an estimator is provided (issue #182)', async function () {
+      const h = harness({
+        codexPricing: {
+          estimate: (tokens) => ({
+            costUsd: (tokens.inputTokens ?? 0) * 2e-6,
+            model: 'gpt-5-codex',
+            rates: { inputPerM: 2, cachedInputPerM: 0.5, outputPerM: 6 },
+            source: 'openai-list',
+            pricingDate: '2026-08-05',
+          }),
+        },
+      });
+      await boot(h);
+      await feed(h, fixture('codex-appserver-text-turn'));
+      const usage = only(h.events, 'usage').pop().usage;
+      // The fixure reports 100 input tokens; the stub prices them at $2/M.
+      assert.strictEqual(usage.costUsd, 100 * 2e-6);
+      assert.strictEqual(usage.costSource, 'estimated');
+      assert.ok(usage.costEstimate);
+      assert.strictEqual(usage.costEstimate.model, 'gpt-5-codex');
+      assert.strictEqual(usage.costEstimate.source, 'openai-list');
     });
   });
 

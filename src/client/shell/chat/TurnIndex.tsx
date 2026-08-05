@@ -2,6 +2,8 @@ import * as React from 'react';
 import { Icon } from '../../ui/relay/Icon.js';
 import { PHONE_TEXT, TOUCH_GAP, TOUCH_TARGET, usePhone } from '../../ui/touch.js';
 import { STATUS_GLYPH, formatTurnCost, type TurnIndexRow } from '../../chat/turns.js';
+import { describeCodexEstimate } from '../../../shared/codex-pricing.js';
+import { markEstimatedCost } from '../../../shared/usage-records.js';
 import { TabContextMenu } from '../TabContextMenu.js';
 
 /**
@@ -504,7 +506,20 @@ function TurnRow({
           never will, and "$0.00" for either of those is a number nobody
           measured. Right of the label, in the same monospace as every other
           figure on this screen, so a column of them reads down the list. */}
-      {collapsed || turn.costUsd === undefined ? null : (
+      {collapsed || turn.costUsd === undefined ? null : turn.costEstimate ? (
+        <span
+          title={describeCodexEstimate(turn.costEstimate)}
+          style={{
+            flex: '0 0 auto',
+            fontFamily: 'var(--font-mono)',
+            fontSize: isPhone ? PHONE_TEXT.meta : 10,
+            color: 'var(--muted-foreground)',
+            fontVariantNumeric: 'tabular-nums',
+          }}
+        >
+          {markEstimatedCost(formatTurnCost(turn.costUsd))}
+        </span>
+      ) : (
         <span
           title={`this turn cost $${turn.costUsd.toFixed(4)}`}
           style={{

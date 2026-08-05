@@ -1,6 +1,7 @@
 import * as React from 'react';
 import { ChatCapabilities, ChatUsage } from '../../../shared/chat-events.js';
-import { tokenTotal } from '../../../shared/usage-records.js';
+import { describeCodexEstimate } from '../../../shared/codex-pricing.js';
+import { markEstimatedCost, tokenTotal } from '../../../shared/usage-records.js';
 import { PHONE_TEXT } from '../../ui/touch.js';
 
 /**
@@ -64,6 +65,20 @@ export function UsageMeter({ usage, capabilities, compact = false, phone = false
 
   const hasTotal = showTokens && usage.totalTokens !== undefined;
   const hasCost = showCost && usage.costUsd !== undefined;
+  /** A cost figure this app computed for codex (issue #182), to be labelled ~. */
+  const estimated = hasCost && (usage.costSource === 'estimated' || usage.costEstimate !== undefined);
+  const estimateTitle = estimated && usage.costEstimate
+    ? describeCodexEstimate(usage.costEstimate)
+    : undefined;
+  /**
+   * The cost figure as it should read on any surface: the same money, with the
+   * `~` marker when it is an estimate, and a tooltip carrying its provenance.
+   */
+  const costText = hasCost
+    ? estimated
+      ? markEstimatedCost(formatCost(usage.costUsd!))
+      : formatCost(usage.costUsd!)
+    : null;
   /**
    * Said out loud, once a turn has finished having reported nothing.
    *
@@ -144,7 +159,7 @@ export function UsageMeter({ usage, capabilities, compact = false, phone = false
     // different readings of the same work — which is what they were (#80).
     const total = showTokens ? tokenTotal(usage) : null;
     if (total !== null) parts.push(`${formatTokens(total)} tok`);
-    if (hasCost) parts.push(formatCost(usage.costUsd!));
+    if (costText) parts.push(costText);
 
     // One phrase at most, and the shorter one when both halves are silent. This
     // strip is fixed-width — the reason the context warning is a percentage
@@ -191,7 +206,9 @@ export function UsageMeter({ usage, capabilities, compact = false, phone = false
           color: 'var(--muted-foreground)',
         }}
       >
-        {parts.length ? <span>{costOnly && hasCost ? formatCost(usage.costUsd!) : parts.join(' · ')}</span> : null}
+        {parts.length ? (
+          <span title={estimateTitle}>{costOnly && costText ? costText : parts.join(' · ')}</span>
+        ) : null}
         {silence ? <span title={silenceTitle(tokensSilent, costSilent)}>{silence}</span> : null}
         {hasContext && !costOnly ? (
           <span
@@ -260,7 +277,7 @@ export function UsageMeter({ usage, capabilities, compact = false, phone = false
           {hasCost ? (
             <span>
               <span>cost </span>
-              <span style={{ color: 'var(--foreground)' }}>{formatCost(usage.costUsd!)}</span>
+              <span style={{ color: 'var(--foreground)' }} title={estimateTitle}>{costText}</span>
             </span>
           ) : null}
         </div>
