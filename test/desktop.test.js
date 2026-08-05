@@ -37,16 +37,21 @@ describe('Electron desktop helpers', function () {
     );
     assert.match(rendererPolicy, /setPermissionRequestHandler/);
     assert.match(main, /will-redirect/);
-    assert.match(main, /hasSwitch\('no-sandbox'\)/);
+    assert.match(
+      main,
+      /if \(app\.isPackaged && app\.commandLine\.hasSwitch\('no-sandbox'\)\) \{[\s\S]{0,160}throw new Error\([\s\S]{0,160}refuses to run without Chromium sandboxing/,
+    );
     assert.match(main, /\.\.\.desktopWindowChrome\(\)/);
     assert.match(main, /Menu\.setApplicationMenu\(null\)/);
     assert.match(main, /\.removeMenu\(\)/);
     assert.match(main, /did-change-theme-color/);
+    assert.match(main, /shutdownComplete = true;[\s\S]{0,240}app\.exit\(0\);\s*return;/);
     for (const target of ['AppImage', 'flatpak', 'nsis', 'dmg']) {
       assert.match(builder, new RegExp(`\\b${target}\\b`));
     }
     assert.match(builder, /--filesystem=home/);
     assert.match(builder, /asarUnpack:[\s\S]*@lydell/);
+    assert.match(builder, /asarUnpack:[\s\S]*dist\/public\/\*\*\/\*/);
     assert.match(builder, /appImage:[\s\S]*executableArgs:\s*\[\]/);
     assert.match(builder, /src\/public\/icons\/icon-512\.png/);
 
@@ -57,6 +62,7 @@ describe('Electron desktop helpers', function () {
     assert.match(release, /push:\s*\n\s*tags:\s*\n\s*- ['"]v\*\.\*\.\*['"]/);
     assert.match(release, /- ['"]!v\*\.\*\.\*-staging['"]/);
     assert.doesNotMatch(release, /push:\s*\n\s*branches:/);
+    assert.match(release, /- os: ubuntu-24\.04/);
     assert.match(release, /EXPECTED_TAG="v\$\{VERSION\}"/);
     assert.match(release, /git merge-base --is-ancestor "\$TAG_TARGET" origin\/main/);
     assert.match(release, /Smoke the native packaged application/);
@@ -65,26 +71,38 @@ describe('Electron desktop helpers', function () {
     assert.match(release, /flatpak uninstall --user --noninteractive --delete-data/);
     assert.match(release, /DESKTOP_WORKSPACE_ATTACHMENT_SMOKE_OK/);
     assert.match(release, /DESKTOP_PACKAGED_RENDERER_SMOKE_OK/);
+    assert.match(release, /apt-get install --yes[^\n]*libfuse2t64/);
+    assert.match(release, /find release -maxdepth 1 -type f -name ['"]\*\.AppImage['"]/);
+    assert.match(release, /if ! unshare -Ur true 2>\/dev\/null; then/);
+    assert.match(release, /\/proc\/sys\/kernel\/apparmor_restrict_unprivileged_userns/);
+    assert.match(release, /The runner cannot provide Chromium's user-namespace sandbox/);
+    assert.match(
+      release,
+      /timeout --signal=TERM --kill-after=10s 120s[\s\\]*xvfb-run -a "\$appimage" --headless/,
+    );
+    assert.doesNotMatch(
+      release,
+      /xvfb-run[\s\S]{0,160}"\$appimage"[\s\\]*--no-sandbox/,
+    );
+    assert.match(release, /appimage_status=\$\?/);
+    assert.match(release, /AppImage` — Linux x64[^\n]*unprivileged user namespaces/);
     assert.match(release, /sha256sum -c SHA256SUMS/);
     assert.match(release, /tag_name:\s*\$\{\{ needs\.verify\.outputs\.tag \}\}/);
     assert.match(release, /target_commitish:\s*\$\{\{ needs\.verify\.outputs\.commit_sha \}\}/);
     assert.match(release, /permissions:\s*\n\s*contents: write/);
   });
 
-  it('keeps picker, drop, and user paste outside broad Electron permissions', function () {
+  it('keeps desktop permissions exact-origin and denies broad filesystem access', function () {
     const origin = 'http://127.0.0.1:43210';
-    assert.strictEqual(rendererPermissionAllowed('notifications', `${origin}/chat`, origin), true);
-    for (const permission of [
-      'clipboard-read',
-      'clipboard-sanitized-write',
-      'fileSystem',
-      'fileSystemWrite',
-      'openExternal',
-    ]) {
+    for (const permission of ['notifications', 'clipboard-read', 'clipboard-sanitized-write']) {
+      assert.strictEqual(rendererPermissionAllowed(permission, `${origin}/chat`, origin), true);
+      assert.strictEqual(rendererPermissionAllowed(permission, 'https://example.test', origin), false);
+    }
+    for (const permission of ['fileSystem', 'fileSystemWrite', 'openExternal']) {
       assert.strictEqual(
         rendererPermissionAllowed(permission, `${origin}/chat`, origin),
         false,
-        `${permission} must not be granted just to accept a user gesture`,
+        `${permission} must not be granted to the renderer`,
       );
     }
     assert.strictEqual(
@@ -98,7 +116,8 @@ describe('Electron desktop helpers', function () {
       setPermissionCheckHandler(handler) { installed.check = handler; },
       setPermissionRequestHandler(handler) { installed.request = handler; },
     }, origin);
-    assert.strictEqual(installed.check(null, 'clipboard-read', origin), false);
+    assert.strictEqual(installed.check(null, 'clipboard-read', origin), true);
+    assert.strictEqual(installed.check(null, 'fileSystem', origin), false);
     let decision = null;
     installed.request(
       { getURL: () => `${origin}/chat` },

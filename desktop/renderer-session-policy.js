@@ -1,21 +1,17 @@
 'use strict';
 
+const { desktopPermissionAllowed } = require('./lib.js');
+
 /**
  * Permissions granted to the desktop renderer.
  *
- * Native file inputs, drag-and-drop, and a user-triggered paste event do not
- * need a Chromium permission grant. Keeping them out of this allow-list is
- * intentional: it lets those gestures work without giving the renderer
- * programmatic clipboard access or a general filesystem capability.
+ * Native file inputs and drag-and-drop do not need a Chromium permission
+ * grant, so general filesystem access stays out of this allow-list. Clipboard
+ * access is scoped to the exact controller origin for xterm's explicit
+ * copy/paste shortcuts; remote or embedded content remains denied.
  */
 function rendererPermissionAllowed(permission, requestingOrigin, trustedOrigin) {
-  let origin = '';
-  try {
-    origin = requestingOrigin ? new URL(requestingOrigin).origin : '';
-  } catch {
-    return false;
-  }
-  return permission === 'notifications' && origin === trustedOrigin;
+  return desktopPermissionAllowed(permission, requestingOrigin, trustedOrigin);
 }
 
 function installRendererSessionPolicy(ses, trustedOrigin) {

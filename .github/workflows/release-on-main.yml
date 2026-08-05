@@ -178,7 +178,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          # The AppImage smoke repair below targets Ubuntu 24.04's AppArmor
+          # user-namespace policy and its libfuse2t64 package name.
+          - os: ubuntu-24.04
             label: Linux x64
             args: --linux AppImage flatpak --x64 --config.publish.channel=latest --config.forceCodeSigning=true
             packages: 2
@@ -262,7 +264,11 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install --yes flatpak flatpak-builder xvfb xauth
+          # Ubuntu 24.04 renamed AppImage's FUSE 2 compatibility library to
+          # libfuse2t64. It is required to exercise the actual mounted artifact.
+          sudo apt-get install --yes flatpak flatpak-builder libfuse2t64 xvfb xauth
+          # electron-builder updates these refs without privilege escalation,
+          # so install them for the runner user instead of system-wide.
           flatpak remote-add --user --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
           flatpak install --user --noninteractive flathub \
             org.freedesktop.Platform//24.08 org.freedesktop.Sdk//24.08 \
@@ -377,18 +383,78 @@ jobs:
           set -euo pipefail
           case '${{ runner.os }}' in
             Linux)
+              executable='release/linux-unpacked/code-agents-webcli'
               sandbox='release/linux-unpacked/chrome-sandbox'
+              if [ ! -f "$sandbox" ]; then
+                echo "Could not find the packaged Chromium sandbox helper." >&2
+                exit 1
+              fi
+              # Chromium aborts instead of silently weakening its Linux
+              # sandbox unless this unpacked helper is root-owned and setuid.
+              # This changes only the disposable smoke-test directory; the
+              # AppImage and Flatpak artifacts were already built above.
               sudo chown root:root "$sandbox"
               sudo chmod 4755 "$sandbox"
-              output="$(ELECTRON_OZONE_PLATFORM_HINT=x11 xvfb-run -a \
-                release/linux-unpacked/code-agents-webcli --ozone-platform=x11)"
+              if [ "$(stat -c '%U:%G %a' "$sandbox")" != "root:root 4755" ]; then
+                echo "The packaged Chromium sandbox helper is not configured securely." >&2
+                exit 1
+              fi
+              unpacked_output="$(ELECTRON_OZONE_PLATFORM_HINT=x11 xvfb-run -a \
+                "$executable" --ozone-platform=x11)"
+              printf '%s\n' "$unpacked_output"
+              grep -F 'DESKTOP_SMOKE_OK' <<<"$unpacked_output"
+
+              # Exercise the real FUSE-mounted AppImage too. The unpacked app
+              # cannot catch nested ASAR/SquashFS path failures seen only under
+              # /tmp/.mount_* on an installed launch.
+              appimage="$(find release -maxdepth 1 -type f -name '*.AppImage' -print -quit)"
+              if [ -z "$appimage" ] || [ ! -x "$appimage" ]; then
+                echo "Could not find an executable AppImage for smoke testing." >&2
+                exit 1
+              fi
+              # electron-builder's AppRun probes user namespaces and adds
+              # --no-sandbox when Ubuntu 24.04's AppArmor restriction blocks
+              # them. Keep the production safety check intact: relax only the
+              # disposable runner restriction, then fail closed unless the
+              # same probe used by AppRun succeeds.
+              if ! unshare -Ur true 2>/dev/null; then
+                if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+                  echo 0 | sudo tee \
+                    /proc/sys/kernel/apparmor_restrict_unprivileged_userns >/dev/null
+                fi
+                if [ -e /proc/sys/kernel/unprivileged_userns_clone ]; then
+                  echo 1 | sudo tee /proc/sys/kernel/unprivileged_userns_clone >/dev/null
+                fi
+              fi
+              if ! unshare -Ur true 2>/dev/null; then
+                echo "The runner cannot provide Chromium's user-namespace sandbox." >&2
+                exit 1
+              fi
+              set +e
+              output="$(ELECTRON_OZONE_PLATFORM_HINT=x11 \
+                timeout --signal=TERM --kill-after=10s 120s \
+                xvfb-run -a "$appimage" --headless --ozone-platform=x11 2>&1)"
+              appimage_status=$?
+              set -e
+              if [ "$appimage_status" -ne 0 ]; then
+                printf '%s\n' "$output" >&2
+                exit "$appimage_status"
+              fi
               ;;
-            Windows) output="$(release/win-unpacked/code-agents-webcli.exe)" ;;
+            Windows)
+              executable="release/win-unpacked/code-agents-webcli.exe"
+              output="$("$executable")"
+              ;;
             macOS)
               executable="$(find release -type f -path '*/Code Agents Web CLI.app/Contents/MacOS/Code Agents Web CLI' -print -quit)"
+              if [ -z "$executable" ]; then
+                echo "Could not find the packaged macOS executable." >&2
+                exit 1
+              fi
               output="$("$executable")"
               ;;
           esac
+          printf '%s\n' "$output"
           grep -F 'DESKTOP_WORKSPACE_ATTACHMENT_SMOKE_OK' <<<"$output"
           grep -F 'DESKTOP_PACKAGED_RENDERER_SMOKE_OK' <<<"$output"
           grep -F 'DESKTOP_SMOKE_OK' <<<"$output"
@@ -631,10 +697,17 @@ jobs:
           body: |
             Signed desktop release for ${{ needs.verify.outputs.tag }}.
 
-            This release contains the five usual human-facing packages, updater
-            manifests/blockmaps, signed macOS ZIPs, and Flatpak remote descriptors.
-            The native app never downloads or installs an update until the user
-            confirms **Update and restart**.
+            Desktop downloads:
+            - `*.AppImage` — Linux x64, portable; mounted launches require FUSE2 and Chromium sandboxing requires unprivileged user namespaces.
+            - `*.flatpak` — Linux x64, sandboxed Flatpak bundle.
+            - `*.exe` — Windows x64 NSIS installer.
+            - `*-x64.dmg` — macOS Intel (x64).
+            - `*-arm64.dmg` — macOS Apple Silicon (arm64).
+            - `SHA256SUMS` — SHA-256 checksums for every desktop package.
+
+            Also included are updater manifests/blockmaps, signed macOS ZIPs, and
+            Flatpak remote descriptors. The native app never downloads or installs
+            an update until the user confirms **Update and restart**.
 
             **One-time updater bridge:** installations older than the first
             updater-capable release must install this signed Windows, macOS, or

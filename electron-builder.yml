@@ -33,6 +33,10 @@ asarUnpack:
   # @lydell/node-pty is N-API compatible with Electron, but dlopen cannot load
   # a native library from inside an asar archive.
   - node_modules/@lydell/**/prebuilds/**/*.node
+  # Express streams the browser shell at runtime. Keep those files beside the
+  # ASAR so AppImage's temporary SquashFS mount never has to stream a nested
+  # archive entry (which Electron reports as a false ENOENT on some hosts).
+  - dist/public/**/*
 # Release Linux jobs materialize the protected Flatpak repository public key in
 # this existing build directory. The filtered resource is absent from ordinary
 # native builds and mandatory/verified for the Flatpak release build.

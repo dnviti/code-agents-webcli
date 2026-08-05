@@ -566,7 +566,15 @@ async function runPackagedRendererSmoke(started, expectedSessionName) {
 async function runSmokeCheck(started) {
   console.log('DESKTOP_SMOKE_STAGE config');
   const cookie = `${started.auth.name}=${encodeURIComponent(started.auth.value)}`;
-  const response = await fetch(`${started.url}/api/config`, { headers: { Cookie: cookie } });
+  const headers = { Cookie: cookie };
+  const page = await fetch(`${started.url}/`, { headers });
+  if (!page.ok) throw new Error(`Desktop smoke page failed with HTTP ${page.status}.`);
+  const html = await page.text();
+  if (!html.includes('<title>Code Agents Web CLI</title>')) {
+    throw new Error('Desktop smoke page did not contain the packaged browser shell.');
+  }
+
+  const response = await fetch(`${started.url}/api/config`, { headers });
   if (!response.ok) throw new Error(`Desktop smoke request failed with HTTP ${response.status}.`);
   const config = await response.json();
   if (!config.currentUser || !Array.isArray(config.supportedShells)) {
@@ -864,7 +872,9 @@ async function boot() {
       fs.rmSync(smokeRoot, { recursive: true, force: true });
     }
     shutdownComplete = true;
-    app.quit();
+    // Smoke mode has already shut down every resource it owns. Exit directly
+    // so AppImage's FUSE launcher cannot keep CI waiting on Electron teardown.
+    app.exit(0);
     return;
   }
 
