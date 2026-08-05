@@ -67,15 +67,35 @@ describe('Electron desktop helpers', function () {
       path.join(__dirname, '..', 'scripts', 'configure-ci-electron-sandbox.sh'),
       'utf8',
     );
+    assert.strictEqual(
+      (ci.match(/bash scripts\/configure-ci-electron-sandbox\.sh/g) || []).length,
+      1,
+      'ordinary CI configures its Electron helper exactly once',
+    );
+    assert.strictEqual(
+      (release.match(/bash scripts\/configure-ci-electron-sandbox\.sh/g) || []).length,
+      2,
+      'tag CI configures both its verify and Linux desktop helpers',
+    );
     for (const workflow of [ci, release]) {
       assert.match(workflow, /bash scripts\/configure-ci-electron-sandbox\.sh/);
     }
-    assert.match(ciSandbox, /sandbox="\$\{1:-node_modules\/electron\/dist\/chrome-sandbox\}"/);
-    assert.match(ciSandbox, /if \[ -L "\$sandbox" \]; then[\s\S]*install -m 0755[\s\S]*mv -f/);
-    assert.match(ciSandbox, /sudo chown root:root -- "\$sandbox"/);
-    assert.match(ciSandbox, /sudo chmod 4755 -- "\$sandbox"/);
-    assert.match(ciSandbox, /stat -c '%u:%g %a' -- "\$sandbox"/);
-    assert.match(ciSandbox, /test "\$sandbox_mode" = '0:0 4755'/);
+    assert.match(ciSandbox, /ELECTRON_OVERRIDE_DIST_PATH is not allowed/);
+    assert.match(ciSandbox, /package_entry="\$\(node -p 'require\.resolve\("electron"\)'\)"/);
+    assert.match(ciSandbox, /expected_package_root="\$workspace_root\/node_modules\/electron"/);
+    assert.match(ciSandbox, /node -e 'require\("electron"\)'/);
+    assert.match(ciSandbox, /electron_executable="\$\(realpath -e -- "\$\(node -p 'require\("electron"\)'\)"\)"/);
+    assert.match(ciSandbox, /dist_root="\$\(realpath -e -- "\$package_root\/dist"\)"/);
+    assert.match(ciSandbox, /dirname -- "\$electron_executable"\)" != "\$dist_root"/);
+    assert.match(ciSandbox, /candidate="\$\(dirname -- "\$electron_executable"\)\/chrome-sandbox"/);
+    assert.match(ciSandbox, /target="\$\(realpath -e -- "\$candidate"\)"/);
+    assert.match(ciSandbox, /dirname -- "\$target"\)" != "\$dist_root"/);
+    assert.match(ciSandbox, /\[ ! -f "\$target" \] \|\| \[ -L "\$target" \]/);
+    assert.match(ciSandbox, /sudo chown root:root -- "\$target"/);
+    assert.match(ciSandbox, /sudo chmod 4755 -- "\$target"/);
+    assert.match(ciSandbox, /stat -c '%u:%g:%a' -- "\$target"/);
+    assert.match(ciSandbox, /sandbox_mode" != '0:0:4755'/);
+    assert.match(ciSandbox, /Electron sandbox helper has insecure identity or mode/);
     assert.match(release, /push:\s*\n\s*tags:\s*\n\s*- ['"]v\*\.\*\.\*['"]/);
     assert.match(release, /- ['"]!v\*\.\*\.\*-staging['"]/);
     assert.doesNotMatch(release, /push:\s*\n\s*branches:/);
