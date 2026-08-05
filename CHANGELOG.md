@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [6.1.0] - 2026-08-05
 
 ### Added
 - **Codex usage now shows an API-equivalent cost estimate** (#182). Turns that
@@ -11,9 +11,6 @@
   official source (last known rate + date disclosed during an outage), and
   eligible historical Codex jobs get a retrospective estimate on upgrade.
 
-## [6.1.0] - 2026-08-05
-
-### Added
 - **Agent runtimes can now be checked, installed, and updated as verified,
   app-owned copies** (#190). The launcher and active-session version row cover
   Claude Code, Codex CLI, pi, Grok, Qwen Code, Kimi, Oh My Pi,
