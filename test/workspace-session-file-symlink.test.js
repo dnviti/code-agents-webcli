@@ -311,40 +311,41 @@ describe('workspace session final-component symlink safety', function () {
     assert.strictEqual(resolveWorkspaceEntryMutationPolicy(null, 'win32', false), 'deny');
   });
 
-  it('requires both rename and delete sharing to be blocked by a live Windows-style handle', function () {
+  it('establishes the Windows capability from ancestor rename pinning alone', function () {
     const probeRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'cawc-windows-pin-probe-'));
     const fd = fs.openSync(probeRoot, fs.constants.O_RDONLY);
     const originalRename = fs.renameSync;
-    const originalRmdir = fs.rmdirSync;
-    let renameBlocked = false;
-    let deleteBlocked = false;
+    // Both volume behaviours are modelled explicitly rather than by removing
+    // the stub, because a real Windows host pins the ancestor rename itself and
+    // could not otherwise exercise the unpinned branch deterministically.
+    let pinsRenames = true;
+    let renameBlockedWhileOpen = false;
     fs.renameSync = function (from, to, ...rest) {
-      if (!renameBlocked && path.basename(String(from)).startsWith('.cc-web-pin-rename-')) {
-        renameBlocked = true;
-        throw Object.assign(new Error('simulated sharing violation'), { code: 'EBUSY' });
+      if (path.basename(String(from)).startsWith('.cc-web-pin-rename-')) {
+        if (!pinsRenames) return undefined;
+        if (!renameBlockedWhileOpen) {
+          // Only the attempt made while the descendant handle is open is
+          // refused; the probe requires the retry after close to succeed.
+          renameBlockedWhileOpen = true;
+          throw Object.assign(new Error('simulated sharing violation'), { code: 'EBUSY' });
+        }
       }
       return originalRename.call(this, from, to, ...rest);
     };
-    fs.rmdirSync = function (target, ...rest) {
-      if (!deleteBlocked && path.basename(String(target)).startsWith('.cc-web-pin-delete-')) {
-        deleteBlocked = true;
-        throw Object.assign(new Error('simulated sharing violation'), { code: 'EBUSY' });
-      }
-      return originalRmdir.call(this, target, ...rest);
-    };
     try {
+      // libuv opens directories with FILE_SHARE_DELETE, so a live handle never
+      // prevents its own directory from being removed. Requiring that as well
+      // left this capability unreachable on every real Windows host, and the
+      // policy stuck at 'deny' with `.cc-web` impossible to create. The
+      // ancestor rename pin is what the probe now establishes.
       assert.strictEqual(probeWorkspacePathMutationPin(probeRoot, fd), true);
-      assert.strictEqual(renameBlocked, true, 'the ancestor rename branch must be exercised');
-      assert.strictEqual(deleteBlocked, true, 'the directory delete-sharing branch must be exercised');
+      assert.strictEqual(renameBlockedWhileOpen, true, 'the ancestor rename branch must be exercised');
 
-      // Rename pinning alone is insufficient: allowing FILE_SHARE_DELETE on
-      // the opened directory must make the complete capability fail.
-      fs.rmdirSync = originalRmdir;
-      renameBlocked = false;
+      // Without rename pinning there is no namespace guarantee left to rely on.
+      pinsRenames = false;
       assert.strictEqual(probeWorkspacePathMutationPin(probeRoot, fd), false);
     } finally {
       fs.renameSync = originalRename;
-      fs.rmdirSync = originalRmdir;
       fs.closeSync(fd);
       fs.rmSync(probeRoot, { recursive: true, force: true });
     }

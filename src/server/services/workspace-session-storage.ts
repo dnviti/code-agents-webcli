@@ -347,25 +347,35 @@ function verifyCreatedWorkspaceGitignore(
 }
 
 /**
- * Windows can make the pathname fallback safe only when Node's real handle
- * flags deny FILE_SHARE_DELETE. Probe both namespace operations on the actual
- * workspace volume instead of assuming libuv's CreateFile sharing mode:
+ * Windows has no openat-like descriptor namespace, so the pathname fallback is
+ * permitted only where a live handle demonstrably pins the directory namespace.
+ * Probe the real workspace volume instead of assuming libuv's CreateFile
+ * sharing mode: a live descendant handle must prevent its ancestor from being
+ * renamed, and that exact rename must become possible as soon as the handle
+ * closes, which separates handle pinning from an ACL, read-only mount,
+ * antivirus lock or other unrelated failure.
  *
- * - a live descendant handle must prevent its ancestor from being renamed;
- * - a live directory handle must prevent that directory from being removed.
+ * This deliberately no longer also requires a handle to prevent its own
+ * directory from being removed. libuv opens directories with FILE_SHARE_DELETE,
+ * so that condition is unreachable through Node's fs API on every Windows host;
+ * requiring it made this capability always fail, which left the policy at
+ * `deny` and made `.cc-web` impossible to create on Windows at all.
  *
- * Each operation must become possible immediately after close, which separates
- * handle pinning from an ACL, read-only mount, antivirus lock or other failure.
+ * The residual exposure is the narrow window in which something already able to
+ * mutate the workspace root could exchange it for the duration of a single
+ * mkdir. That is detected rather than silently accepted: `openChildDirectory`
+ * re-verifies the pinned parent through `verifyDirectoryBinding` after the
+ * operation, so a surviving symlink or a different directory fails the identity
+ * comparison. Planting the directory symlink such an exchange needs also
+ * requires Developer Mode or elevation on a default Windows installation.
  */
 function probeHandlePinsMutationNamespace(parent: OpenDirectory): boolean {
   const token = randomBytes(12).toString('hex');
   const renameParent = path.join(parent.accessPath, `.cc-web-pin-rename-${token}`);
   const renameChild = path.join(renameParent, 'child');
   const movedParent = `${renameParent}.moved`;
-  const deleteTarget = path.join(parent.accessPath, `.cc-web-pin-delete-${token}`);
   let pinFd: number | null = null;
   let currentRenameParent = renameParent;
-  let deleteTargetExists = false;
   try {
     verifyDirectoryBinding(parent.canonicalPath, parent.fd, parent.accessPath);
     fs.mkdirSync(renameParent, { mode: 0o700 });
@@ -394,24 +404,6 @@ function probeHandlePinsMutationNamespace(parent: OpenDirectory): boolean {
     fs.renameSync(movedParent, renameParent);
     currentRenameParent = renameParent;
 
-    fs.mkdirSync(deleteTarget, { mode: 0o700 });
-    deleteTargetExists = true;
-    pinFd = fs.openSync(deleteTarget, DIRECTORY_FLAGS);
-    let deleteBlockedWhileOpen = false;
-    try {
-      fs.rmdirSync(deleteTarget);
-      deleteTargetExists = false;
-    } catch (error) {
-      const code = (error as NodeJS.ErrnoException).code;
-      if (code !== 'EACCES' && code !== 'EPERM' && code !== 'EBUSY') return false;
-      deleteBlockedWhileOpen = true;
-    }
-    fs.closeSync(pinFd);
-    pinFd = null;
-    if (!deleteBlockedWhileOpen) return false;
-    fs.rmdirSync(deleteTarget);
-    deleteTargetExists = false;
-
     verifyDirectoryBinding(parent.canonicalPath, parent.fd, parent.accessPath);
     return true;
   } catch {
@@ -419,9 +411,6 @@ function probeHandlePinsMutationNamespace(parent: OpenDirectory): boolean {
   } finally {
     if (pinFd !== null) {
       try { fs.closeSync(pinFd); } catch { /* Probe cleanup is best effort. */ }
-    }
-    if (deleteTargetExists) {
-      try { fs.rmdirSync(deleteTarget); } catch { /* Never recurse over an unexpected entry. */ }
     }
     const child = path.join(currentRenameParent, 'child');
     try { fs.rmdirSync(child); } catch { /* Never recurse over an unexpected entry. */ }
