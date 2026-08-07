@@ -67,11 +67,11 @@ function createReleaseFixture(version = '6.1.0') {
 }
 
 describe('desktop release update pipeline', function () {
-  it('pins native updates to the project and requires signed release artifacts', function () {
+  it('pins native updates to the project and supports optional release signing', function () {
     const builder = read('electron-builder.yml');
     const pkg = JSON.parse(read('package.json'));
     assert.match(builder, /publish:\s*\n\s*provider: github\s*\n\s*owner: dnviti\s*\n\s*repo: code-agents-webcli/);
-    assert.match(builder, /forceCodeSigning: true/);
+    assert.match(builder, /forceCodeSigning: false/);
     assert.match(builder, /hardenedRuntime: true/);
     assert.match(builder, /entitlements: build\/entitlements\.mac\.plist/);
     assert.match(builder, /- zip/);
@@ -110,7 +110,10 @@ describe('desktop release update pipeline', function () {
     assert.match(workflow, /gh release edit .*--draft=false/);
     assert.match(workflow, /--config\.publish\.channel=latest-x64/);
     assert.match(workflow, /--config\.publish\.channel=latest-arm64/);
-    assert.match(workflow, /--config\.forceCodeSigning=true/);
+    assert.match(workflow, /--config\.forceCodeSigning=\$signing/);
+    assert.match(workflow, /signing is not configured; the package will be built unsigned/);
+    assert.match(workflow, /Incomplete \$platform signing identity/);
+    assert.match(workflow, /needs\.release-identities\.outputs\.all_signed == 'true'/);
     assert.match(workflow, /Stable feeds require an exact X\.Y\.Z semantic version/);
     assert.match(workflow, /Verify the versioned HTTPS candidate and unchanged stable ref/);
     assert.match(workflow, /cmp "\$local_repository\/summary" "\$verify\/summary"/);
@@ -152,16 +155,18 @@ describe('desktop release update pipeline', function () {
     }
   });
 
-  it('scopes private signing material to the platform that consumes it', function () {
+  it('exposes only boolean signing decisions from the protected identity check', function () {
     const workflow = read('.github', 'workflows', 'release-on-main.yml');
-    const windows = workflow.indexOf('- name: Require Windows release identity');
-    const mac = workflow.indexOf('- name: Require macOS release identity');
-    const flatpak = workflow.indexOf('- name: Require Flatpak release identity');
-    const appleKey = workflow.indexOf('- name: Prepare Apple notarization key');
-    assert.ok(windows >= 0 && mac > windows && flatpak > mac && appleKey > flatpak);
-    assert.doesNotMatch(workflow.slice(windows, mac), /MACOS_CSC_LINK|FLATPAK_GPG_PRIVATE_KEY/);
-    assert.doesNotMatch(workflow.slice(mac, flatpak), /WINDOWS_CSC_LINK|FLATPAK_GPG_PRIVATE_KEY/);
-    assert.doesNotMatch(workflow.slice(flatpak, appleKey), /WINDOWS_CSC_LINK|MACOS_CSC_LINK|APPLE_API_KEY_BASE64/);
+    const identityJob = workflow.slice(
+      workflow.indexOf('  release-identities:'),
+      workflow.indexOf('\n  desktop:'),
+    );
+    assert.match(identityJob, /outputs:\n\s+windows: .*outputs\.windows/);
+    assert.match(identityJob, /macos: .*outputs\.macos/);
+    assert.match(identityJob, /flatpak: .*outputs\.flatpak/);
+    assert.match(identityJob, /all_signed: .*outputs\.all_signed/);
+    assert.doesNotMatch(identityJob, /echo .*CSC_LINK.*GITHUB_OUTPUT/);
+    assert.doesNotMatch(identityJob, /echo .*GPG_PRIVATE_KEY.*GITHUB_OUTPUT/);
     assert.match(workflow, /runner\.os == 'macOS' && secrets\.MACOS_CSC_LINK \|\| ''/);
   });
 

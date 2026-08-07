@@ -91,14 +91,16 @@ any tag outside that history or with a different version.
   release, pushes the image to GHCR, and stages trusted desktop update feeds.
 
 The project is not published to npm. Pushing to GHCR uses the `GITHUB_TOKEN`
-Actions provides automatically. Desktop promotion is deliberately stricter: a
-protected `release` environment must provide the Windows signing identity and
-expected publisher, macOS Developer ID plus App Store Connect notarization API
-key, and the Flatpak repository GPG key. GitHub Pages must use the
+Actions provides automatically. A protected `release` environment may provide
+the Windows signing identity and expected publisher, macOS Developer ID plus
+App Store Connect notarization API key, and the Flatpak repository GPG key.
+GitHub Pages must use the
 `github-pages` environment at the repository's stable `/flatpak/` URL. The
-workflow fails before publishing a stable package feed when any required
-identity, platform signature, notarization ticket, updater metadata/checksum,
-or Flatpak summary signature is missing or invalid. Never add those credentials
+workflow always builds every desktop package. A platform with no configured
+identity is uploaded as an unsigned Actions artifact; a complete identity makes
+that platform signed. A partially configured identity fails rather than
+silently producing an unexpected unsigned package. Stable feeds are promoted
+only when all three identities pass verification. Never add those credentials
 to source control.
 
 Every candidate also needs a protected installed-package qualification. Run the
@@ -135,6 +137,63 @@ derives the public key, embeds it in the Flatpak, publishes it in the repository
 descriptors, and verifies the signed commit/version manifest over the deployed
 HTTPS origin. Private keys and passphrases are available only to the protected
 tagged-release environment, never pull requests or forks.
+
+### Provision the desktop signing identities
+
+These values are not issued by GitHub. Create or obtain each platform identity,
+then add it under **Settings → Environments → release → Environment secrets**
+(and put the non-secret values in **Environment variables**). Keep an encrypted
+offline backup: losing a key can prevent existing installations from trusting
+future updates.
+
+For Flatpak, generate a dedicated OpenPGP signing key on a trusted machine. Use
+a strong passphrase when prompted and replace the example identity:
+
+```bash
+gpg --quick-generate-key 'Code Agents WebCLI Flatpak <release@example.com>' rsa4096 sign 2y
+gpg --list-secret-keys --with-colons 'Code Agents WebCLI Flatpak' \
+  | awk -F: '$1 == "fpr" { print $10; exit }'
+gpg --armor --export-secret-keys THE_40_HEX_FINGERPRINT \
+  | base64 | tr -d '\n'
+```
+
+Store the fingerprint as `FLATPAK_GPG_KEY_ID`, the final single-line output as
+`FLATPAK_GPG_PRIVATE_KEY`, and the passphrase as
+`FLATPAK_GPG_PASSPHRASE`. Do not use a Git commit-signing key or omit the
+passphrase. The release workflow base64-decodes and imports this key before
+signing the OSTree repository.
+
+For Windows, purchase an Authenticode code-signing certificate from a trusted
+certificate authority. Export the certificate **with its private key** as a
+password-protected PKCS#12/PFX file. Base64-encode the file as one line with
+`base64 < certificate.pfx | tr -d '\n'` (or use electron-builder's supported
+HTTPS certificate URL) and store it as `WINDOWS_CSC_LINK`; store the export
+password as `WINDOWS_CSC_KEY_PASSWORD`. Set `WINDOWS_CERT_SUBJECT` to the exact
+certificate subject reported by PowerShell:
+
+```powershell
+(Get-PfxCertificate .\certificate.pfx).Subject
+[Convert]::ToBase64String([IO.File]::ReadAllBytes('.\certificate.pfx'))
+```
+
+For macOS, enroll the organization or individual in the Apple Developer
+Program, create a **Developer ID Application** certificate, install it together
+with its private key in Keychain Access, and export both as a
+password-protected `.p12`. Base64-encode that file as one line and store it as
+`MACOS_CSC_LINK`; store its export password as `MACOS_CSC_KEY_PASSWORD`.
+`MACOS_TEAM_ID` is the Apple developer Team ID, while
+`MACOS_CERT_AUTHORITY` must be the exact first authority printed by
+`codesign -dv --verbose=4 Signed.app`. Notarization additionally requires a
+separate App Store Connect API key: store the base64-encoded `.p8` contents as
+`APPLE_API_KEY_BASE64`, its key ID as `APPLE_API_KEY_ID`, and its issuer ID as
+`APPLE_API_ISSUER`.
+
+After saving the values, re-run the failed tagged-release jobs. Do not create a
+new tag merely to retry missing credentials. With none of a platform's values
+configured, the workflow logs a notice and builds that package unsigned. If
+only some values are configured, it reports the missing names; later
+verification also rejects a certificate whose subject, Team ID, authority,
+notarization, or GPG fingerprint differs from the protected configuration.
 
 Flatpak publication is two-phase. The workflow first deploys the candidate at a
 versioned `/flatpak-candidates/vX.Y.Z/` path while keeping the old signed ref at
