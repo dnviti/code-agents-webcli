@@ -80,6 +80,13 @@ flatpak:
   # incompatible with the selected Freedesktop 24.08 runtime and SDK.
   baseVersion: "24.08"
   branch: stable
+  # As with AppImage above, electron-builder renders the generic Linux arch
+  # macro as `x86_64`, while this project's public asset contract is `x64`.
+  # Signed runs hid the mismatch because the repository step rewrites the
+  # bundle to the contract name, but that step is skipped when no Flatpak
+  # signing key is configured, and the installed smoke test then cannot find
+  # `Code-Agents-Web-CLI-*-linux-x64.flatpak`. Emit the contract name directly.
+  artifactName: Code-Agents-Web-CLI-${version}-linux-x64.${ext}
   finishArgs:
     - --share=ipc
     - --share=network

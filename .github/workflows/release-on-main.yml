@@ -343,6 +343,17 @@ jobs:
             macOS) signing='${{ needs.release-identities.outputs.macos }}' ;;
           esac
           platform_config+=("--config.forceCodeSigning=$signing")
+          # An `env:` key whose expression yields an empty string is still
+          # defined, so an absent certificate secret arrives as CSC_LINK=''
+          # rather than as no variable at all. electron-builder's Windows path
+          # rejects that empty value explicitly, but its macOS path only guards
+          # `cscLink != null` — and '' is not null — so it resolves the empty
+          # path against the working directory and fails the packaging step
+          # with "<repository> not a file". Remove the variables outright
+          # unless this platform holds a complete signing identity.
+          if [ "$signing" != true ]; then
+            unset CSC_LINK CSC_KEY_PASSWORD
+          fi
           if [ '${{ runner.os }}' = 'Windows' ] && [ "$signing" = true ]; then
             platform_config+=("--config.win.signtoolOptions.publisherName=$WINDOWS_CERT_SUBJECT")
           fi
