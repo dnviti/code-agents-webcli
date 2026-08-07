@@ -804,6 +804,121 @@ jobs:
             release-assets/**/flatpak-repository
             release-assets/**/flatpak-repository-previous
 
+  unsigned-release:
+    name: Publish unsigned desktop release
+    # The signed path stages a private draft, proves the versioned Flatpak
+    # candidate feed over HTTPS, binds the installed updater qualification and
+    # only then promotes. None of that is reachable without the signing
+    # identities: the Flatpak repository, its `.flatpakref`/`.flatpakrepo`
+    # descriptors and the qualification attestation are all produced by the
+    # signing steps. An unsigned tag therefore publishes exactly the packages
+    # it actually built, and claims nothing it cannot prove.
+    if: needs.release-identities.outputs.all_signed != 'true'
+    needs: [verify, release-identities, desktop]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.verify.outputs.commit_sha }}
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: desktop-*
+          path: release-assets
+      - name: Collect the built packages and write checksums
+        shell: bash
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir release-assets/published
+          declare -A seen=()
+          while IFS= read -r -d '' file; do
+            name="$(basename "$file")"
+            if [[ -v "seen[$name]" ]]; then echo "Duplicate release asset: $name" >&2; exit 1; fi
+            seen["$name"]=1
+            cp "$file" "release-assets/published/$name"
+          done < <(find release-assets -type f \
+            ! -path '*/flatpak-repository/*' \
+            ! -path '*/flatpak-repository-previous/*' \( \
+            -name '*.AppImage' -o -name '*.flatpak' -o -name '*.exe' -o \
+            -name '*.exe.blockmap' -o -name '*.dmg' -o -name '*.zip' -o \
+            -name '*.zip.blockmap' -o -name 'latest*.yml' \
+          \) -print0)
+          # `needs: desktop` already fails this job if any matrix leg failed.
+          # Name every installable package anyway, so a future matrix or
+          # artifactName change cannot quietly publish a partial release.
+          for name in \
+            "Code-Agents-Web-CLI-${VERSION}-linux-x64.AppImage" \
+            "Code-Agents-Web-CLI-${VERSION}-linux-x64.flatpak" \
+            "Code-Agents-Web-CLI-${VERSION}-win-x64.exe" \
+            "Code-Agents-Web-CLI-${VERSION}-mac-x64.dmg" \
+            "Code-Agents-Web-CLI-${VERSION}-mac-arm64.dmg"; do
+            test -f "release-assets/published/$name" \
+              || { echo "Missing expected release package: $name" >&2; exit 1; }
+          done
+          cd release-assets/published
+          find . -maxdepth 1 -type f \( -name '*.AppImage' -o -name '*.flatpak' \
+            -o -name '*.exe' -o -name '*.dmg' \) -printf '%f\0' \
+            | sort -z | xargs -0 sha256sum > SHA256SUMS
+          sha256sum -c SHA256SUMS
+      - name: Refuse to replace an already published release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          tag='${{ needs.verify.outputs.tag }}'
+          release_status="$(curl --silent --show-error --location --proto '=https' --tlsv1.2 \
+            --output /dev/null --write-out '%{http_code}' \
+            --header "Authorization: Bearer $GH_TOKEN" \
+            --header 'Accept: application/vnd.github+json' \
+            --header 'X-GitHub-Api-Version: 2022-11-28' \
+            "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/releases/tags/$tag")"
+          case "$release_status:${{ needs.verify.outputs.resume_draft }}" in
+            404:false) ;;
+            200:true) ;;
+            200:false) echo "Release $tag already exists; published versions are immutable." >&2; exit 1 ;;
+            *) echo "Could not prove release $tag is unused (HTTP $release_status)." >&2; exit 1 ;;
+          esac
+      - uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v3.0.0
+        with:
+          tag_name: ${{ needs.verify.outputs.tag }}
+          name: ${{ needs.verify.outputs.tag }}
+          target_commitish: ${{ needs.verify.outputs.commit_sha }}
+          draft: false
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: release-assets/published/*
+          body: |
+            Unsigned desktop release for ${{ needs.verify.outputs.tag }}.
+
+            **These packages are not code signed.** No Windows Authenticode
+            certificate, Apple Developer ID identity or Flatpak signing key was
+            configured for this build, so the operating system will warn about
+            an unidentified developer on first launch. Verify what you download
+            against `SHA256SUMS` before installing.
+
+            Desktop downloads:
+            - `*.AppImage` — Linux x64, portable; mounted launches require FUSE2 and Chromium sandboxing requires unprivileged user namespaces.
+            - `*.flatpak` — Linux x64, sandboxed Flatpak bundle. Install the bundle directly; this release publishes no signed Flatpak remote.
+            - `*.exe` — Windows x64 NSIS installer.
+            - `*-x64.dmg` — macOS Intel (x64).
+            - `*-arm64.dmg` — macOS Apple Silicon (arm64).
+            - `SHA256SUMS` — SHA-256 checksums for every desktop package.
+
+            **In-app updates cannot install this release.** The updater
+            manifests and blockmaps are published here, but the desktop updater
+            verifies a package's signature before installing it, and these
+            packages have none. An installation from an earlier signed release
+            will see this version and fail that check. Install the package above
+            manually instead; application data is preserved.
+      - name: Report what an unsigned release deliberately does not publish
+        run: |
+          echo '::notice::Published unsigned packages, updater manifests and SHA256SUMS.'
+          echo '::notice::No signed Flatpak repository, remote descriptors or updater qualification exist for this release.'
+
   flatpak-pages-stage:
     name: Stage and verify the signed Flatpak candidate
     needs: [verify, release-stage]
