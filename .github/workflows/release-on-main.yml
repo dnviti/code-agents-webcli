@@ -446,6 +446,11 @@ jobs:
           esac
       - name: Smoke the native packaged application
         shell: bash
+        # The Linux branch below bounds its own launches, but a packaged app
+        # that fails to start and then never exits would otherwise hold the
+        # Windows and macOS runners until the job limit. macOS has no GNU
+        # `timeout`, so bound the whole step here instead of per platform.
+        timeout-minutes: 20
         env:
           CODE_AGENTS_WEBCLI_DESKTOP_SMOKE: '1'
         run: |
