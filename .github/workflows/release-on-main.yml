@@ -177,9 +177,74 @@ jobs:
             BUILD_SHA=${{ needs.verify.outputs.commit_sha }}
             BUILD_DATE=${{ needs.verify.outputs.commit_date }}
 
-  desktop:
-    name: Build signed desktop (${{ matrix.label }})
+  release-identities:
+    name: Detect optional desktop signing identities
     needs: verify
+    runs-on: ubuntu-latest
+    environment: release
+    outputs:
+      windows: ${{ steps.identities.outputs.windows }}
+      macos: ${{ steps.identities.outputs.macos }}
+      flatpak: ${{ steps.identities.outputs.flatpak }}
+      all_signed: ${{ steps.identities.outputs.all_signed }}
+    steps:
+      - name: Select signed or unsigned builds
+        id: identities
+        shell: bash
+        env:
+          WINDOWS_CSC_LINK: ${{ secrets.WINDOWS_CSC_LINK }}
+          WINDOWS_CSC_KEY_PASSWORD: ${{ secrets.WINDOWS_CSC_KEY_PASSWORD }}
+          WINDOWS_CERT_SUBJECT: ${{ vars.WINDOWS_CERT_SUBJECT }}
+          MACOS_CSC_LINK: ${{ secrets.MACOS_CSC_LINK }}
+          MACOS_CSC_KEY_PASSWORD: ${{ secrets.MACOS_CSC_KEY_PASSWORD }}
+          MACOS_TEAM_ID: ${{ vars.MACOS_TEAM_ID }}
+          MACOS_CERT_AUTHORITY: ${{ vars.MACOS_CERT_AUTHORITY }}
+          APPLE_API_KEY_BASE64: ${{ secrets.APPLE_API_KEY_BASE64 }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          FLATPAK_GPG_PRIVATE_KEY: ${{ secrets.FLATPAK_GPG_PRIVATE_KEY }}
+          FLATPAK_GPG_KEY_ID: ${{ secrets.FLATPAK_GPG_KEY_ID }}
+          FLATPAK_GPG_PASSPHRASE: ${{ secrets.FLATPAK_GPG_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+          check_identity() {
+            local platform="$1"
+            local primary="$2"
+            shift 2
+            local missing=()
+            if [ -z "${!primary:-}" ]; then
+              echo "$platform=false" >> "$GITHUB_OUTPUT"
+              echo "::notice::$platform signing is not configured; the package will be built unsigned."
+              return
+            fi
+            for name in "$@"; do
+              if [ -z "${!name:-}" ]; then missing+=("$name"); fi
+            done
+            if [ "${#missing[@]}" -ne 0 ]; then
+              echo "Incomplete $platform signing identity; missing: ${missing[*]}" >&2
+              exit 1
+            else
+              echo "$platform=true" >> "$GITHUB_OUTPUT"
+            fi
+          }
+          check_identity windows WINDOWS_CSC_LINK WINDOWS_CSC_LINK WINDOWS_CSC_KEY_PASSWORD WINDOWS_CERT_SUBJECT
+          check_identity macos MACOS_CSC_LINK MACOS_CSC_LINK MACOS_CSC_KEY_PASSWORD MACOS_TEAM_ID \
+            MACOS_CERT_AUTHORITY APPLE_API_KEY_BASE64 APPLE_API_KEY_ID APPLE_API_ISSUER
+          check_identity flatpak FLATPAK_GPG_PRIVATE_KEY FLATPAK_GPG_PRIVATE_KEY \
+            FLATPAK_GPG_KEY_ID FLATPAK_GPG_PASSPHRASE
+          if [ -n "$FLATPAK_GPG_KEY_ID" ] && ! [[ "$FLATPAK_GPG_KEY_ID" =~ ^[0-9A-Fa-f]{40}$ ]]; then
+            echo 'FLATPAK_GPG_KEY_ID must be an exact 40-hex fingerprint.' >&2
+            exit 1
+          fi
+          if [ -n "$WINDOWS_CSC_LINK" ] && [ -n "$MACOS_CSC_LINK" ] && [ -n "$FLATPAK_GPG_PRIVATE_KEY" ]; then
+            echo 'all_signed=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'all_signed=false' >> "$GITHUB_OUTPUT"
+          fi
+
+  desktop:
+    name: Build desktop (${{ matrix.label }})
+    needs: [verify, release-identities]
     runs-on: ${{ matrix.os }}
     environment: release
     strategy:
@@ -190,21 +255,21 @@ jobs:
           # user-namespace policy and its libfuse2t64 package name.
           - os: ubuntu-24.04
             label: Linux x64
-            args: --linux AppImage flatpak --x64 --config.publish.channel=latest --config.forceCodeSigning=true
+            args: --linux AppImage flatpak --x64 --config.publish.channel=latest
             packages: 2
           - os: windows-latest
             label: Windows x64
-            args: --win nsis --x64 --config.publish.channel=latest --config.forceCodeSigning=true
+            args: --win nsis --x64 --config.publish.channel=latest
             packages: 1
           # These remain native builds because node-pty is selected for the
           # build host. The channel names keep architecture feeds separate.
           - os: macos-15-intel
             label: macOS x64
-            args: --mac dmg zip --x64 --config.publish.channel=latest-x64 --config.forceCodeSigning=true
+            args: --mac dmg zip --x64 --config.publish.channel=latest-x64
             packages: 1
           - os: macos-15
             label: macOS arm64
-            args: --mac dmg zip --arm64 --config.publish.channel=latest-arm64 --config.forceCodeSigning=true
+            args: --mac dmg zip --arm64 --config.publish.channel=latest-arm64
             packages: 1
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -215,49 +280,8 @@ jobs:
           node-version: '24'
           cache: npm
       - run: npm ci
-      - name: Require Windows release identity
-        if: runner.os == 'Windows'
-        shell: bash
-        env:
-          WINDOWS_CSC_LINK: ${{ secrets.WINDOWS_CSC_LINK }}
-          WINDOWS_CSC_KEY_PASSWORD: ${{ secrets.WINDOWS_CSC_KEY_PASSWORD }}
-          WINDOWS_CERT_SUBJECT: ${{ vars.WINDOWS_CERT_SUBJECT }}
-        run: |
-          set -euo pipefail
-          for name in WINDOWS_CSC_LINK WINDOWS_CSC_KEY_PASSWORD WINDOWS_CERT_SUBJECT; do
-            test -n "${!name:-}" || { echo "Required protected release identity $name is not configured." >&2; exit 1; }
-          done
-      - name: Require macOS release identity
-        if: runner.os == 'macOS'
-        shell: bash
-        env:
-          MACOS_CSC_LINK: ${{ secrets.MACOS_CSC_LINK }}
-          MACOS_CSC_KEY_PASSWORD: ${{ secrets.MACOS_CSC_KEY_PASSWORD }}
-          MACOS_TEAM_ID: ${{ vars.MACOS_TEAM_ID }}
-          MACOS_CERT_AUTHORITY: ${{ vars.MACOS_CERT_AUTHORITY }}
-          APPLE_API_KEY_BASE64: ${{ secrets.APPLE_API_KEY_BASE64 }}
-          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
-          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
-        run: |
-          set -euo pipefail
-          for name in MACOS_CSC_LINK MACOS_CSC_KEY_PASSWORD MACOS_TEAM_ID MACOS_CERT_AUTHORITY APPLE_API_KEY_BASE64 APPLE_API_KEY_ID APPLE_API_ISSUER; do
-            test -n "${!name:-}" || { echo "Required protected release identity $name is not configured." >&2; exit 1; }
-          done
-      - name: Require Flatpak release identity
-        if: runner.os == 'Linux'
-        shell: bash
-        env:
-          FLATPAK_GPG_PRIVATE_KEY: ${{ secrets.FLATPAK_GPG_PRIVATE_KEY }}
-          FLATPAK_GPG_KEY_ID: ${{ secrets.FLATPAK_GPG_KEY_ID }}
-          FLATPAK_GPG_PASSPHRASE: ${{ secrets.FLATPAK_GPG_PASSPHRASE }}
-        run: |
-          set -euo pipefail
-          for name in FLATPAK_GPG_PRIVATE_KEY FLATPAK_GPG_KEY_ID FLATPAK_GPG_PASSPHRASE; do
-            test -n "${!name:-}" || { echo "Required protected release identity $name is not configured." >&2; exit 1; }
-          done
-          [[ "$FLATPAK_GPG_KEY_ID" =~ ^[0-9A-Fa-f]{40}$ ]] || { echo 'Flatpak key id must be an exact fingerprint.' >&2; exit 1; }
       - name: Prepare Apple notarization key
-        if: runner.os == 'macOS'
+        if: runner.os == 'macOS' && needs.release-identities.outputs.macos == 'true'
         shell: bash
         env:
           APPLE_API_KEY_BASE64: ${{ secrets.APPLE_API_KEY_BASE64 }}
@@ -282,7 +306,7 @@ jobs:
             org.freedesktop.Platform//24.08 org.freedesktop.Sdk//24.08 \
             org.electronjs.Electron2.BaseApp//24.08
       - name: Embed the trusted Flatpak manifest key
-        if: runner.os == 'Linux'
+        if: runner.os == 'Linux' && needs.release-identities.outputs.flatpak == 'true'
         shell: bash
         env:
           FLATPAK_GPG_PRIVATE_KEY: ${{ secrets.FLATPAK_GPG_PRIVATE_KEY }}
@@ -300,10 +324,10 @@ jobs:
           gpg --batch --homedir "$key_home" --armor --export "$FLATPAK_GPG_KEY_ID" \
             > build/flatpak-update-public-key.asc
           grep -F 'BEGIN PGP PUBLIC KEY BLOCK' build/flatpak-update-public-key.asc >/dev/null
-      - name: Build signed desktop packages
+      - name: Build desktop packages
         shell: bash
         env:
-          CODE_AGENTS_WEBCLI_RELEASE: '1'
+          CODE_AGENTS_WEBCLI_REQUIRE_NOTARIZATION: ${{ needs.release-identities.outputs.macos }}
           CSC_LINK: ${{ runner.os == 'Windows' && secrets.WINDOWS_CSC_LINK || (runner.os == 'macOS' && secrets.MACOS_CSC_LINK || '') }}
           CSC_KEY_PASSWORD: ${{ runner.os == 'Windows' && secrets.WINDOWS_CSC_KEY_PASSWORD || (runner.os == 'macOS' && secrets.MACOS_CSC_KEY_PASSWORD || '') }}
           APPLE_API_KEY_ID: ${{ runner.os == 'macOS' && secrets.APPLE_API_KEY_ID || '' }}
@@ -313,7 +337,13 @@ jobs:
         run: |
           set -euo pipefail
           platform_config=()
-          if [ '${{ runner.os }}' = 'Windows' ]; then
+          signing='false'
+          case '${{ runner.os }}' in
+            Windows) signing='${{ needs.release-identities.outputs.windows }}' ;;
+            macOS) signing='${{ needs.release-identities.outputs.macos }}' ;;
+          esac
+          platform_config+=("--config.forceCodeSigning=$signing")
+          if [ '${{ runner.os }}' = 'Windows' ] && [ "$signing" = true ]; then
             platform_config+=("--config.win.signtoolOptions.publisherName=$WINDOWS_CERT_SUBJECT")
           fi
           npm run desktop:dist -- ${{ matrix.args }} "${platform_config[@]}" --publish never
@@ -327,7 +357,7 @@ jobs:
       - name: Verify native attachment gestures and controller routing
         run: npm run test:desktop-attachments
       - name: Publish signed Flatpak repository artifacts
-        if: runner.os == 'Linux'
+        if: runner.os == 'Linux' && needs.release-identities.outputs.flatpak == 'true'
         shell: bash
         env:
           FLATPAK_GPG_PRIVATE_KEY: ${{ secrets.FLATPAK_GPG_PRIVATE_KEY }}
@@ -355,6 +385,11 @@ jobs:
               test -f "$(find release -maxdepth 1 -name '*.AppImage' -print -quit)"
               test -f release/latest-linux.yml
               test -z "$(find release -maxdepth 1 -name '*.AppImage.blockmap' -print -quit)"
+              if [ '${{ needs.release-identities.outputs.flatpak }}' != true ]; then
+                test -f "$(find release -maxdepth 1 -name '*.flatpak' -print -quit)"
+                echo 'Skipping repository signature verification for unsigned Flatpak build.'
+                exit 0
+              fi
               test -d release/flatpak-repository
               test -f release/linux-unpacked/resources/flatpak-update-public-key.asc
               embedded_fingerprint="$(gpg --batch --with-colons --show-keys \
@@ -366,6 +401,10 @@ jobs:
               test "$embedded_fingerprint" = "$repository_fingerprint"
               ;;
             Windows)
+              if [ '${{ needs.release-identities.outputs.windows }}' != true ]; then
+                echo 'Skipping Authenticode verification for unsigned Windows build.'
+                exit 0
+              fi
               exe="$(find release -maxdepth 1 -name '*.exe' -print -quit)"
               EXE="$exe" powershell -NoProfile -Command '$s = Get-AuthenticodeSignature $env:EXE; if ($s.Status -ne "Valid" -or $s.SignerCertificate.Subject -cne $env:WINDOWS_CERT_SUBJECT) { throw "Invalid or unexpected Authenticode signature subject" }'
               UPDATE_CONFIG=release/win-unpacked/resources/app-update.yml \
@@ -375,6 +414,10 @@ jobs:
               test -f "$(find release -maxdepth 1 -name '*.exe.blockmap' -print -quit)"
               ;;
             macOS)
+              if [ '${{ needs.release-identities.outputs.macos }}' != true ]; then
+                echo 'Skipping signature and notarization verification for unsigned macOS build.'
+                exit 0
+              fi
               app="$(find release -type d -path '*.app' -print -quit)"
               test -n "$app"
               codesign --verify --deep --strict --verbose=2 "$app"
@@ -629,7 +672,8 @@ jobs:
 
   release-stage:
     name: Stage complete signed desktop release
-    needs: [verify, desktop]
+    if: needs.release-identities.outputs.all_signed == 'true'
+    needs: [verify, release-identities, desktop]
     runs-on: ubuntu-latest
     permissions:
       contents: write
