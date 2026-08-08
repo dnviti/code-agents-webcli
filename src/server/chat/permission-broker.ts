@@ -3,6 +3,7 @@ import * as fs from 'fs';
 import * as net from 'net';
 import * as os from 'os';
 import * as path from 'path';
+import { electronAsNodeEnv } from './node-as-node.js';
 
 /**
  * The approval channel for runtimes that gate tools through an external hook.
@@ -469,6 +470,7 @@ export function permissionHookSettings(
     },
     env: {
       CCWEB_PERMISSION_SOCKET: socketPath,
+      ...electronAsNodeEnv(nodePath),
     },
   });
 }

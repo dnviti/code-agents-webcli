@@ -61,6 +61,65 @@ linux:
   target:
     - AppImage
     - flatpak
+    - deb
+    - rpm
+
+# Debian / Ubuntu packaging (fpm). `.deb` is the conventional apt install
+# path and `.rpm` the Red Hat / Fedora path; both keep the same `linux-x64`
+# public asset contract as the AppImage and Flatpak so users can reason about
+# the set they download. The fpm tool requires `rpmbuild` for the rpm target.
+deb:
+  # The package.json author has email-less `Daniele Viti`, which fpm refuses,
+  # so the maintainer is spelled out with the real project address.
+  maintainer: Daniele Viti <dnviti@gmail.com>
+  synopsis: Run coding agents and real terminals locally
+  # Match the repo's established public `linux-x64` asset naming (see AppImage
+  # and flatpak below) rather than fpm's `amd64` deb convention.
+  artifactName: Code-Agents-Web-CLI-${version}-linux-x64.${ext}
+  # Electron's Linux runtime links GTK3, NSS, the X11 test/scrn-saver
+  # libraries, GBM and ALSA directly. The electron-builder defaults omit
+  # libgbm1 and libasound2, so a clean Debian/Ubuntu install would start with
+  # missing shared objects; spell out the full set so apt resolves everything.
+  # Database libraries that Debian/Ubuntu renamed for the time_t 64 transition
+  # (libgtk-3-0 -> libgtk-3-0t64, libatspi2.0-0 -> libatspi2.0-0t64,
+  # libasound2 -> libasound2t64 on Ubuntu 24.04+) are listed as alternatives.
+  # Plain `libasound2` alone is dangerous on 24.04: apt satisfies it with the
+  # `liboss4-salsa-asound2` compatibility shim, which lacks the ALSA symbols
+  # Electron links (`snd_device_name_get_hint`), crashing at startup.
+  depends:
+    - libgtk-3-0t64 | libgtk-3-0
+    - libnotify4
+    - libnss3
+    - libxss1
+    - libxtst6
+    - xdg-utils
+    - libatspi2.0-0t64 | libatspi2.0-0
+    - libuuid1
+    - libsecret-1-0
+    - libgbm1
+    - libasound2t64 | libasound2
+    - libxkbcommon0
+
+rpm:
+  maintainer: Daniele Viti <dnviti@gmail.com>
+  synopsis: Run coding agents and real terminals locally
+  artifactName: Code-Agents-Web-CLI-${version}-linux-x64.${ext}
+  # Same rationale as the deb depends above, with RPM package names. The
+  # defaults use `(libXtst or libXtst6)`/`(libuuid or libuuid1)` rich
+  # alternatives that only half-exist on some distros and omit GBM/ALSA/XKB.
+  depends:
+    - gtk3
+    - libnotify
+    - nss
+    - libXScrnSaver
+    - libXtst
+    - xdg-utils
+    - at-spi2-core
+    - libuuid
+    - libsecret
+    - mesa-libgbm
+    - alsa-lib
+    - libxkbcommon
 
 appImage:
   category: Development

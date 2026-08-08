@@ -81,9 +81,13 @@ class ElectronUpdaterProvider extends EventEmitter {
     if (this.platform !== 'linux') return;
     const filename = this.environment.APPIMAGE;
     if (!filename) {
-      const error = new Error('APPIMAGE is not set.');
-      error.code = 'APPIMAGE_NOT_WRITABLE';
-      throw error;
+      // A packaged Linux app without APPIMAGE is a deb/rpm/pacman install:
+      // electron-updater selects its native updater from the `package-type`
+      // resource, which installs through the package manager and has no
+      // in-place writability requirement. Only real AppImage runs replace
+      // themselves in place, and electron-updater itself deactivates the
+      // AppImageUpdater when APPIMAGE is unset.
+      return;
     }
     try {
       const stat = fs.statSync(filename);

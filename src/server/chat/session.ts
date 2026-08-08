@@ -74,6 +74,7 @@ import {
   fileMcpConfig,
   writeFileMcpBridge,
 } from './file-mcp-bridge.js';
+import { electronAsNodeEnv } from './node-as-node.js';
 import { UserEnvironment } from '../services/environments/types.js';
 import { ChatStoreLike, ChatSessionRef, chatStoreAppendOutcome } from './store.js';
 import {
@@ -1308,6 +1309,7 @@ export class ChatSession {
               [FILE_CALLBACK_TOKEN_ENV]: fileEndpoint.token,
               [QUESTION_TOOL_ENABLED_ENV]: questionToolRequested ? '1' : '0',
               ...(laddered ? { [TIER_ENABLED_ENV]: '1' } : {}),
+              ...electronAsNodeEnv(nodePath),
             },
           }
         : {
@@ -1318,6 +1320,7 @@ export class ChatSession {
               [ASK_SOCKET_ENV]: runtimeSocketPath,
               [QUESTION_TOOL_ENABLED_ENV]: questionToolRequested ? '1' : '0',
               ...(laddered ? { [TIER_ENABLED_ENV]: '1' } : {}),
+              ...electronAsNodeEnv(nodePath),
             },
           };
       ccwebToolsWired = true;

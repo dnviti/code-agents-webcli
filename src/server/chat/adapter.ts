@@ -845,7 +845,13 @@ export abstract class JsonRpcChatAdapter extends BaseChatAdapter {
       if (!waiter) return;
       this.pending.delete(rpc.id as number);
       if (rpc.error) {
-        waiter.reject(new Error(rpc.error.message || 'request failed'));
+        // omp's MCP failure surfaces the root cause in `data.details`
+        // (e.g. the question-server command that failed to spawn). Carrying it
+        // into the message turns a naked "Internal error" into the actionable
+        // fact, which is what the failure path downstream needs to see.
+        const detail = (rpc.error as { data?: { details?: unknown } }).data?.details;
+        const suffix = typeof detail === 'string' && detail ? ` — ${detail}` : '';
+        waiter.reject(new Error(`${rpc.error.message || 'request failed'}${suffix}`));
       } else {
         waiter.resolve(rpc.result);
       }

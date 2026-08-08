@@ -510,9 +510,22 @@ describe('desktop update providers and IPC guards', function () {
     const provider = new ElectronUpdaterProvider({
       autoUpdater: native,
       platform: 'linux',
-      environment: {},
+      environment: { APPIMAGE: '/nonexistent/Code-Agents-Web-CLI.AppImage' },
     });
     await assert.rejects(provider.download(), (error) => error.code === 'APPIMAGE_NOT_WRITABLE');
+  });
+
+  it('lets a packaged deb/rpm install download without an APPIMAGE environment', async function () {
+    const native = new EventEmitter();
+    let downloaded = 0;
+    native.downloadUpdate = async () => { downloaded += 1; };
+    const provider = new ElectronUpdaterProvider({
+      autoUpdater: native,
+      platform: 'linux',
+      environment: {},
+    });
+    await provider.download();
+    assert.strictEqual(downloaded, 1, 'a package-manager install must reach the native updater');
   });
 
   it('selects the matching architecture-specific macOS feed', function () {

@@ -341,6 +341,71 @@ describe('asking the user a choice-based question', function () {
       }
     });
 
+    it('runs the ACP question-server as node on the desktop build', async function () {
+      // omp speaks the ACP `protocol` channel: the ccweb server travels as an
+      // mcpServers entry on session/new, not as a --mcp-config flag. The
+      // desktop app is packaged as Electron, so `process.execPath` is the
+      // Electron binary, and the runtime must spawn that binary as a node
+      // script via ELECTRON_RUN_AS_NODE=1 — otherwise session/new rejects the
+      // server with `Internal error` and the adapter misreads it as a login
+      // prompt. The env patch must ride the server descriptor itself.
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), 'omp-question-mcp-'));
+      const store = memoryStore();
+      const sent = [];
+      let adapterOptions;
+      const realFactory = registry.createChatAdapter;
+      registry.createChatAdapter = (runtime, options) => {
+        adapterOptions = options;
+        return {
+          runtime,
+          capabilities: { streaming: true, permissions: false, interrupt: true },
+          alive: true,
+          readyForTurn: true,
+          async start() {},
+          async send(turn) { sent.push(turn.text); },
+          async interrupt() {},
+          async stop() { this.alive = false; },
+          respondPermission() {},
+        };
+      };
+      const savedElectron = process.versions.electron;
+      let chat;
+      try {
+        process.versions.electron = '43.2.0';
+        chat = new ChatSession(
+          { id: 's1', ownerUserId: 7 },
+          {
+            store,
+            socketDir: path.join(root, 'sockets'),
+            hookScript: path.join(root, 'missing-hook.js'),
+            askScript: ASK_SERVER,
+            broadcast: () => {},
+            resolveCommand: () => path.join(root, 'missing-runtime'),
+          },
+        );
+        await chat.start({
+          runtime: 'omp',
+          workingDir: root,
+          bypassPermissions: true,
+          planMode: false,
+        });
+        await chat.send({ text: 'Choose an implementation.' });
+        assert.match(sent[0], /<ccweb-question>/);
+
+        const server = adapterOptions.askMcpServer;
+        assert.ok(server, 'ACPs must receive the question server as askMcpServer');
+        assert.strictEqual(server.name, 'ccweb');
+        assert.strictEqual(server.command, process.execPath);
+        assert.strictEqual(server.env.ELECTRON_RUN_AS_NODE, '1',
+          'the runtime must spawn the Electron child in node mode');
+      } finally {
+        process.versions.electron = savedElectron;
+        await chat?.stop();
+        registry.createChatAdapter = realFactory;
+        fs.rmSync(root, { recursive: true, force: true });
+      }
+    });
+
     it('forwards Codex’s question policy through the MCP environment allowlist', async function () {
       const root = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-question-mcp-'));
       const store = memoryStore();
@@ -899,6 +964,47 @@ describe('asking the user a choice-based question', function () {
       assert.deepStrictEqual(server.args, ['/opt/app/ask-mcp.js']);
       assert.strictEqual(server.env.CCWEB_ASK_SOCKET, '/tmp/s.sock');
       assert.strictEqual(server.env.CCWEB_QUESTION_TOOL_ENABLED, '0');
+    });
+
+    it('re-runs the question-server through the Electron binary as node on the desktop app', function () {
+      // The desktop build is an Electron binary, so `process.execPath` is
+      // Electron, not node. The MCP server / hook is a node script: Electron
+      // only executes it when told it is node (`ELECTRON_RUN_AS_NODE=1`), and
+      // without that flag the runtime spawns a GUI instead and `session/new`
+      // dies with `Internal error`. The child descriptor must carry the flag
+      // exactly when the child will be our own Electron binary, and neither on
+      // the node web build nor for a container's `node`.
+      const { electronAsNodeEnv } = require('../dist/server/chat/node-as-node.js');
+      const { permissionHookSettings } = require('../dist/server/chat/permission-broker.js');
+
+      const savedElectron = process.versions.electron;
+      try {
+        delete process.versions.electron;
+        assert.deepStrictEqual(electronAsNodeEnv(process.execPath), {},
+          'a plain node build must not add the flag');
+        assert.deepStrictEqual(electronAsNodeEnv('/usr/bin/node'), {},
+          'a container child must not add the flag');
+
+        process.versions.electron = '43.2.0';
+        assert.deepStrictEqual(electronAsNodeEnv(process.execPath),
+          { ELECTRON_RUN_AS_NODE: '1' },
+          'the desktop Electron binary must be told to act as node');
+        assert.deepStrictEqual(electronAsNodeEnv('/usr/bin/node'), {},
+          'a non-own command must not carry the flag');
+
+        const mcpc = JSON.parse(askMcpConfig('/opt/app/ask-mcp.js', '/tmp/s.sock', process.execPath));
+        assert.strictEqual(mcpc.mcpServers.ccweb.env.ELECTRON_RUN_AS_NODE, '1',
+          'the inline MCP descriptor must pass the flag to the runtime');
+        const hook = JSON.parse(permissionHookSettings('/x/hook.js', '/tmp/a.sock', process.execPath));
+        assert.strictEqual(hook.env.ELECTRON_RUN_AS_NODE, '1',
+          'the permission hook descriptor must pass the flag to the runtime');
+      } finally {
+        if (savedElectron === undefined) {
+          delete process.versions.electron;
+        } else {
+          process.versions.electron = savedElectron;
+        }
+      }
     });
 
     it('knows which runtimes have a verified way to take the server', function () {

@@ -35,6 +35,7 @@ import {
   SUBMIT_PLAN_TOOL_DESCRIPTION,
   TIER_TOOL,
 } from '../../shared/chat-events.js';
+import { electronAsNodeEnv } from './node-as-node.js';
 
 /**
  * Whether this server should offer the ladder tool at all.
@@ -660,6 +661,7 @@ export function askMcpConfig(
           [ASK_SOCKET_ENV]: socketPath,
           [QUESTION_TOOL_ENABLED_ENV]: questionToolEnabled ? '1' : '0',
           ...(laddered ? { [TIER_ENABLED_ENV]: '1' } : {}),
+          ...electronAsNodeEnv(nodePath),
         },
       },
     },

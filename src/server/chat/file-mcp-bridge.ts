@@ -12,6 +12,7 @@ import {
   TIER_TOOL,
 } from '../../shared/chat-events.js';
 import { FILE_CALLBACK_GENERATED_CLIENT_SOURCE } from './file-callback.js';
+import { electronAsNodeEnv } from './node-as-node.js';
 
 export const FILE_CALLBACK_DIR_ENV = 'CCWEB_CALLBACK_DIR';
 export const FILE_CALLBACK_TOKEN_ENV = 'CCWEB_CALLBACK_TOKEN';
@@ -40,7 +41,14 @@ export function fileMcpConfig(
         // Repeating the token here would expose it in Claude's --mcp-config
         // argv. MCP children inherit the launch environment; only the
         // non-secret per-server ladder flag needs an explicit override.
-        ...(laddered ? { env: { CCWEB_TIER_LADDER: '1' } } : {}),
+        // The Electron-as-node flag rides along on the container bridge too,
+        // so the identical descriptor works whether the child is the desktop
+        // binary or the image's `node`.
+        ...(laddered
+          ? { env: { CCWEB_TIER_LADDER: '1', ...electronAsNodeEnv(nodePath) } }
+          : Object.keys(electronAsNodeEnv(nodePath)).length
+            ? { env: electronAsNodeEnv(nodePath) }
+            : {}),
       },
     },
   });

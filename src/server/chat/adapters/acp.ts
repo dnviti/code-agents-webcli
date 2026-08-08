@@ -409,6 +409,14 @@ export class AcpChatAdapter extends JsonRpcChatAdapter {
   private readonly permissionOptions = new Map<string, PermissionOption[]>();
   private loadSupported = false;
   /**
+   * Whether existing local credentials were accepted before session/new.
+   *
+   * Once true, a `session/new` failure is a technical problem (frequently the
+   * question-server MCP child) rather than an auth refusal, so `openSession`
+   * must not rewrite the error into a login request.
+   */
+  private authenticatedWithExistingCredentials = false;
+  /**
    * Paths this turn has already been refused, so it is said once.
    *
    * An agent that is told it may not read a file frequently tries again — a
@@ -512,6 +520,13 @@ export class AcpChatAdapter extends JsonRpcChatAdapter {
     const methodId = method ? str(method.id) : '';
     if (!methodId) return;
     await this.call('authenticate', { methodId });
+    // Session/new refuses an unauthenticated client, but it also refuses an
+    // MCP server that fails to start — and omp reports that second failure as
+    // `Internal error`, not as an auth error. Once existing credentials have
+    // been accepted, the "needs authentication" rewrite in `openSession` must
+    // stay off so the real cause (usually the question-server MCP child) is
+    // shown instead of a false login prompt.
+    this.authenticatedWithExistingCredentials = true;
   }
 
   /**
@@ -593,11 +608,14 @@ export class AcpChatAdapter extends JsonRpcChatAdapter {
     } catch (error: unknown) {
       // An unauthenticated agent refuses here and nowhere else, and the fix is
       // a login in a terminal — so name the method it offered instead of
-      // surfacing a bare RPC error.
+      // surfacing a bare RPC error. Once existing credentials were accepted,
+      // the refusal is a technical failure (mostly the ccweb MCP child failing
+      // to start — omp reports that as `Internal error`), and rewriting it as
+      // "needs authentication" would point the user at the wrong fix.
       const methods = list(init.authMethods)
         .map((method) => str(record(method).name) || str(record(method).id))
         .filter(Boolean);
-      if (methods.length) {
+      if (methods.length && !this.authenticatedWithExistingCredentials) {
         const message = error instanceof Error ? error.message : String(error);
         throw new Error(`${message} — this agent needs authentication (${methods.join(', ')})`);
       }

@@ -255,8 +255,8 @@ jobs:
           # user-namespace policy and its libfuse2t64 package name.
           - os: ubuntu-24.04
             label: Linux x64
-            args: --linux AppImage flatpak --x64 --config.publish.channel=latest
-            packages: 2
+            args: --linux AppImage flatpak deb rpm --x64 --config.publish.channel=latest
+            packages: 4
           - os: windows-latest
             label: Windows x64
             args: --win nsis --x64 --config.publish.channel=latest
@@ -316,6 +316,12 @@ jobs:
           # Ubuntu 24.04 renamed AppImage's FUSE 2 compatibility library to
           # libfuse2t64. It is required to exercise the actual mounted artifact.
           sudo apt-get install --yes flatpak flatpak-builder libfuse2t64 xvfb xauth
+          # electron-builder's bundled fpm builds the `.deb` and `.rpm`
+          # targets: the Debian round-trip needs fakeroot, and the Red Hat
+          # round-trip shells out to `rpmbuild` (provided by the `rpm`
+          # package). Install both so the tagged release can emit the same
+          # formats a developer produces locally.
+          sudo apt-get install --yes fakeroot rpm
           # electron-builder updates these refs without privilege escalation,
           # so install them for the runner user instead of system-wide.
           flatpak remote-add --user --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
@@ -411,6 +417,8 @@ jobs:
           case '${{ runner.os }}' in
             Linux)
               test -f "$(find release -maxdepth 1 -name '*.AppImage' -print -quit)"
+              test -f "$(find release -maxdepth 1 -name '*.deb' -print -quit)"
+              test -f "$(find release -maxdepth 1 -name '*.rpm' -print -quit)"
               test -f release/latest-linux.yml
               test -z "$(find release -maxdepth 1 -name '*.AppImage.blockmap' -print -quit)"
               if [ '${{ needs.release-identities.outputs.flatpak }}' != true ]; then
@@ -610,6 +618,8 @@ jobs:
           if-no-files-found: error
           path: |
             release/*.AppImage
+            release/*.deb
+            release/*.rpm
             release/*.flatpak
             release/*.flatpakref
             release/*.flatpakrepo
@@ -732,13 +742,15 @@ jobs:
           done < <(find release-assets -type f \
             ! -path '*/flatpak-repository/*' \
             ! -path '*/flatpak-repository-previous/*' \( \
-            -name '*.AppImage' -o -name '*.flatpak' -o \
+            -name '*.AppImage' -o -name '*.deb' -o -name '*.rpm' -o -name '*.flatpak' -o \
             -name '*.flatpakref' -o -name '*.flatpakrepo' -o -name '*.exe' -o \
             -name '*.exe.blockmap' -o -name '*.dmg' -o -name '*.zip' -o \
             -name '*.zip.blockmap' -o -name 'latest*.yml' \
           \) -print0)
           cd release-assets/published
-          find . -maxdepth 1 -type f \( -name '*.AppImage' -o -name '*.flatpak' -o -name '*.exe' -o -name '*.dmg' -o -name '*.flatpakref' -o -name '*.flatpakrepo' \) -printf '%f\0' | sort -z | xargs -0 sha256sum > SHA256SUMS
+          find . -maxdepth 1 -type f \( -name '*.AppImage' -o -name '*.deb' -o -name '*.rpm' \
+            -o -name '*.flatpak' -o -name '*.exe' -o -name '*.dmg' -o \
+            -name '*.flatpakref' -o -name '*.flatpakrepo' \) -printf '%f\0' | sort -z | xargs -0 sha256sum > SHA256SUMS
           sha256sum -c SHA256SUMS
           cd ../..
           node scripts/validate-release-assets.js release-assets/published '${{ needs.verify.outputs.version }}'
@@ -791,6 +803,8 @@ jobs:
 
             Desktop downloads:
             - `*.AppImage` — Linux x64, portable; mounted launches require FUSE2 and Chromium sandboxing requires unprivileged user namespaces.
+            - `*.deb` — Linux x64, Debian / Ubuntu package (apt).
+            - `*.rpm` — Linux x64, Red Hat / Fedora package (dnf/yum).
             - `*.flatpak` — Linux x64, sandboxed Flatpak bundle.
             - `*.exe` — Windows x64 NSIS installer.
             - `*-x64.dmg` — macOS Intel (x64).
@@ -859,7 +873,8 @@ jobs:
           done < <(find release-assets -type f \
             ! -path '*/flatpak-repository/*' \
             ! -path '*/flatpak-repository-previous/*' \( \
-            -name '*.AppImage' -o -name '*.flatpak' -o -name '*.exe' -o \
+            -name '*.AppImage' -o -name '*.deb' -o -name '*.rpm' -o -name '*.flatpak' \
+            -o -name '*.exe' -o \
             -name '*.exe.blockmap' -o -name '*.dmg' -o -name '*.zip' -o \
             -name '*.zip.blockmap' -o -name 'latest*.yml' \
           \) -print0)
@@ -870,6 +885,8 @@ jobs:
           # desktop matrix, so a silently missing package still fails closed.
           for name in \
             "Code-Agents-Web-CLI-${VERSION}-linux-x64.AppImage" \
+            "Code-Agents-Web-CLI-${VERSION}-linux-x64.deb" \
+            "Code-Agents-Web-CLI-${VERSION}-linux-x64.rpm" \
             "Code-Agents-Web-CLI-${VERSION}-linux-x64.flatpak" \
             "Code-Agents-Web-CLI-${VERSION}-win-x64.exe"; do
             test -f "release-assets/published/$name" \
@@ -880,8 +897,8 @@ jobs:
             exit 1
           fi
           cd release-assets/published
-          find . -maxdepth 1 -type f \( -name '*.AppImage' -o -name '*.flatpak' \
-            -o -name '*.exe' -o -name '*.dmg' \) -printf '%f\0' \
+          find . -maxdepth 1 -type f \( -name '*.AppImage' -o -name '*.deb' -o -name '*.rpm' \
+            -o -name '*.flatpak' -o -name '*.exe' -o -name '*.dmg' \) -printf '%f\0' \
             | sort -z | xargs -0 sha256sum > SHA256SUMS
           sha256sum -c SHA256SUMS
       - name: Refuse to replace an already published release
@@ -923,6 +940,8 @@ jobs:
 
             Desktop downloads:
             - `*.AppImage` — Linux x64, portable; mounted launches require FUSE2 and Chromium sandboxing requires unprivileged user namespaces.
+            - `*.deb` — Linux x64, Debian / Ubuntu package (apt).
+            - `*.rpm` — Linux x64, Red Hat / Fedora package (dnf/yum).
             - `*.flatpak` — Linux x64, sandboxed Flatpak bundle. Install the bundle directly; this release publishes no signed Flatpak remote.
             - `*.exe` — Windows x64 NSIS installer.
             - `SHA256SUMS` — SHA-256 checksums for every desktop package.
