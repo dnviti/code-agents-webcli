@@ -1,5 +1,14 @@
 # Changelog
 
+## [6.1.1] - 2026-08-08
+
+### Fixed
+- **Flatpak Local-computer processes now run in the host environment.**
+  Terminals use the configured host `sh`, `bash`, or `zsh`, while coding
+  agents, version probes, and agent installers use the host login-shell
+  `PATH`, credentials, and privileges through `flatpak-spawn --host` instead
+  of the Flatpak runtime's shell and toolchain.
+
 ## [6.1.0] - 2026-08-05
 
 ### Added

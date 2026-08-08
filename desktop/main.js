@@ -389,12 +389,12 @@ async function showFlatpakNotice() {
   if (fs.existsSync(marker)) return;
   const result = await dialog.showMessageBox({
     type: 'info',
-    title: 'Flatpak tool access',
-    message: 'The Flatpak sandbox may hide coding-agent tools installed on the host.',
+    title: 'Flatpak host tool access',
+    message: 'Terminals and coding-agent tools run on your host system.',
     detail:
-      'Your home folder is available inside the sandbox, but some host commands or credential '
-      + 'helpers may not be. Use the AppImage release when an agent is installed outside your '
-      + 'home folder or cannot be found here.',
+      'The application uses your configured host shell and host PATH. Commands run from this '
+      + 'Flatpak therefore have the same access and privileges as commands you start in your '
+      + 'normal terminal.',
     buttons: ['Continue', 'Read the guide'],
     defaultId: 0,
     cancelId: 0,
