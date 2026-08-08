@@ -95,8 +95,10 @@ flatpak:
     - --device=dri
     - --filesystem=home
     - --talk-name=org.freedesktop.Notifications
-    # The updater uses the narrow Flatpak portal interface; it does not gain
-    # unrestricted host D-Bus or shell access.
+    # Terminals, coding agents, and their installers deliberately execute in
+    # the user's host environment rather than the development-hostile runtime.
+    - --talk-name=org.freedesktop.Flatpak
+    # The updater separately uses the narrow Flatpak portal interface.
     - --talk-name=org.freedesktop.portal.Flatpak
 
 win:

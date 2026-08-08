@@ -207,6 +207,22 @@ export function wrapHostCommand(
   };
 }
 
+/** Route native process launches out of a Flatpak sandbox and onto the host. */
+export function wrapFlatpakHostCommand(
+  command: string,
+  args: string[],
+  options: WrapOptions,
+): HostCommandLaunch {
+  const flatpakArgs = ['--host', '--watch-bus'];
+  if (options.cwd) flatpakArgs.push(`--directory=${options.cwd}`);
+  if (options.inheritHostEnv === false) flatpakArgs.push('--clear-env');
+  for (const [name, value] of Object.entries(options.env || {})) {
+    flatpakArgs.push(`--env=${name}=${value}`);
+  }
+  flatpakArgs.push(command, ...args);
+  return { command: '/usr/bin/flatpak-spawn', args: flatpakArgs };
+}
+
 /**
  * The environment the server has always had: this machine, this account.
  *
@@ -244,7 +260,9 @@ export class HostEnvironment implements UserEnvironment {
     const baseEnv = options.inheritHostEnv === false
       ? { ...(options.env || {}) }
       : mergedEnv(options.env);
-    const launch = wrapHostCommand(command, args, process.platform, baseEnv);
+    const launch = process.env.FLATPAK_ID && process.platform === 'linux'
+      ? wrapFlatpakHostCommand(command, args, options)
+      : wrapHostCommand(command, args, process.platform, baseEnv);
     const { envPatch, ...processLaunch } = launch;
     return {
       ...processLaunch,

@@ -355,6 +355,21 @@ describe('Electron desktop helpers', function () {
     );
   });
 
+  it('recovers PATH from the host login shell inside Flatpak', function () {
+    const recovered = loginShellPath({
+      platform: 'linux',
+      flatpakId: 'io.github.dnviti.code-agents-webcli',
+      shell: '/bin/zsh',
+      inheritedPath: '/app/bin',
+      execFileSync: (command, argv) => {
+        assert.strictEqual(command, '/usr/bin/flatpak-spawn');
+        assert.deepStrictEqual(argv.slice(0, 3), ['--host', '/bin/zsh', '-ilc']);
+        return '__CODE_AGENTS_PATH__=/home/alice/.local/bin:/usr/bin\n';
+      },
+    });
+    assert.strictEqual(recovered, '/home/alice/.local/bin:/usr/bin:/app/bin');
+  });
+
   it('awaits embedded-server teardown after a post-listen startup failure', async function () {
     const order = [];
     await shutdownAfterStartupFailure({

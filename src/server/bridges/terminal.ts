@@ -110,9 +110,10 @@ export class TerminalBridge {
     try {
       // `which` is not part of a normal Windows installation. `where.exe`
       // searches PATH there while preserving the existing Unix lookup.
+      const flatpakHost = this.platform === 'linux' && Boolean(this.env.FLATPAK_ID);
       this.execFileSync(
-        this.platform === 'win32' ? 'where.exe' : 'which',
-        [command],
+        flatpakHost ? '/usr/bin/flatpak-spawn' : (this.platform === 'win32' ? 'where.exe' : 'which'),
+        flatpakHost ? ['--host', 'which', command] : [command],
         { stdio: 'ignore' },
       );
       return true;
