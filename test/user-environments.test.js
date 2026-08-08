@@ -449,6 +449,26 @@ describe('per-user environments', function () {
       assert.strictEqual(wrapped.env.A, '1');
       assert.strictEqual(wrapped.env.PATH, process.env.PATH);
     });
+
+    it('runs host commands through flatpak-spawn when packaged as a Flatpak', function () {
+      const previous = process.env.FLATPAK_ID;
+      process.env.FLATPAK_ID = 'io.github.dnviti.code-agents-webcli';
+      try {
+        const wrapped = new HostEnvironment('/home/alice').wrap('codex', ['--version'], {
+          cwd: '/home/alice/project',
+          env: { TERM: 'dumb' },
+          inheritHostEnv: false,
+        });
+        assert.strictEqual(wrapped.command, '/usr/bin/flatpak-spawn');
+        assert.deepStrictEqual(wrapped.args, [
+          '--host', '--watch-bus', '--directory=/home/alice/project', '--clear-env',
+          '--env=TERM=dumb', 'codex', '--version',
+        ]);
+      } finally {
+        if (previous === undefined) delete process.env.FLATPAK_ID;
+        else process.env.FLATPAK_ID = previous;
+      }
+    });
   });
 
   describe('container environment', function () {

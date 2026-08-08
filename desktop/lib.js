@@ -194,9 +194,15 @@ function loginShellPath(options = {}) {
   const exec = options.execFileSync || execFileSync;
   const marker = '__CODE_AGENTS_PATH__=';
   try {
+    const flatpakHost = (options.flatpakId ?? process.env.FLATPAK_ID)
+      && (options.platform || process.platform) === 'linux';
     const output = exec(
-      shell,
-      ['-ilc', `printf '\n${marker}%s\n' "$PATH"`],
+      flatpakHost ? '/usr/bin/flatpak-spawn' : shell,
+      [
+        ...(flatpakHost ? ['--host', shell] : []),
+        '-ilc',
+        `printf '\n${marker}%s\n' "$PATH"`,
+      ],
       {
         encoding: 'utf8',
         timeout: 5000,

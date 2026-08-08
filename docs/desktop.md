@@ -67,10 +67,11 @@ version, never a silent replacement of the same release.
 | macOS Intel | `*-x64.dmg` | Open the DMG and drag the app to Applications. |
 | macOS Apple Silicon | `*-arm64.dmg` | Open the signed/notarized DMG and drag the app to Applications. |
 
-Flatpak's sandbox can prevent it from seeing agent executables, credentials, or
-working folders outside the locations it has been allowed to access. If that
-gets in the way of an agent you already use on the host, use the AppImage
-instead: it is portable and does not add Flatpak sandboxing.
+The Flatpak keeps the Electron UI sandboxed, but launches every Local-computer
+terminal, coding agent, version probe, and agent installer through
+`flatpak-spawn --host`. Those processes use the host's configured `sh`, `bash`,
+or `zsh`, login-shell `PATH`, credentials, and normal host privileges. Only use
+the Local computer target when you trust the commands you ask an agent to run.
 
 ### One-time updater bridge
 
@@ -406,7 +407,7 @@ several saved servers.
 | Find servers returns nothing | Discovery must be enabled on the server, **Find servers** must be started manually, both devices must share a broadcast-reachable IPv4 LAN, and UDP `32353` must pass the firewall. You can always enter the HTTPS origin manually. |
 | An agent is missing on Local computer | Install it and authenticate with your own account, then restart the desktop app so it can recover your login-shell `PATH`. |
 | Repository URL is disabled on Windows | Create the project without a repository, or use a Linux server for repository-backed managed projects. Ordinary work in local folders remains available. |
-| A Flatpak cannot reach an agent, credential, or project | This is normally Flatpak sandboxing. Grant the necessary access with Flatpak tooling or use the AppImage. |
+| A Flatpak cannot reach an agent, credential, or project | Restart the app after installing the tool so it can recover the host login-shell `PATH`, then check that the same command works in a normal host terminal. Flatpak Local-computer processes run through `flatpak-spawn --host`. |
 | AppImage does not open | Ensure it is executable. On distributions without FUSE2, install the compatible FUSE package or use `--appimage-extract-and-run`. The app refuses `--no-sandbox`; enable unprivileged user namespaces or use Flatpak rather than disabling Chromium's sandbox. |
 | SmartScreen or Gatekeeper stops the installer | Do not override an unexpected publisher/signature warning. Download the matching signed package from the release and verify `SHA256SUMS`; contact the maintainer if the identity remains unexpected. |
 | Another device cannot connect to Local computer | The embedded server always binds to `127.0.0.1`. For temporary access, choose **Open on phone** on the Local computer row and follow the [LAN or Tailscale guide](phone-access.md). For an always-on shared service, run a normal server installation instead. |

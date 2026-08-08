@@ -77,6 +77,7 @@ describe('desktop release update pipeline', function () {
     assert.match(builder, /- zip/);
     assert.match(builder, /afterSign: scripts\/notarize\.js/);
     assert.match(builder, /--talk-name=org\.freedesktop\.portal\.Flatpak/);
+    assert.match(builder, /--talk-name=org\.freedesktop\.Flatpak/);
     assert.match(builder, /flatpak-update-public-key\.asc/);
     assert.match(builder, /artifactName: Code-Agents-Web-CLI-\$\{version\}-linux-x64\.\$\{ext\}/);
     assert.ok(pkg.dependencies['electron-updater']);
@@ -377,6 +378,15 @@ describe('desktop release update pipeline', function () {
       assert.throws(() => childProcess.execFileSync('node', [
         'scripts/validate-flatpak-permissions.js', previous, current, 'v6.1.0', '',
       ], { cwd: root, stdio: 'pipe' }), /Flatpak finish-args expanded/);
+      childProcess.execFileSync('node', [
+        'scripts/validate-flatpak-permissions.js', previous, current, 'v6.1.0', 'v6.1.0',
+      ], { cwd: root, stdio: 'pipe' });
+      fs.writeFileSync(previous, config(['--share=network', '--talk-name=org.freedesktop.portal.Flatpak']));
+      fs.writeFileSync(current, config([
+        '--share=network',
+        '--talk-name=org.freedesktop.portal.Flatpak',
+        '--talk-name=org.freedesktop.Flatpak',
+      ]));
       childProcess.execFileSync('node', [
         'scripts/validate-flatpak-permissions.js', previous, current, 'v6.1.0', 'v6.1.0',
       ], { cwd: root, stdio: 'pipe' });

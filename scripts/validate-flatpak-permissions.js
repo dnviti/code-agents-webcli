@@ -33,12 +33,15 @@ if (added.length === 0) {
   process.exit(0);
 }
 
-const updaterPortalPermission = '--talk-name=org.freedesktop.portal.Flatpak';
-if (updaterBridgeTag === releaseTag && added.length === 1 && added[0] === updaterPortalPermission) {
-  console.warn(`Allowing only the one-time remote-less updater bridge in ${releaseTag}: ${added[0]}`);
+const approvedBridgePermissions = new Set([
+  '--talk-name=org.freedesktop.portal.Flatpak',
+  '--talk-name=org.freedesktop.Flatpak',
+]);
+if (updaterBridgeTag === releaseTag && added.length === 1 && approvedBridgePermissions.has(added[0])) {
+  console.warn(`Allowing only the one-time reviewed Flatpak bridge in ${releaseTag}: ${added[0]}`);
   process.exit(0);
 }
 throw new Error(
   `Flatpak finish-args expanded: ${added.join(', ')}. `
-  + 'Do not promote this automatic-update channel. Future permission changes require a separate documented manual migration path; the bridge exception accepts only the Flatpak updater portal permission.',
+  + 'Do not promote this automatic-update channel. Future permission changes require a separate documented manual migration path; the bridge exception accepts only one exact reviewed Flatpak bridge permission.',
 );

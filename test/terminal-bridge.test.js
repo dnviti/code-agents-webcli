@@ -120,6 +120,21 @@ describe('TerminalBridge', function() {
     assert.strictEqual(unixBridge.resolveShell('sh'), '/custom/sh');
   });
 
+  it('probes shell availability on the host inside Flatpak', function() {
+    const calls = [];
+    const flatpakBridge = new TerminalBridge({
+      platform: 'linux',
+      env: { FLATPAK_ID: 'io.github.dnviti.code-agents-webcli', SHELL: '/bin/zsh' },
+      existsSync() { return false; },
+      execFileSync(command, args) { calls.push({ command, args }); return ''; },
+    });
+    assert.strictEqual(flatpakBridge.resolveShell(), '/bin/zsh');
+    assert.deepStrictEqual(calls[0], {
+      command: '/usr/bin/flatpak-spawn',
+      args: ['--host', 'which', '/bin/zsh'],
+    });
+  });
+
   it('advertises one friendly Windows choice per shell family', function() {
     const bridge = new TerminalBridge({ platform: 'win32' });
     assert.deepStrictEqual(bridge.getSupportedShells(), ['pwsh', 'powershell', 'cmd']);
