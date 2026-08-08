@@ -25,6 +25,20 @@ const SMOKE_PAYLOAD_BYTES = 1024 * 1024 + 257;
  */
 const WORKSPACE_LOCAL_PERSISTENCE_PLATFORMS = new Set(['linux']);
 
+/**
+ * Windows spells one directory two ways. `fs.realpathSync` is implemented in
+ * JavaScript and resolves symlinks while preserving an 8.3 short component such
+ * as `RUNNER~1`, whereas the server resolves the same directory to its long
+ * form. Comparing those two spellings makes a path that is inside the workspace
+ * look like an escape, so every path this smoke compares is resolved through
+ * the OS, which expands short components. The injected filesystem used by the
+ * unit test has no `native` variant, so fall back to the JavaScript one.
+ */
+function canonicalPath(target, filesystem) {
+  const native = filesystem.realpathSync?.native;
+  return typeof native === 'function' ? native(target) : filesystem.realpathSync(target);
+}
+
 function isInside(root, candidate) {
   const relative = path.relative(root, candidate);
   return relative === '' || (!relative.startsWith(`..${path.sep}`) && relative !== '..' && !path.isAbsolute(relative));
@@ -146,10 +160,17 @@ async function runPackagedWorkspacePersistenceSmoke(options) {
     throw new Error('Packaged persistence smoke refuses filesystem roots.');
   }
   filesystem.mkdirSync(workspaceRoot, { recursive: true, mode: 0o700 });
+  // The request below must keep this spelling: the server validates a working
+  // directory against its own base folder, and rejects the OS-resolved long
+  // form as outside the allowed area. Comparisons use `resolvedInside`.
   const canonicalWorkspace = filesystem.realpathSync(workspaceRoot);
   const canonicalDataDir = filesystem.realpathSync(dataDir);
-  assert.equal(isInside(canonicalWorkspace, canonicalDataDir), false, 'dataDir must not be inside the workspace');
-  assert.equal(isInside(canonicalDataDir, canonicalWorkspace), false, 'workspace must not be inside dataDir');
+  const resolvedInside = (root, candidate) => isInside(
+    canonicalPath(root, filesystem),
+    canonicalPath(candidate, filesystem),
+  );
+  assert.equal(resolvedInside(canonicalWorkspace, canonicalDataDir), false, 'dataDir must not be inside the workspace');
+  assert.equal(resolvedInside(canonicalDataDir, canonicalWorkspace), false, 'workspace must not be inside dataDir');
 
   const workspaceLocalExpected = WORKSPACE_LOCAL_PERSISTENCE_PLATFORMS.has(process.platform);
   const cookie = `${started.auth.name}=${encodeURIComponent(started.auth.value)}`;
@@ -215,7 +236,7 @@ async function runPackagedWorkspacePersistenceSmoke(options) {
     findWorkspaceSessionDirectory,
     'workspace-local session database and transcript',
   );
-  assert.ok(isInside(ccWeb, sessionDirectory));
+  assert.ok(resolvedInside(ccWeb, sessionDirectory));
 
   const payload = randomBytes(SMOKE_PAYLOAD_BYTES);
   const uploadResponse = await fetchImpl(
@@ -237,19 +258,24 @@ async function runPackagedWorkspacePersistenceSmoke(options) {
   assert.equal(typeof attachment.path, 'string');
   assert.equal(typeof attachment.relativePath, 'string');
   const storedPath = path.resolve(attachment.path);
-  const attachmentWorkspaceLocal = isInside(ccWeb, storedPath);
+  const attachmentWorkspaceLocal = resolvedInside(ccWeb, storedPath);
   if (workspaceLocalExpected) {
-    assert.ok(attachmentWorkspaceLocal, 'attachment was stored outside workspace .cc-web');
+    assert.ok(attachmentWorkspaceLocal,
+      `attachment was stored outside workspace .cc-web (${ccWeb}): ${storedPath}`);
   } else if (!attachmentWorkspaceLocal) {
     // Attachments resolve their own mutation policy against the session
     // working directory, so a host can keep the workspace session layout and
     // still fall back for attachments. Wherever they land it must be one of
     // the two storage locations this smoke owns, never somewhere else.
-    assert.ok(isInside(canonicalDataDir, storedPath),
-      `attachment left both the workspace and installation storage: ${storedPath}`);
+    assert.ok(resolvedInside(canonicalDataDir, storedPath),
+      'attachment left both the workspace and installation storage: '
+      + `${storedPath} is in neither ${ccWeb} nor ${canonicalDataDir}`);
   }
   if (attachmentWorkspaceLocal) {
-    assert.equal(path.resolve(canonicalWorkspace, attachment.relativePath), storedPath);
+    assert.equal(
+      canonicalPath(path.resolve(canonicalWorkspace, attachment.relativePath), filesystem),
+      canonicalPath(storedPath, filesystem),
+    );
   }
   assert.deepEqual(filesystem.readFileSync(storedPath), payload);
 
