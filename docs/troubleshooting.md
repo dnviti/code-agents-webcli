@@ -234,6 +234,16 @@ the server treats its operational state as unrecognised. Reopen the real
 workspace and choose the runtime/approval settings again; native resume IDs and
 archived project paths are deliberately not trusted across that boundary.
 
+**The API reports `workspace_persistence_unavailable` on macOS or Windows.**
+Workspace-local storage is available on Linux only in this release. Binding a
+workspace directory without a rename race requires an `openat`-style descriptor
+namespace: Linux provides one through `/proc/self/fd`, macOS exposes `/dev/fd`
+but does not support the `/dev/fd/<n>/child` traversal this needs, and Windows
+has no equivalent. Rather than write history through a path it cannot verify,
+the server declines the workspace root, and sessions and attachments keep using
+installation storage. This is expected on those platforms and needs no action;
+nothing is lost, and nothing will need migrating when they gain support.
+
 **The API reports `workspace_persistence_unavailable`, or migration is
 incomplete.**
 The destination is missing, read-only, unsafe, or conflicts with an existing

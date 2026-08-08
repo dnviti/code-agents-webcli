@@ -908,6 +908,13 @@ jobs:
             - `*-arm64.dmg` — macOS Apple Silicon (arm64).
             - `SHA256SUMS` — SHA-256 checksums for every desktop package.
 
+            **Workspace-local session storage is available on Linux only in
+            this release.** Binding a workspace directory without a rename race
+            needs an `openat`-style descriptor namespace, which macOS and
+            Windows do not provide. On those platforms sessions and attachments
+            keep using installation storage instead; no data is lost and nothing
+            will need migrating later.
+
             **In-app updates cannot install this release.** The updater
             manifests and blockmaps are published here, but the desktop updater
             verifies a package's signature before installing it, and these

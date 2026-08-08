@@ -7,6 +7,20 @@ const path = require('node:path');
 
 const SMOKE_PAYLOAD_BYTES = 1024 * 1024 + 257;
 
+/**
+ * Workspace-local persistence needs an openat-like descriptor namespace to
+ * prove race-safe directory binding. Only Linux provides one that survives the
+ * runtime probe in `workspace-session-storage`: macOS exposes `/dev/fd` but
+ * does not support the `/dev/fd/N/child` traversal this requires, and Windows
+ * has no equivalent namespace at all. On those hosts the storage layer refuses
+ * pathname mutation and history stays in installation storage instead.
+ *
+ * This is asserted per platform rather than accepting whatever happens, so a
+ * regression on Linux still fails here, and a host that unexpectedly gains the
+ * workspace-local layout is still held to the full workspace-only contract.
+ */
+const WORKSPACE_LOCAL_PERSISTENCE_PLATFORMS = new Set(['linux']);
+
 function isInside(root, candidate) {
   const relative = path.relative(root, candidate);
   return relative === '' || (!relative.startsWith(`..${path.sep}`) && relative !== '..' && !path.isAbsolute(relative));
@@ -124,24 +138,50 @@ async function runPackagedWorkspacePersistenceSmoke(options) {
   assert.equal(isInside(canonicalWorkspace, canonicalDataDir), false, 'dataDir must not be inside the workspace');
   assert.equal(isInside(canonicalDataDir, canonicalWorkspace), false, 'workspace must not be inside dataDir');
 
+  const workspaceLocalExpected = WORKSPACE_LOCAL_PERSISTENCE_PLATFORMS.has(process.platform);
   const cookie = `${started.auth.name}=${encodeURIComponent(started.auth.value)}`;
   const commonHeaders = { Cookie: cookie, Origin: started.url };
-  const createdResponse = await fetchImpl(`${started.url}/api/sessions/create`, {
+  const createSession = (body) => fetchImpl(`${started.url}/api/sessions/create`, {
     method: 'POST',
     headers: { ...commonHeaders, 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      name: 'Packaged workspace persistence smoke',
-      workingDir: canonicalWorkspace,
-    }),
+    body: JSON.stringify(body),
   });
-  const created = await jsonResponse(createdResponse, 'desktop smoke session creation');
+  const readSession = async (response) => {
+    const text = await response.text();
+    let body = null;
+    try { body = text ? JSON.parse(text) : null; } catch { /* reported by the caller */ }
+    return { body, text };
+  };
+
+  let createdResponse = await createSession({
+    name: 'Packaged workspace persistence smoke',
+    workingDir: canonicalWorkspace,
+  });
+  let { body: created, text: createdText } = await readSession(createdResponse);
+  let workspaceRooted = true;
+  if (createdResponse.status === 409 && created?.error === 'workspace_persistence_unavailable') {
+    if (workspaceLocalExpected) {
+      throw new Error(`desktop smoke session creation failed with HTTP 409: ${createdText.slice(0, 500)}`);
+    }
+    // The server refuses a workspace-local root it cannot bind safely rather
+    // than silently writing history somewhere else. An installation-stored
+    // session must still be created and remain fully usable.
+    workspaceRooted = false;
+    createdResponse = await createSession({ name: 'Packaged installation persistence smoke' });
+    ({ body: created, text: createdText } = await readSession(createdResponse));
+  }
+  if (!createdResponse.ok || !created || typeof created !== 'object') {
+    throw new Error(
+      `desktop smoke session creation failed with HTTP ${createdResponse.status}: ${createdText.slice(0, 500)}`,
+    );
+  }
   const sessionId = created.sessionId;
   if (typeof sessionId !== 'string' || !sessionId) throw new Error('Desktop smoke did not receive a session id.');
-  assert.equal(created.session?.workingDir, canonicalWorkspace);
+  if (workspaceRooted) assert.equal(created.session?.workingDir, canonicalWorkspace);
 
   const ccWeb = path.join(canonicalWorkspace, '.cc-web');
   const sessionDatabase = path.join(ccWeb, 'session-state.sqlite');
-  const sessionDirectory = await waitFor(() => {
+  const findWorkspaceSessionDirectory = () => {
     if (!filesystem.existsSync(sessionDatabase)) return null;
     const sessionsRoot = path.join(ccWeb, 'sessions');
     const matches = walk(sessionsRoot, filesystem)
@@ -150,8 +190,15 @@ async function runPackagedWorkspacePersistenceSmoke(options) {
     return matches.length === 1 && filesystem.existsSync(path.join(matches[0], 'transcript.md'))
       ? matches[0]
       : null;
-  }, 'workspace-local session database and transcript');
-  assert.ok(isInside(ccWeb, sessionDirectory));
+  };
+  let sessionDirectory = null;
+  if (workspaceRooted) {
+    sessionDirectory = workspaceLocalExpected
+      ? await waitFor(findWorkspaceSessionDirectory, 'workspace-local session database and transcript')
+      : await waitFor(findWorkspaceSessionDirectory, 'workspace-local session database and transcript')
+        .catch(() => null);
+    if (sessionDirectory) assert.ok(isInside(ccWeb, sessionDirectory));
+  }
 
   const payload = randomBytes(SMOKE_PAYLOAD_BYTES);
   const uploadResponse = await fetchImpl(
@@ -173,8 +220,20 @@ async function runPackagedWorkspacePersistenceSmoke(options) {
   assert.equal(typeof attachment.path, 'string');
   assert.equal(typeof attachment.relativePath, 'string');
   const storedPath = path.resolve(attachment.path);
-  assert.ok(isInside(ccWeb, storedPath), 'attachment was stored outside workspace .cc-web');
-  assert.equal(path.resolve(canonicalWorkspace, attachment.relativePath), storedPath);
+  const attachmentWorkspaceLocal = isInside(ccWeb, storedPath);
+  if (workspaceLocalExpected) {
+    assert.ok(attachmentWorkspaceLocal, 'attachment was stored outside workspace .cc-web');
+  } else if (!attachmentWorkspaceLocal) {
+    // Attachments resolve their own mutation policy against the session
+    // working directory, so a host can keep the workspace session layout and
+    // still fall back for attachments. Wherever they land it must be one of
+    // the two storage locations this smoke owns, never somewhere else.
+    assert.ok(isInside(canonicalDataDir, storedPath),
+      `attachment left both the workspace and installation storage: ${storedPath}`);
+  }
+  if (attachmentWorkspaceLocal) {
+    assert.equal(path.resolve(canonicalWorkspace, attachment.relativePath), storedPath);
+  }
   assert.deepEqual(filesystem.readFileSync(storedPath), payload);
 
   const downloadResponse = await fetchImpl(new URL(attachment.url, started.url), {
@@ -186,16 +245,24 @@ async function runPackagedWorkspacePersistenceSmoke(options) {
   assert.equal(downloadResponse.headers.get('cache-control'), 'no-store');
   assert.deepEqual(Buffer.from(await downloadResponse.arrayBuffer()), payload);
 
-  assertNoInstallationSessionCopy(
-    started.server,
-    canonicalDataDir,
-    sessionId,
-    payload,
-    filesystem,
-  );
+  // Only meaningful when the workspace holds everything: in the documented
+  // fallback the session and its attachment are deliberately in installation
+  // storage, which is exactly what this would flag as a leak.
+  const workspaceOnly = workspaceRooted && Boolean(sessionDirectory) && attachmentWorkspaceLocal;
+  if (workspaceOnly) {
+    assertNoInstallationSessionCopy(
+      started.server,
+      canonicalDataDir,
+      sessionId,
+      payload,
+      filesystem,
+    );
+  }
   return {
     sessionId,
     bytes: payload.length,
+    mode: workspaceOnly ? 'workspace-only' : 'installation-fallback',
+    workspaceOnly,
     sessionDatabase,
     sessionDirectory,
     attachmentPath: storedPath,

@@ -117,6 +117,21 @@
   disposer but preserves ambiguous data and returns the branch id with
   `recoveryPending` rather than risking destructive cleanup.
 
+### Known limitations
+
+- **Workspace-local session storage is available on Linux only in this
+  release.** Binding a workspace directory without a rename race requires an
+  `openat`-style descriptor namespace. Linux provides one through
+  `/proc/self/fd`; macOS exposes `/dev/fd` but does not support the
+  `/dev/fd/<n>/child` traversal this needs, and Windows has no equivalent. On
+  macOS and Windows the storage layer refuses the pathname fallback rather than
+  writing history through an unverifiable path, so sessions and attachments
+  continue to use installation storage and a workspace-rooted request reports
+  `workspace_persistence_unavailable`. No data is lost or written to an
+  unexpected location, and nothing needs to be migrated when those platforms
+  gain support. See
+  [Troubleshooting](docs/troubleshooting.md).
+
 ## [6.0.0] - 2026-08-05
 
 ### Added
