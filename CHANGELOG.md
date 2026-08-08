@@ -117,6 +117,26 @@
   disposer but preserves ambiguous data and returns the branch id with
   `recoveryPending` rather than risking destructive cleanup.
 
+### Known limitations
+
+- **Workspace-local session storage is not available on macOS in this
+  release.** Binding a workspace directory without a rename race requires an
+  `openat`-style descriptor namespace. Linux provides one through
+  `/proc/self/fd`, so workspace-local storage is always available there. macOS
+  exposes `/dev/fd` but does not support the `/dev/fd/<n>/child` traversal this
+  needs, and there is no alternative that can be proven safe, so the storage
+  layer declines rather than writing history through an unverifiable path and a
+  workspace-rooted request reports `workspace_persistence_unavailable`.
+- **On Windows it depends on the volume.** Windows has no `openat` namespace
+  either, but the storage layer accepts a pathname fallback once it has proven
+  on that specific volume that an open descendant handle blocks an ancestor
+  rename. Ordinary NTFS volumes pass, so workspace-local storage works and
+  `.cc-web/` must be included in backups. Where the probe fails — some network
+  and filtered filesystems — that workspace reports
+  `workspace_persistence_unavailable` instead. `GET /api/sessions/persistence`
+  reports which roots are loaded and which are unavailable. See
+  [Troubleshooting](docs/troubleshooting.md).
+
 ## [6.0.0] - 2026-08-05
 
 ### Added
