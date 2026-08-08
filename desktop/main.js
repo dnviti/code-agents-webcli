@@ -853,13 +853,11 @@ async function boot() {
   }
 
   const smoke = process.env.CODE_AGENTS_WEBCLI_DESKTOP_SMOKE === '1';
-  // Flatpak may expose the sandbox tmp directory through a mount alias. The
-  // server confines requested working directories lexically to its admitted
-  // base, while the persistence smoke canonicalises the child before sending
-  // it over HTTP. Canonicalise the parent once as well so both sides use the
-  // same namespace after `realpath` resolves that alias.
+  // Host processes launched through flatpak-spawn cannot see the sandbox's
+  // private /tmp mount. Keep the smoke workspace under the home mount, which
+  // is visible in both namespaces, so its terminal stage can use --directory.
   const smokeRoot = smoke
-    ? fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'cc-web-electron-smoke-')))
+    ? fs.realpathSync(fs.mkdtempSync(path.join(os.homedir(), '.cc-web-electron-smoke-')))
     : null;
   if (smoke) {
     console.log('DESKTOP_SMOKE_STAGE embedded-server');

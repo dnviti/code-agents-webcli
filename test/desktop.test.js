@@ -234,8 +234,8 @@ describe('Electron desktop helpers', function () {
     assert.doesNotMatch(main, /path\.dirname\(started\.server\.database\.storageDir\)/);
     assert.match(
       main,
-      /fs\.realpathSync\(fs\.mkdtempSync\(path\.join\(os\.tmpdir\(\), 'cc-web-electron-smoke-'\)\)\)/,
-      'the packaged smoke must admit the same canonical tmp namespace it sends to the server',
+      /fs\.realpathSync\(fs\.mkdtempSync\(path\.join\(os\.homedir\(\), '\.cc-web-electron-smoke-'\)\)\)/,
+      'the packaged smoke workspace must be visible to host processes launched through Flatpak',
     );
     assert.match(main, /runPackagedRendererSmoke\(started/);
     assert.match(main, /DESKTOP_WORKSPACE_ATTACHMENT_SMOKE_OK/);
