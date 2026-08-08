@@ -255,6 +255,7 @@ function run(
         timeout: EXEC_TIMEOUT_MS,
         maxBuffer: MAX_OUTPUT_BYTES,
         windowsHide: true,
+        windowsVerbatimArguments: launch.windowsVerbatimArguments,
         env: launch.env,
       },
       (error, stdout, stderr) => {

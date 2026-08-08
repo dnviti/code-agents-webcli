@@ -6,11 +6,10 @@ const path = require('path');
 const { PiChatAdapter } = require('../dist/server/chat/adapters/pi.js');
 const { CodexExecAdapter } = require('../dist/server/chat/adapters/codex.js');
 
-// The one-shot adapters get their prompt from argv and never write to stdin.
-// Handed an open pipe anyway, pi and `codex exec` both wait on it forever:
-// measured at zero bytes of output and no exit after 40s, against a normal
-// completion once stdin is closed. From the browser that is a turn that simply
-// never answers — no error, no exit, nothing to click.
+// The one-shot adapters must always deliver EOF. Pi writes its prompt and then
+// closes the pipe; Codex gets a closed stdin because its prompt is in argv.
+// Leaving either writer open makes the CLI wait forever: from the browser that
+// is a turn that simply never answers — no error, no exit, nothing to click.
 //
 // The stub below is that behaviour in miniature: it emits only once stdin has
 // reached EOF, which happens immediately when stdin is closed and never when it
@@ -30,15 +29,17 @@ before(function () {
     [
       '#!/usr/bin/env node',
       "// Emits one protocol line, but only after stdin reaches EOF.",
+      "const chunks = [];",
       "const done = () => {",
-      "  process.stdout.write(JSON.stringify({ type: 'session', id: 'stub-session', cwd: process.cwd() }) + '\\n');",
+      "  const prompt = Buffer.concat(chunks).toString('utf8');",
+      "  process.stdout.write(JSON.stringify({ type: 'session', id: prompt ? `stub:${prompt}` : 'stub-session', cwd: process.cwd() }) + '\\n');",
       "  process.stdout.write(JSON.stringify({ type: 'agent_settled' }) + '\\n');",
       '  process.exit(0);',
       '};',
-      "process.stdin.on('data', () => {});",
+      "process.stdin.on('data', (chunk) => chunks.push(chunk));",
       "process.stdin.on('end', done);",
-      // An 'ignore'd stdin is /dev/null, which is already at EOF; a pipe with a
-      // live writer never ends. No timer here on purpose — a fallback would
+      // An 'ignore'd stdin is /dev/null and Pi explicitly ends its prompt
+      // pipe; a pipe with a live writer never ends. No timer here on purpose — a fallback would
       // hide the very hang this is checking for.
       '',
     ].join('\n'),
@@ -92,7 +93,7 @@ function options(sink, extra = {}) {
   };
 }
 
-describe('one-shot chat adapters close stdin', function () {
+describe('one-shot chat adapters finish stdin', function () {
   this.timeout(20000);
 
   // When these fail they fail by *not* getting output, which means the child is
@@ -106,7 +107,7 @@ describe('one-shot chat adapters close stdin', function () {
     if (adapter) await adapter.stop().catch(() => undefined);
   });
 
-  it('pi produces a turn instead of waiting on a pipe nobody writes to', async function () {
+  it('pi receives the prompt on stdin and produces a turn after EOF', async function () {
     const sink = collect();
     // `command` is the executable and the adapter appends its own flags, so the
     // stub is reached by running it as node's script argument.
@@ -117,7 +118,7 @@ describe('one-shot chat adapters close stdin', function () {
     await live.send({ text: 'hello' });
 
     const session = await sink.waitFor('session');
-    assert.strictEqual(session.nativeSessionId, 'stub-session');
+    assert.strictEqual(session.nativeSessionId, 'stub:hello');
   });
 
   it('codex exec produces a turn instead of waiting on a pipe nobody writes to', async function () {

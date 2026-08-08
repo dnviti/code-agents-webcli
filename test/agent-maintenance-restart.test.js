@@ -7,6 +7,7 @@ const WebSocket = require('ws');
 const { ChatSession } = require('../dist/server/chat/session.js');
 const { MessageProcessor } = require('../dist/server/websocket/messages.js');
 const { probeLaunchedAgentVersion } = require('../dist/server/index.js');
+const { HostEnvironment } = require('../dist/server/services/environments/index.js');
 
 function chat() {
   const session = new ChatSession(
@@ -78,6 +79,31 @@ describe('agent-update chat restart', function () {
     assert.equal(wraps[0].options.inheritHostEnv, false);
     assert.equal(runs[0].options.inheritEnv, false, 'the child runner must not merge process.env');
     assert.deepEqual(runs[0].options.env, { PATH: '/safe/bin' });
+  });
+
+  it('retains only host process plumbing when probing a launched executable', async function () {
+    const previous = process.env.CLAUDE_API_KEY;
+    process.env.CLAUDE_API_KEY = 'must-not-leak';
+    try {
+      let captured;
+      const version = await probeLaunchedAgentVersion(
+        new HostEnvironment(os.tmpdir()),
+        'claude',
+        process.execPath,
+        {
+          async run(_command, _args, options) {
+            captured = options.env;
+            return { stdout: 'claude 1.2.3', stderr: '' };
+          },
+        },
+      );
+      assert.equal(version, '1.2.3');
+      assert.equal(captured.PATH || captured.Path, process.env.PATH || process.env.Path);
+      assert.equal(captured.CLAUDE_API_KEY, undefined);
+    } finally {
+      if (previous === undefined) delete process.env.CLAUDE_API_KEY;
+      else process.env.CLAUDE_API_KEY = previous;
+    }
   });
 
   it('classifies only a fully idle resumable session as automatic-safe', function () {

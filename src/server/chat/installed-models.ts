@@ -1,5 +1,6 @@
 import { spawn } from 'child_process';
 import { ModelChoice } from '../../shared/chat-events.js';
+import { wrapHostCommand } from '../services/environments/manager.js';
 
 /**
  * Which models a runtime will accept, asked of the runtime itself.
@@ -143,8 +144,17 @@ export function installedModels(runtime: string, command: string, env?: NodeJS.P
   if (cached) return cached;
 
   const probe = new Promise<ModelChoice[]>((resolve) => {
-    const child = spawn(command, listing.args, {
-      env: { ...process.env, ...(env || {}), NO_COLOR: '1', TERM: 'dumb', FORCE_COLOR: '0' },
+    const processEnv = {
+      ...process.env,
+      ...(env || {}),
+      NO_COLOR: '1',
+      TERM: 'dumb',
+      FORCE_COLOR: '0',
+    };
+    const launch = wrapHostCommand(command, listing.args, process.platform, processEnv);
+    const child = spawn(launch.command, launch.args, {
+      env: { ...processEnv, ...(launch.envPatch || {}) },
+      windowsVerbatimArguments: launch.windowsVerbatimArguments,
       // Closed, not piped, and this is the reason this is a `spawn` rather than
       // the `execFile` it used to be — that helper leaves stdin an open pipe and
       // has no option to close it. `agy models` waits on that pipe forever:

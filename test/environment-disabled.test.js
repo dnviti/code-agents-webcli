@@ -1,4 +1,5 @@
 const assert = require('assert');
+const { execFileSync } = require('child_process');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
@@ -59,23 +60,18 @@ function response() {
 
 describe('an installation with no container engine configured', function () {
   describe('configuration', function () {
-    it('launches Windows npm command shims through ComSpec but keeps executables direct', function () {
-      assert.deepStrictEqual(
-        wrapHostCommand(
-          'C:\\Users\\alice\\AppData\\Roaming\\npm\\claude.cmd',
-          ['--model', 'sonnet'],
-          'win32',
-          { ComSpec: 'C:\\Windows\\System32\\cmd.exe' },
-        ),
-        {
-          command: 'C:\\Windows\\System32\\cmd.exe',
-          args: [
-            '/d', '/s', '/v:off', '/c',
-            'C:\\Users\\alice\\AppData\\Roaming\\npm\\claude.cmd',
-            '--model', 'sonnet',
-          ],
-        },
+    it('quotes Windows batch launchers as one verbatim ComSpec command', function () {
+      const wrapped = wrapHostCommand(
+        'C:\\Users\\alice\\AppData\\Roaming\\npm\\claude.cmd',
+        ['--model', 'sonnet'],
+        'win32',
+        { ComSpec: 'C:\\Windows\\System32\\cmd.exe' },
       );
+      assert.strictEqual(wrapped.command, 'C:\\Windows\\System32\\cmd.exe');
+      assert.deepStrictEqual(wrapped.args.slice(0, 4), ['/d', '/s', '/v:off', '/c']);
+      assert.match(wrapped.args[4], /claude\.cmd/);
+      assert.match(wrapped.args[4], /sonnet/);
+      assert.strictEqual(wrapped.windowsVerbatimArguments, true);
       assert.deepStrictEqual(
         wrapHostCommand('C:\\Tools\\codex.exe', ['exec'], 'win32', {}),
         { command: 'C:\\Tools\\codex.exe', args: ['exec'] },
@@ -84,6 +80,78 @@ describe('an installation with no container engine configured', function () {
         wrapHostCommand('/usr/bin/claude', [], 'linux', {}),
         { command: '/usr/bin/claude', args: [] },
       );
+    });
+
+    it('preserves spaces and cmd metacharacters without executing them', function () {
+      if (process.platform !== 'win32') this.skip();
+      const fixture = path.join(__dirname, 'fixtures', 'windows command', 'echo-argv.cmd');
+      const args = [
+        'space value', '&', 'echo', 'CAWC_INJECTED', 'a|b', '100%',
+        'wow!', 'caret^', '(paren)', '<input>', '>output',
+      ];
+      const wrapped = wrapHostCommand(fixture, args, 'win32', process.env);
+      const output = execFileSync(wrapped.command, wrapped.args, {
+        encoding: 'utf8',
+        env: process.env,
+        windowsVerbatimArguments: wrapped.windowsVerbatimArguments,
+      });
+      assert.deepStrictEqual(JSON.parse(output), args);
+      assert.ok(!output.includes('CAWC_INJECTED\r\n'), 'metacharacters must stay argv, not become commands');
+
+      const quoteArgs = ['quote"value'];
+      const quoted = wrapHostCommand(fixture, quoteArgs, 'win32', process.env);
+      assert.deepStrictEqual(JSON.parse(execFileSync(quoted.command, quoted.args, {
+        encoding: 'utf8',
+        env: process.env,
+        windowsVerbatimArguments: quoted.windowsVerbatimArguments,
+      })), quoteArgs);
+    });
+
+    it('rejects values that cmd.exe cannot represent without command splitting', function () {
+      for (const value of ['line one\nline two', 'line one\rline two', 'before\0after']) {
+        assert.throws(
+          () => wrapHostCommand('C:\\Tools\\agent.cmd', [value], 'win32', {}),
+          /cannot safely represent NUL or line-break characters/,
+        );
+      }
+      assert.throws(
+        () => wrapHostCommand('C:\\Tools\\bad\nname.cmd', [], 'win32', {}),
+        /cannot safely represent NUL or line-break characters/,
+      );
+    });
+
+    it('bypasses cmd.exe for npm shims and preserves multiline argv', function () {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cawc npm shim '));
+      try {
+        const bin = path.join(root, 'prefix', 'bin');
+        const entry = path.join(bin, 'node_modules', 'example', 'cli.js');
+        const managedNode = path.join(root, 'node-runtime', 'node.exe');
+        fs.mkdirSync(path.dirname(entry), { recursive: true });
+        fs.mkdirSync(path.dirname(managedNode), { recursive: true });
+        try {
+          fs.linkSync(process.execPath, path.join(bin, 'node.exe'));
+        } catch {
+          fs.copyFileSync(process.execPath, path.join(bin, 'node.exe'));
+        }
+        fs.writeFileSync(managedNode, 'managed node marker');
+        fs.writeFileSync(entry, 'process.stdout.write(JSON.stringify({ args: process.argv.slice(2), prefix: process.env.npm_config_prefix, piPrefix: process.env.PI_NPM_INSTALL_PREFIX, path: process.env.PATH }));');
+        const shim = path.join(bin, 'pi.cmd');
+        fs.writeFileSync(shim, '@ECHO off\r\n"%dp0%\\node.exe" "%dp0%\\node_modules\\example\\cli.js" %*\r\n');
+        const args = ['line one\n& echo CAWC_INJECTED\nline two', 'a|b', '100%'];
+        const wrapped = wrapHostCommand(shim, args, 'win32', { PATH: 'host-path' });
+        assert.strictEqual(wrapped.command, path.join(bin, 'node.exe'));
+        assert.strictEqual(wrapped.windowsVerbatimArguments, undefined);
+        const parsed = JSON.parse(execFileSync(wrapped.command, wrapped.args, {
+          encoding: 'utf8',
+          env: { ...process.env, ...(wrapped.envPatch || {}) },
+        }));
+        assert.deepStrictEqual(parsed.args, args);
+        assert.strictEqual(parsed.prefix, bin);
+        assert.strictEqual(parsed.piPrefix, bin);
+        assert.ok(parsed.path.split(path.delimiter).includes(path.join(root, 'node-runtime')));
+      } finally {
+        fs.rmSync(root, { recursive: true, force: true });
+      }
     });
 
     it('is off when nothing is passed and nothing is in the environment', function () {

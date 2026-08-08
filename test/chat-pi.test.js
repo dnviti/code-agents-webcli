@@ -218,7 +218,6 @@ describe('pi chat adapter', function () {
       '--model',
       'vendor/model-x',
       '-p',
-      'hello',
     ]);
 
     adapter.nativeSessionId = 'native-1';
@@ -227,7 +226,7 @@ describe('pi chat adapter', function () {
         text: 'hello again',
         attachments: [{ url: '/files/a', mime: 'text/plain', name: 'a.txt', size: 1, path: '/tmp/a.txt' }],
       }),
-      ['--mode', 'json', '--model', 'vendor/model-x', '--session-id', 'native-1', '@/tmp/a.txt', '-p', 'hello again'],
+      ['--mode', 'json', '--model', 'vendor/model-x', '--session-id', 'native-1', '@/tmp/a.txt', '-p'],
     );
   });
 

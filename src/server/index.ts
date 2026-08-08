@@ -139,6 +139,7 @@ import {
   OfficialScriptAgentInstaller,
   childProcessRunner,
   officialFetch,
+  safeProcessEnvironment,
   type AgentCommandRunner,
 } from './services/agent-maintenance-runtime.js';
 import {
@@ -162,12 +163,14 @@ export async function probeLaunchedAgentVersion(
   const command = selectedCommand || entry.binary;
   try {
     const wrapped = environment.wrap(command, [...entry.versionArgs], {
+      env: environment.kind === 'host' ? safeProcessEnvironment() : {},
       inheritHostEnv: false,
     });
     const result = await runner.run(wrapped.command, wrapped.args, {
       env: wrapped.env,
       timeoutMs: 2_000,
       inheritEnv: false,
+      windowsVerbatimArguments: wrapped.windowsVerbatimArguments,
     });
     const match = `${result.stdout}\n${result.stderr}`
       .replace(/\x1b\[[0-?]*[ -/]*[@-~]/gu, '')
@@ -1269,6 +1272,7 @@ export class ClaudeCodeWebServer {
         const result = await childProcessRunner.run(wrapped.command, wrapped.args, {
           env: wrapped.env,
           timeoutMs: 2_000,
+          windowsVerbatimArguments: wrapped.windowsVerbatimArguments,
         });
         raw = result.stdout.trim();
       } catch {

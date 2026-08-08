@@ -35,7 +35,7 @@ describe('agent maintenance foundation', () => {
     assert.equal(agentSupported(antigravity, 'linux', 'x64'), true);
     assert.equal(agentSupported(antigravity, 'win32', 'arm64'), true);
     const qwen = AGENT_MAINTENANCE_CATALOG.find((x) => x.id === 'qwen');
-    assert.equal(agentSupported(qwen, 'win32', 'arm64'), false);
+    assert.equal(agentSupported(qwen, 'win32', 'arm64'), true);
   });
 
   it('caches bounded checks and reports updates without startup work', async () => {
@@ -46,6 +46,26 @@ describe('agent maintenance foundation', () => {
     assert.equal((await service.check(target(), 'claude')).state, 'update_available');
     now += 1; assert.equal((await service.check(target(), 'claude')).state, 'update_available');
     assert.equal(calls, 1);
+  });
+
+  it('does not offer a downgrade when the installed version is newer than the stable pointer', async () => {
+    const { deps } = fixture({
+      probe: { locate: async () => ({ state: 'managed', version: '2.1.221' }), version: async () => '2.1.221' },
+      releases: { latest: async () => ({ version: '2.1.220' }) },
+    });
+    assert.equal((await new AgentMaintenanceService(deps).check(target(), 'claude', true)).state, 'current');
+  });
+
+  it('does not offer an update when an installed copy cannot report a trustworthy version', async () => {
+    for (const state of ['external', 'managed']) {
+      const { deps } = fixture({
+        probe: { locate: async () => ({ state, version: null }), version: async () => null },
+      });
+      assert.equal(
+        (await new AgentMaintenanceService(deps).check(target(), 'claude', true)).state,
+        'unable_to_check',
+      );
+    }
   });
 
   it('binds private targets to immutable container identities and fails closed without one', () => {
@@ -238,6 +258,32 @@ describe('agent maintenance foundation', () => {
     assert.deepEqual(activated, []);
   });
 
+  it('preserves version-probe failures instead of replacing them with Windows runtime guidance', async () => {
+    const { deps } = fixture({
+      probe: { locate: async () => ({ state: 'missing', version: null }), version: async () => { throw new Error('kimi executable could not load a required DLL'); } },
+    });
+    const result = await new AgentMaintenanceService(deps).install(target({ platform: 'win32' }), 'kimi', 7, 7);
+    assert.match(result.error, /kimi executable could not load a required DLL/);
+    assert.doesNotMatch(result.error, /Install Git for Windows/);
+  });
+
+  it('retains a failed staging tree when Windows PATH cleanup could not remove its reference', async () => {
+    const discarded = [];
+    const cleanupFailure = new Error('publisher failed\nThe temporary Windows user PATH entry could not be removed.');
+    cleanupFailure.preserveStaging = true;
+    const { deps } = fixture({
+      installer: {
+        install: async () => { throw cleanupFailure; },
+        activate: async () => {},
+        discard: async (input) => { discarded.push(input.stagingRoot); },
+      },
+    });
+    const result = await new AgentMaintenanceService(deps).install(target({ platform: 'win32' }), 'codex', 7, 7);
+    assert.equal(result.phase, 'failed');
+    assert.match(result.error, /PATH entry could not be removed/);
+    assert.deepEqual(discarded, []);
+  });
+
   it('shows prerequisite guidance only for the affected target platform', async () => {
     const missingVersion = () => fixture({
       probe: { locate: async () => ({ state: 'missing', version: null }), version: async () => null },
@@ -251,6 +297,6 @@ describe('agent maintenance foundation', () => {
       7,
       7,
     );
-    assert.match(windows.error, /Windows requires a Bash implementation/);
+    assert.match(windows.error, /Managed installation includes Node.js; Git Bash is needed when Pi runs shell tools/);
   });
 });

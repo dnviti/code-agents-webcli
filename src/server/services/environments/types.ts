@@ -125,6 +125,8 @@ export interface EnvironmentOwner {
 export interface WrappedCommand {
   command: string;
   args: string[];
+  /** Args already form a safely escaped Windows command line. */
+  windowsVerbatimArguments?: boolean;
   /** The environment the *spawn* gets — not the environment the program sees. */
   env: Record<string, string>;
   /**
