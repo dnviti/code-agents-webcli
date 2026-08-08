@@ -45,24 +45,45 @@ function harness(overrides) {
       overrides,
     ),
   );
-  adapter.writeLine = (payload) => sent.push(payload);
+  adapter.writeLine = (payload) => {
+    sent.push(payload);
+    if (payload.method === 'authenticate') {
+      adapter.handleMessage({ jsonrpc: '2.0', id: payload.id, result: {} });
+    }
+  };
   return { adapter, events, sent };
 }
 
 /** Feed the handshake replies, then hand back the rest of the capture. */
 async function boot(h, lines) {
   const done = h.adapter.handshake();
-  for (const line of lines.slice(0, 2)) {
-    h.adapter.handleMessage(line);
+  let consumed = 0;
+  for (; consumed < lines.length; consumed += 1) {
+    const line = lines[consumed];
+    const response = line.result?.sessionId && h.sent.some((message) => message.method === 'authenticate')
+      ? { ...line, id: 3 }
+      : line;
+    h.adapter.handleMessage(response);
     await flush();
+    // OMP authenticates between initialize and session/new; the other ACP
+    // fixtures go straight from initialize to session/new.
+    if (h.sent.some((message) => message.method === 'session/new') && line.result?.sessionId) {
+      consumed += 1;
+      break;
+    }
   }
   await done;
-  return lines.slice(2);
+  return lines.slice(consumed);
 }
 
 async function feed(h, lines) {
   for (const line of lines) {
-    h.adapter.handleMessage(line);
+    const response = h.sent.some((message) => message.method === 'authenticate')
+      && line.id !== undefined
+      && (line.result !== undefined || line.error)
+      ? { ...line, id: Number(line.id) + 1 }
+      : line;
+    h.adapter.handleMessage(response);
     await flush();
   }
 }
@@ -97,6 +118,16 @@ describe('acp chat adapter', function () {
       assert.deepStrictEqual(initialize.params.clientCapabilities.fs, {
         readTextFile: false,
         writeTextFile: false,
+      });
+    });
+
+    it('authenticates OMP with its existing local credentials before opening a session', async function () {
+      const h = harness();
+      await boot(h, fixture('acp-omp'));
+      const methods = h.sent.filter((message) => message.method).map((message) => message.method);
+      assert.deepStrictEqual(methods.slice(0, 3), ['initialize', 'authenticate', 'session/new']);
+      assert.deepStrictEqual(h.sent.find((message) => message.method === 'authenticate').params, {
+        methodId: 'agent',
       });
     });
 
