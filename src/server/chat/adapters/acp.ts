@@ -452,6 +452,7 @@ export class AcpChatAdapter extends JsonRpcChatAdapter {
         }),
       );
       this.applyInitialize(init);
+      await this.authenticateWithExistingCredentials(init);
 
       const session = await this.openSession(init);
       this.applySessionConfig(record(session));
@@ -489,6 +490,28 @@ export class AcpChatAdapter extends JsonRpcChatAdapter {
       this.emit({ t: 'state', state: 'error' });
       throw error instanceof Error ? error : new Error(message);
     }
+  }
+
+  /**
+   * ACP requires an agent-auth method to be selected after initialize and
+   * before session/new. OMP's method is deliberately non-interactive: it asks
+   * the client to reuse the credentials already present in its local store.
+   * Terminal auth methods (Kimi, for example) still need a user-facing login
+   * flow and must not be invoked blindly from the chat handshake.
+   */
+  private async authenticateWithExistingCredentials(init: Record<string, unknown>): Promise<void> {
+    const method = list(init.authMethods)
+      .map((raw) => record(raw))
+      .find((candidate) => {
+        const type = str(candidate.type);
+        if (type && type !== 'agent') return false;
+        const id = (str(candidate.id) || '').toLowerCase();
+        const text = `${str(candidate.name)} ${str(candidate.description)}`.toLowerCase();
+        return id === 'agent' || text.includes('existing local credentials');
+      });
+    const methodId = method ? str(method.id) : '';
+    if (!methodId) return;
+    await this.call('authenticate', { methodId });
   }
 
   /**
