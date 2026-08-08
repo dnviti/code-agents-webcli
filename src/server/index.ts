@@ -139,6 +139,7 @@ import {
   OfficialScriptAgentInstaller,
   childProcessRunner,
   officialFetch,
+  safeProcessEnvironment,
   type AgentCommandRunner,
 } from './services/agent-maintenance-runtime.js';
 import {
@@ -162,6 +163,7 @@ export async function probeLaunchedAgentVersion(
   const command = selectedCommand || entry.binary;
   try {
     const wrapped = environment.wrap(command, [...entry.versionArgs], {
+      env: environment.kind === 'host' ? safeProcessEnvironment() : {},
       inheritHostEnv: false,
     });
     const result = await runner.run(wrapped.command, wrapped.args, {

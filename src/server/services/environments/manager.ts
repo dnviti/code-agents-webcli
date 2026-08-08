@@ -110,8 +110,16 @@ function mergedEnv(extra?: Record<string, string>): Record<string, string> {
  * stay direct and container commands never pass through this host wrapper.
  */
 const CMD_META = /([()\][%!^"`<>&|;, *?])/gu;
+const CMD_UNREPRESENTABLE = /[\0\r\n]/u;
+
+function assertRepresentableCmdValue(value: string): void {
+  if (CMD_UNREPRESENTABLE.test(value)) {
+    throw new Error('Windows batch commands cannot safely represent NUL or line-break characters');
+  }
+}
 
 function escapeCmdCommand(value: string): string {
+  assertRepresentableCmdValue(value);
   return value.replace(CMD_META, '^$1');
 }
 
@@ -120,6 +128,7 @@ function escapeCmdCommand(value: string): string {
 // marked verbatim at every Windows spawn site, so neither Node nor cmd gets a
 // chance to reinterpret a prompt/model/path as shell syntax.
 function escapeCmdArgument(value: string, doubleEscapeMeta: boolean): string {
+  assertRepresentableCmdValue(value);
   let escaped = value
     .replace(/(?=(\\+?)?)\1"/gu, '$1$1\\"')
     .replace(/(?=(\\+?)?)\1$/gu, '$1$1');

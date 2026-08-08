@@ -107,6 +107,19 @@ describe('an installation with no container engine configured', function () {
       })), quoteArgs);
     });
 
+    it('rejects values that cmd.exe cannot represent without command splitting', function () {
+      for (const value of ['line one\nline two', 'line one\rline two', 'before\0after']) {
+        assert.throws(
+          () => wrapHostCommand('C:\\Tools\\agent.cmd', [value], 'win32', {}),
+          /cannot safely represent NUL or line-break characters/,
+        );
+      }
+      assert.throws(
+        () => wrapHostCommand('C:\\Tools\\bad\nname.cmd', [], 'win32', {}),
+        /cannot safely represent NUL or line-break characters/,
+      );
+    });
+
     it('bypasses cmd.exe for npm shims and preserves multiline argv', function () {
       const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cawc npm shim '));
       try {

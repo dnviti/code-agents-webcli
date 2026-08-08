@@ -133,14 +133,16 @@ export class AgentMaintenanceService {
           return { targetKey: target.key, agentId: agent.id, latestVersion: null, state: 'unable_to_check' };
         }
         const installed = await this.deps.probe.locate(target, agent);
+        const installedVersion = installed.version ?? installed.managedVersion ?? null;
         return {
           targetKey: target.key,
           agentId: agent.id,
           latestVersion: release.version,
-          state: sameVersionOrNewer(installed.version, release.version)
-            || sameVersionOrNewer(installed.managedVersion ?? null, release.version)
-            ? 'current'
-            : 'update_available',
+          state: installed.state !== 'missing' && !installedVersion
+            ? 'unable_to_check'
+            : sameVersionOrNewer(installedVersion, release.version)
+              ? 'current'
+              : 'update_available',
         };
       })();
       const result = await Promise.race([

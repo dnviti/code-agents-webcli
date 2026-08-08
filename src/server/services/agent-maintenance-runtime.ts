@@ -114,7 +114,7 @@ const SAFE_PROCESS_ENV = [
 ] as const;
 
 /** System plumbing only: never provider tokens, session data, or app credentials. */
-function safeProcessEnvironment(): Record<string, string> {
+export function safeProcessEnvironment(): Record<string, string> {
   const result: Record<string, string> = {};
   for (const key of SAFE_PROCESS_ENV) {
     const value = process.env[key];

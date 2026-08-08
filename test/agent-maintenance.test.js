@@ -56,6 +56,18 @@ describe('agent maintenance foundation', () => {
     assert.equal((await new AgentMaintenanceService(deps).check(target(), 'claude', true)).state, 'current');
   });
 
+  it('does not offer an update when an installed copy cannot report a trustworthy version', async () => {
+    for (const state of ['external', 'managed']) {
+      const { deps } = fixture({
+        probe: { locate: async () => ({ state, version: null }), version: async () => null },
+      });
+      assert.equal(
+        (await new AgentMaintenanceService(deps).check(target(), 'claude', true)).state,
+        'unable_to_check',
+      );
+    }
+  });
+
   it('binds private targets to immutable container identities and fails closed without one', () => {
     const base = { kind: 'container', name: 'reused-name' };
     assert.notEqual(
