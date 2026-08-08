@@ -135,6 +135,19 @@ describe('TerminalBridge', function() {
     });
   });
 
+  it('does not mistake a sandbox-only shell for a host shell', function() {
+    const flatpakBridge = new TerminalBridge({
+      platform: 'linux',
+      env: { FLATPAK_ID: 'io.github.dnviti.code-agents-webcli', SHELL: '/bin/zsh' },
+      existsSync(candidate) { return candidate === '/bin/zsh'; },
+      execFileSync(_command, args) {
+        if (args.at(-1) === '/bin/sh') return '';
+        throw new Error('not installed on host');
+      },
+    });
+    assert.strictEqual(flatpakBridge.resolveShell(), '/bin/sh');
+  });
+
   it('advertises one friendly Windows choice per shell family', function() {
     const bridge = new TerminalBridge({ platform: 'win32' });
     assert.deepStrictEqual(bridge.getSupportedShells(), ['pwsh', 'powershell', 'cmd']);

@@ -180,6 +180,27 @@ function mergePath(preferred, inherited, delimiter = path.delimiter) {
     .join(delimiter);
 }
 
+/** Read the account's configured shell from the host rather than Flatpak. */
+function hostLoginShell(options = {}) {
+  const platform = options.platform || process.platform;
+  const flatpakId = options.flatpakId ?? process.env.FLATPAK_ID;
+  const inherited = options.shell || process.env.SHELL || '/bin/sh';
+  if (!flatpakId || platform !== 'linux') return inherited;
+  const exec = options.execFileSync || execFileSync;
+  const marker = '__CODE_AGENTS_SHELL__=';
+  try {
+    const output = exec('/usr/bin/flatpak-spawn', [
+      '--host', '/bin/sh', '-lc',
+      `configured=''; if command -v getent >/dev/null 2>&1; then configured=$(getent passwd "$(id -u)" | cut -d: -f7); fi; [ -n "$configured" ] || configured="$SHELL"; printf '${marker}%s\n' "\${configured:-/bin/sh}"`,
+    ], { encoding: 'utf8', timeout: 5000, windowsHide: true });
+    const index = String(output).lastIndexOf(marker);
+    const candidate = index < 0 ? '' : String(output).slice(index + marker.length).split(/\r?\n/, 1)[0];
+    return /^\/(?:[^/\0\r\n]+\/)*(?:sh|bash|zsh)$/u.test(candidate) ? candidate : inherited;
+  } catch {
+    return inherited;
+  }
+}
+
 /**
  * GUI applications do not inherit a login shell's PATH on macOS and many Linux
  * desktops. Agent CLIs commonly live under nvm, mise, Homebrew or a user bin,
@@ -190,7 +211,7 @@ function loginShellPath(options = {}) {
   if ((options.platform || process.platform) === 'win32') {
     return options.inheritedPath || process.env.PATH || '';
   }
-  const shell = options.shell || process.env.SHELL || '/bin/sh';
+  const shell = options.shell || hostLoginShell(options);
   const exec = options.execFileSync || execFileSync;
   const marker = '__CODE_AGENTS_PATH__=';
   try {
@@ -226,6 +247,7 @@ module.exports = {
   desktopPermissionAllowed,
   desktopWindowChrome,
   desktopCookie,
+  hostLoginShell,
   isSafeExternalUrl,
   loginShellPath,
   mergePath,

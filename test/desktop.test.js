@@ -8,6 +8,7 @@ const {
   DEFAULT_WINDOW,
   desktopWindowChrome,
   desktopCookie,
+  hostLoginShell,
   isSafeExternalUrl,
   loginShellPath,
   mergePath,
@@ -368,6 +369,20 @@ describe('Electron desktop helpers', function () {
       },
     });
     assert.strictEqual(recovered, '/home/alice/.local/bin:/usr/bin:/app/bin');
+  });
+
+  it('reads the configured login shell from the host inside Flatpak', function () {
+    const shell = hostLoginShell({
+      platform: 'linux',
+      flatpakId: 'io.github.dnviti.code-agents-webcli',
+      shell: '/app/bin/sh',
+      execFileSync: (command, argv) => {
+        assert.strictEqual(command, '/usr/bin/flatpak-spawn');
+        assert.deepStrictEqual(argv.slice(0, 3), ['--host', '/bin/sh', '-lc']);
+        return 'banner\n__CODE_AGENTS_SHELL__=/usr/bin/zsh\n';
+      },
+    });
+    assert.strictEqual(shell, '/usr/bin/zsh');
   });
 
   it('awaits embedded-server teardown after a post-listen startup failure', async function () {

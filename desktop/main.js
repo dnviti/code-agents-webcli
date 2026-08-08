@@ -20,6 +20,7 @@ const {
 const {
   CUSTOM_TITLE_BAR_HEIGHT,
   desktopWindowChrome,
+  hostLoginShell,
   isSafeExternalUrl,
   loginShellPath,
   readWindowState,
@@ -140,6 +141,7 @@ async function startEmbeddedServer({ dataDir, baseFolder }) {
   // serve HTML, but its defining terminal/agent feature cannot work; presenting
   // that as a healthy app would turn a packaging defect into a blank session.
   ptySource();
+  if (process.env.FLATPAK_ID) process.env.SHELL = hostLoginShell();
   process.env.PATH = loginShellPath({ inheritedPath: process.env.PATH });
   if (process.platform === 'win32' && !process.env.HOME) process.env.HOME = baseFolder;
 
