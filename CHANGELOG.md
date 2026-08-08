@@ -119,14 +119,17 @@
 
 ### Known limitations
 
-- **Workspace-local session storage is not available on macOS in this
-  release.** Binding a workspace directory without a rename race requires an
-  `openat`-style descriptor namespace. Linux provides one through
-  `/proc/self/fd`, so workspace-local storage is always available there. macOS
-  exposes `/dev/fd` but does not support the `/dev/fd/<n>/child` traversal this
-  needs, and there is no alternative that can be proven safe, so the storage
-  layer declines rather than writing history through an unverifiable path and a
-  workspace-rooted request reports `workspace_persistence_unavailable`.
+- **This release publishes no macOS package.** Workspace-local session storage
+  requires an `openat`-style descriptor namespace to bind a workspace directory
+  without a rename race. Linux provides one through `/proc/self/fd`, so
+  workspace-local storage is always available there. macOS exposes `/dev/fd`
+  but does not support the `/dev/fd/<n>/child` traversal this needs, and there
+  is no alternative that can be proven safe. Because the create route derives
+  its storage root from the working directory and loads workspace sessions for
+  it either way, there is no installation-storage fallback to degrade into:
+  every conversation on macOS fails with `workspace_persistence_unavailable`.
+  Rather than ship a build that cannot open a conversation, the macOS packages
+  are held back until that support lands. **macOS users should stay on 6.0.0.**
 - **On Windows it depends on the volume.** Windows has no `openat` namespace
   either, but the storage layer accepts a pathname fallback once it has proven
   on that specific volume that an open descendant handle blocks an ancestor
