@@ -223,6 +223,16 @@ export function wrapFlatpakHostCommand(
   return { command: '/usr/bin/flatpak-spawn', args: flatpakArgs };
 }
 
+/** Environment needed by the trusted bridge itself, not by the host child. */
+function flatpakSpawnEnvironment(childEnv: Record<string, string>): Record<string, string> {
+  const bridgeEnv: Record<string, string> = { ...childEnv };
+  for (const name of ['DBUS_SESSION_BUS_ADDRESS', 'XDG_RUNTIME_DIR', 'FLATPAK_ID']) {
+    const value = process.env[name];
+    if (typeof value === 'string') bridgeEnv[name] = value;
+  }
+  return bridgeEnv;
+}
+
 /**
  * The environment the server has always had: this machine, this account.
  *
@@ -260,13 +270,16 @@ export class HostEnvironment implements UserEnvironment {
     const baseEnv = options.inheritHostEnv === false
       ? { ...(options.env || {}) }
       : mergedEnv(options.env);
-    const launch = process.env.FLATPAK_ID && process.platform === 'linux'
+    const flatpakHost = Boolean(process.env.FLATPAK_ID) && process.platform === 'linux';
+    const launch = flatpakHost
       ? wrapFlatpakHostCommand(command, args, options)
       : wrapHostCommand(command, args, process.platform, baseEnv);
     const { envPatch, ...processLaunch } = launch;
     return {
       ...processLaunch,
-      env: { ...baseEnv, ...(envPatch || {}) },
+      env: flatpakHost
+        ? flatpakSpawnEnvironment(baseEnv)
+        : { ...baseEnv, ...(envPatch || {}) },
     };
   }
 }

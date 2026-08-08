@@ -452,7 +452,9 @@ describe('per-user environments', function () {
 
     it('runs host commands through flatpak-spawn when packaged as a Flatpak', function () {
       const previous = process.env.FLATPAK_ID;
+      const previousBus = process.env.DBUS_SESSION_BUS_ADDRESS;
       process.env.FLATPAK_ID = 'io.github.dnviti.code-agents-webcli';
+      process.env.DBUS_SESSION_BUS_ADDRESS = 'unix:path=/run/user/1000/bus';
       try {
         const wrapped = new HostEnvironment('/home/alice').wrap('codex', ['--version'], {
           cwd: '/home/alice/project',
@@ -464,9 +466,13 @@ describe('per-user environments', function () {
           '--host', '--watch-bus', '--directory=/home/alice/project', '--clear-env',
           '--env=TERM=dumb', 'codex', '--version',
         ]);
+        assert.strictEqual(wrapped.env.DBUS_SESSION_BUS_ADDRESS, 'unix:path=/run/user/1000/bus');
+        assert.ok(!wrapped.args.some((arg) => arg.includes('DBUS_SESSION_BUS_ADDRESS')));
       } finally {
         if (previous === undefined) delete process.env.FLATPAK_ID;
         else process.env.FLATPAK_ID = previous;
+        if (previousBus === undefined) delete process.env.DBUS_SESSION_BUS_ADDRESS;
+        else process.env.DBUS_SESSION_BUS_ADDRESS = previousBus;
       }
     });
   });
