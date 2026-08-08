@@ -35,6 +35,7 @@ const { ClaudeChatAdapter } = require('../dist/server/chat/adapters/claude.js');
 const { ChatSession } = require('../dist/server/chat/session.js');
 const { advertisedChatCapabilities } = require('../dist/server/chat/registry.js');
 const { applyChatEvent, createTranscript } = require('../dist/shared/chat-reducer.js');
+const { feed, wire } = require('./acp-fixture-harness.js');
 
 const ROOT = path.join(__dirname, '..');
 
@@ -62,19 +63,14 @@ async function acpRun(name, runtime, options) {
     acpArgs: ['acp'],
     ...options,
   });
-  adapter.writeLine = () => {};
+  const sent = [];
+  wire(adapter, sent);
   const lines = fixture(name);
   const done = adapter.handshake();
-  for (const line of lines.slice(0, 2)) {
-    adapter.handleMessage(line);
-    await flush();
-  }
+  await feed(adapter, lines.slice(0, 2), sent);
   await done;
   const sending = adapter.send({ text: 'go' });
-  for (const line of lines.slice(2)) {
-    adapter.handleMessage(line);
-    await flush();
-  }
+  await feed(adapter, lines.slice(2), sent);
   await sending;
   return { events, adapter };
 }

@@ -28,6 +28,7 @@ const path = require('path');
 const { AcpChatAdapter } = require('../dist/server/chat/adapters/acp.js');
 const { UsageAccountant } = require('../dist/server/chat/usage-accounting.js');
 const { applyChatEvent, createTranscript } = require('../dist/shared/chat-reducer.js');
+const { feed, wire } = require('./acp-fixture-harness.js');
 
 function fixture(name) {
   return fs
@@ -63,7 +64,7 @@ function harness(overrides) {
       overrides,
     ),
   );
-  adapter.writeLine = (payload) => sent.push(payload);
+  wire(adapter, sent);
   return { adapter, events, sent };
 }
 
@@ -399,16 +400,10 @@ describe('how much of grok’s context is occupied', function () {
       const h = harness({ runtime, acpArgs: ['acp'] });
       const lines = fixture(name);
       const done = h.adapter.handshake();
-      for (const line of lines.slice(0, 2)) {
-        h.adapter.handleMessage(line);
-        await flush();
-      }
+      await feed(h.adapter, lines.slice(0, 2), h.sent);
       await done;
       const sending = h.adapter.send({ text: 'go' });
-      for (const line of lines.slice(2)) {
-        h.adapter.handleMessage(line);
-        await flush();
-      }
+      await feed(h.adapter, lines.slice(2), h.sent);
       await sending;
 
       assert.strictEqual(only(h.events, 'usage').length, 1, `${runtime}: one report, as before`);

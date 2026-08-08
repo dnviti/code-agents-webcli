@@ -5,6 +5,7 @@ const { AcpChatAdapter } = require('../dist/server/chat/adapters/acp.js');
 const { ClaudeChatAdapter } = require('../dist/server/chat/adapters/claude.js');
 const { applyChatEvent, createTranscript } = require('../dist/shared/chat-reducer.js');
 const { collectAgentActivity, countRunning } = require('../dist/shared/agent-activity.js');
+const { feed, repoint, wire } = require('./acp-fixture-harness.js');
 
 /**
  * Issue #139: nothing reads as running once nothing can report on it.
@@ -120,13 +121,11 @@ describe('a delegation nothing will report on again (#139)', function () {
       acpArgs: ['acp'],
       emit: (event) => events.push(event),
     });
-    adapter.writeLine = () => {};
+    const sent = [];
+    wire(adapter, sent);
     const lines = readFixture('acp-omp.jsonl');
     const done = adapter.handshake();
-    for (const line of lines.slice(0, 2)) {
-      adapter.handleMessage(line);
-      await flush();
-    }
+    await feed(adapter, lines.slice(0, 2), sent);
     await done;
     const sending = adapter.send({ text: 'what is the magic word' });
     for (const line of lines.slice(2)) {
@@ -135,7 +134,7 @@ describe('a delegation nothing will report on again (#139)', function () {
         update?.sessionUpdate === 'tool_call_update'
         && (update.status === 'completed' || update.status === 'failed');
       if (backgrounded) continue;
-      adapter.handleMessage(line);
+      adapter.handleMessage(repoint(sent, line));
       await flush();
     }
     await sending;
