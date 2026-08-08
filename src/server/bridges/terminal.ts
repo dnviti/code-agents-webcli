@@ -237,7 +237,11 @@ export class TerminalBridge {
       }
       seen.add(candidate);
 
-      if (this.pathExists(candidate) || this.commandExists(candidate)) {
+      // Paths visible in the Flatpak runtime say nothing about the host. In
+      // particular, /bin/zsh may exist in the runtime but not on the machine
+      // where flatpak-spawn will execute it (or vice versa).
+      const flatpakHost = this.platform === 'linux' && Boolean(this.env.FLATPAK_ID);
+      if ((!flatpakHost && this.pathExists(candidate)) || this.commandExists(candidate)) {
         return candidate;
       }
     }

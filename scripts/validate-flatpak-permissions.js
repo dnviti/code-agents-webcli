@@ -33,11 +33,14 @@ if (added.length === 0) {
   process.exit(0);
 }
 
-const approvedBridgePermissions = new Set([
-  '--talk-name=org.freedesktop.portal.Flatpak',
-  '--talk-name=org.freedesktop.Flatpak',
-]);
-if (updaterBridgeTag === releaseTag && added.length === 1 && approvedBridgePermissions.has(added[0])) {
+const updaterPortalPermission = '--talk-name=org.freedesktop.portal.Flatpak';
+const hostProcessBridgePermission = '--talk-name=org.freedesktop.Flatpak';
+const updaterBridge = updaterBridgeTag === releaseTag && added[0] === updaterPortalPermission;
+// This immutable version check makes the new host-process permission a true
+// one-release migration. The workflow's automatically populated updater tag
+// must not turn into a standing exception for this broader D-Bus interface.
+const hostProcessBridge = releaseTag === 'v6.1.1' && added[0] === hostProcessBridgePermission;
+if (added.length === 1 && (updaterBridge || hostProcessBridge)) {
   console.warn(`Allowing only the one-time reviewed Flatpak bridge in ${releaseTag}: ${added[0]}`);
   process.exit(0);
 }

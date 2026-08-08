@@ -254,6 +254,8 @@ describe('desktop release update pipeline', function () {
     assert.match(script, /updaterBridgeTag === releaseTag/);
     assert.match(script, /added\.length === 1/);
     assert.match(script, /org\.freedesktop\.portal\.Flatpak/);
+    assert.match(script, /releaseTag === 'v6\.1\.1'/);
+    assert.match(script, /org\.freedesktop\.Flatpak/);
   });
 
   it('requires exact installed old-to-new evidence for all five package paths', function () {
@@ -388,8 +390,11 @@ describe('desktop release update pipeline', function () {
         '--talk-name=org.freedesktop.Flatpak',
       ]));
       childProcess.execFileSync('node', [
-        'scripts/validate-flatpak-permissions.js', previous, current, 'v6.1.0', 'v6.1.0',
+        'scripts/validate-flatpak-permissions.js', previous, current, 'v6.1.1', 'v6.1.1',
       ], { cwd: root, stdio: 'pipe' });
+      assert.throws(() => childProcess.execFileSync('node', [
+        'scripts/validate-flatpak-permissions.js', previous, current, 'v6.1.2', 'v6.1.2',
+      ], { cwd: root, stdio: 'pipe' }), /Flatpak finish-args expanded/);
       fs.writeFileSync(current, config([
         '--share=network',
         '--talk-name=org.freedesktop.portal.Flatpak',

@@ -8,6 +8,7 @@ const {
   DEFAULT_WINDOW,
   desktopWindowChrome,
   desktopCookie,
+  hostLoginShell,
   isSafeExternalUrl,
   loginShellPath,
   mergePath,
@@ -233,8 +234,8 @@ describe('Electron desktop helpers', function () {
     assert.doesNotMatch(main, /path\.dirname\(started\.server\.database\.storageDir\)/);
     assert.match(
       main,
-      /fs\.realpathSync\(fs\.mkdtempSync\(path\.join\(os\.tmpdir\(\), 'cc-web-electron-smoke-'\)\)\)/,
-      'the packaged smoke must admit the same canonical tmp namespace it sends to the server',
+      /fs\.realpathSync\(fs\.mkdtempSync\(path\.join\(os\.homedir\(\), '\.cc-web-electron-smoke-'\)\)\)/,
+      'the packaged smoke workspace must be visible to host processes launched through Flatpak',
     );
     assert.match(main, /runPackagedRendererSmoke\(started/);
     assert.match(main, /DESKTOP_WORKSPACE_ATTACHMENT_SMOKE_OK/);
@@ -368,6 +369,20 @@ describe('Electron desktop helpers', function () {
       },
     });
     assert.strictEqual(recovered, '/home/alice/.local/bin:/usr/bin:/app/bin');
+  });
+
+  it('reads the configured login shell from the host inside Flatpak', function () {
+    const shell = hostLoginShell({
+      platform: 'linux',
+      flatpakId: 'io.github.dnviti.code-agents-webcli',
+      shell: '/app/bin/sh',
+      execFileSync: (command, argv) => {
+        assert.strictEqual(command, '/usr/bin/flatpak-spawn');
+        assert.deepStrictEqual(argv.slice(0, 3), ['--host', '/bin/sh', '-lc']);
+        return 'banner\n__CODE_AGENTS_SHELL__=/usr/bin/zsh\n';
+      },
+    });
+    assert.strictEqual(shell, '/usr/bin/zsh');
   });
 
   it('awaits embedded-server teardown after a post-listen startup failure', async function () {
