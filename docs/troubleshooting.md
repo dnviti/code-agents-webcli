@@ -234,15 +234,24 @@ the server treats its operational state as unrecognised. Reopen the real
 workspace and choose the runtime/approval settings again; native resume IDs and
 archived project paths are deliberately not trusted across that boundary.
 
-**The API reports `workspace_persistence_unavailable` on macOS or Windows.**
-Workspace-local storage is available on Linux only in this release. Binding a
+**The API reports `workspace_persistence_unavailable` on macOS.**
+Workspace-local storage is unavailable on macOS in this release. Binding a
 workspace directory without a rename race requires an `openat`-style descriptor
-namespace: Linux provides one through `/proc/self/fd`, macOS exposes `/dev/fd`
-but does not support the `/dev/fd/<n>/child` traversal this needs, and Windows
-has no equivalent. Rather than write history through a path it cannot verify,
-the server declines the workspace root, and sessions and attachments keep using
-installation storage. This is expected on those platforms and needs no action;
-nothing is lost, and nothing will need migrating when they gain support.
+namespace; Linux provides one through `/proc/self/fd`, but macOS exposes
+`/dev/fd` without the `/dev/fd/<n>/child` traversal this needs. Rather than
+write history through a path it cannot verify, the server declines the
+workspace root. This is expected on macOS and is not a misconfiguration.
+
+**The API reports `workspace_persistence_unavailable` for one Windows volume
+but not another.**
+Windows has no `openat` namespace either, so the storage layer accepts a
+pathname fallback only after proving on that specific volume that an open
+descendant handle blocks an ancestor rename. Ordinary NTFS volumes pass and get
+full workspace-local storage, so include `.cc-web/` in your backups. Some
+network shares and filtered filesystems do not, and those workspaces report this
+error; keep such a workspace on a local NTFS volume if you want its history
+stored beside the code. `GET /api/sessions/persistence` reports which roots are
+loaded and which are unavailable.
 
 **The API reports `workspace_persistence_unavailable`, or migration is
 incomplete.**

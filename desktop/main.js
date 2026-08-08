@@ -595,7 +595,7 @@ async function runSmokeCheck(started) {
   // binding, which today means Linux.
   console.log(`DESKTOP_WORKSPACE_ATTACHMENT_SMOKE_OK bytes=${persistence.bytes} ${persistence.mode}`);
   console.log('DESKTOP_SMOKE_STAGE packaged-renderer');
-  await runPackagedRendererSmoke(started, 'Packaged workspace persistence smoke');
+  await runPackagedRendererSmoke(started, persistence.sessionName);
   console.log('DESKTOP_SMOKE_STAGE phone-access');
   await runPhoneAccessSmoke(started, workingDir);
   console.log('DESKTOP_SMOKE_STAGE terminal');

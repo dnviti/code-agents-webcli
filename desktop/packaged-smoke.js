@@ -8,16 +8,20 @@ const path = require('node:path');
 const SMOKE_PAYLOAD_BYTES = 1024 * 1024 + 257;
 
 /**
- * Workspace-local persistence needs an openat-like descriptor namespace to
- * prove race-safe directory binding. Only Linux provides one that survives the
- * runtime probe in `workspace-session-storage`: macOS exposes `/dev/fd` but
- * does not support the `/dev/fd/N/child` traversal this requires, and Windows
- * has no equivalent namespace at all. On those hosts the storage layer refuses
- * pathname mutation and history stays in installation storage instead.
+ * Hosts whose attachments must be stored inside the workspace.
  *
- * This is asserted per platform rather than accepting whatever happens, so a
- * regression on Linux still fails here, and a host that unexpectedly gains the
- * workspace-local layout is still held to the full workspace-only contract.
+ * Workspace-local storage needs an openat-like descriptor namespace to prove
+ * race-safe directory binding. Linux has one in `/proc/self/fd`, so both the
+ * session and its attachments always land in `.cc-web`. Windows has none, but
+ * `workspace-session-storage` accepts a pathname fallback per volume once it
+ * has proven that an open descendant handle blocks an ancestor rename; the
+ * attachment store resolves that policy separately, against the session working
+ * directory, so a Windows host can keep the workspace session layout and still
+ * store attachments in installation storage.
+ *
+ * Listing only the platform that guarantees the workspace-only outcome keeps
+ * a Linux regression failing here, while a host that does achieve it is still
+ * held to the complete contract below.
  */
 const WORKSPACE_LOCAL_PERSISTENCE_PLATFORMS = new Set(['linux']);
 
@@ -95,11 +99,20 @@ function fileContains(filename, needle, filesystem = fs) {
   }
 }
 
-function assertNoInstallationSessionCopy(server, dataDir, sessionId, payload, filesystem = fs) {
+/**
+ * A workspace-local conversation must never gain an installation-global row,
+ * whatever storage its attachments ended up in. This half of the check stays
+ * valid when attachments alone fall back, because it never reads `dataDir`.
+ */
+function assertNoInstallationSessionRows(server) {
   for (const table of ['runtime_sessions', 'usage_jobs', 'usage_job_models', 'usage_job_tools']) {
     const row = server.database.raw.prepare(`SELECT COUNT(*) AS count FROM ${table}`).get();
     assert.equal(row.count, 0, `${table} received a new installation-global row`);
   }
+}
+
+function assertNoInstallationSessionCopy(server, dataDir, sessionId, payload, filesystem = fs) {
+  assertNoInstallationSessionRows(server);
 
   const idNeedle = Buffer.from(sessionId, 'utf8');
   // A random prefix proves that attachment bytes were not duplicated without
@@ -153,22 +166,26 @@ async function runPackagedWorkspacePersistenceSmoke(options) {
     return { body, text };
   };
 
-  let createdResponse = await createSession({
-    name: 'Packaged workspace persistence smoke',
+  // The renderer smoke waits for this exact name to appear in the page, so
+  // every path here must create the session under it. A retry that renamed the
+  // conversation would hydrate a page the renderer stage never recognises.
+  const sessionName = 'Packaged workspace persistence smoke';
+  const createdResponse = await createSession({
+    name: sessionName,
     workingDir: canonicalWorkspace,
   });
-  let { body: created, text: createdText } = await readSession(createdResponse);
-  let workspaceRooted = true;
+  const { body: created, text: createdText } = await readSession(createdResponse);
   if (createdResponse.status === 409 && created?.error === 'workspace_persistence_unavailable') {
-    if (workspaceLocalExpected) {
-      throw new Error(`desktop smoke session creation failed with HTTP 409: ${createdText.slice(0, 500)}`);
-    }
-    // The server refuses a workspace-local root it cannot bind safely rather
-    // than silently writing history somewhere else. An installation-stored
-    // session must still be created and remain fully usable.
-    workspaceRooted = false;
-    createdResponse = await createSession({ name: 'Packaged installation persistence smoke' });
-    ({ body: created, text: createdText } = await readSession(createdResponse));
+    // There is no installation storage to retry into. The create route derives
+    // its storage root from the working directory, defaulting to the base
+    // folder when none is supplied, and loads workspace sessions for whichever
+    // root it picked (`src/server/routes/sessions.ts`). A host that cannot bind
+    // a workspace root therefore cannot create any conversation at all, so this
+    // is reported as the outright failure it is rather than as a fallback.
+    throw new Error(
+      'Workspace-local persistence is unavailable on this host, so no session can be created: '
+      + createdText.slice(0, 500),
+    );
   }
   if (!createdResponse.ok || !created || typeof created !== 'object') {
     throw new Error(
@@ -177,7 +194,7 @@ async function runPackagedWorkspacePersistenceSmoke(options) {
   }
   const sessionId = created.sessionId;
   if (typeof sessionId !== 'string' || !sessionId) throw new Error('Desktop smoke did not receive a session id.');
-  if (workspaceRooted) assert.equal(created.session?.workingDir, canonicalWorkspace);
+  assert.equal(created.session?.workingDir, canonicalWorkspace);
 
   const ccWeb = path.join(canonicalWorkspace, '.cc-web');
   const sessionDatabase = path.join(ccWeb, 'session-state.sqlite');
@@ -191,14 +208,14 @@ async function runPackagedWorkspacePersistenceSmoke(options) {
       ? matches[0]
       : null;
   };
-  let sessionDirectory = null;
-  if (workspaceRooted) {
-    sessionDirectory = workspaceLocalExpected
-      ? await waitFor(findWorkspaceSessionDirectory, 'workspace-local session database and transcript')
-      : await waitFor(findWorkspaceSessionDirectory, 'workspace-local session database and transcript')
-        .catch(() => null);
-    if (sessionDirectory) assert.ok(isInside(ccWeb, sessionDirectory));
-  }
+  // The session was accepted against this workspace root, so its history must
+  // be here. Only the attachment store resolves a separate policy and can still
+  // fall back on its own.
+  const sessionDirectory = await waitFor(
+    findWorkspaceSessionDirectory,
+    'workspace-local session database and transcript',
+  );
+  assert.ok(isInside(ccWeb, sessionDirectory));
 
   const payload = randomBytes(SMOKE_PAYLOAD_BYTES);
   const uploadResponse = await fetchImpl(
@@ -245,10 +262,7 @@ async function runPackagedWorkspacePersistenceSmoke(options) {
   assert.equal(downloadResponse.headers.get('cache-control'), 'no-store');
   assert.deepEqual(Buffer.from(await downloadResponse.arrayBuffer()), payload);
 
-  // Only meaningful when the workspace holds everything: in the documented
-  // fallback the session and its attachment are deliberately in installation
-  // storage, which is exactly what this would flag as a leak.
-  const workspaceOnly = workspaceRooted && Boolean(sessionDirectory) && attachmentWorkspaceLocal;
+  const workspaceOnly = attachmentWorkspaceLocal;
   if (workspaceOnly) {
     assertNoInstallationSessionCopy(
       started.server,
@@ -257,12 +271,20 @@ async function runPackagedWorkspacePersistenceSmoke(options) {
       payload,
       filesystem,
     );
+  } else {
+    // Attachments resolve their own policy, so they can fall back while the
+    // conversation stays workspace-local. Their bytes and their owner/session
+    // namespace are then legitimately inside `dataDir`, which rules out the
+    // filesystem sweep -- but the conversation itself must still own no
+    // installation-global row, and that half of the check remains exact.
+    assertNoInstallationSessionRows(started.server);
   }
   return {
     sessionId,
     bytes: payload.length,
     mode: workspaceOnly ? 'workspace-only' : 'installation-fallback',
     workspaceOnly,
+    sessionName,
     sessionDatabase,
     sessionDirectory,
     attachmentPath: storedPath,
@@ -272,5 +294,6 @@ async function runPackagedWorkspacePersistenceSmoke(options) {
 module.exports = {
   SMOKE_PAYLOAD_BYTES,
   assertNoInstallationSessionCopy,
+  assertNoInstallationSessionRows,
   runPackagedWorkspacePersistenceSmoke,
 };
