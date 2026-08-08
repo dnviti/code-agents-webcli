@@ -261,16 +261,33 @@ jobs:
             label: Windows x64
             args: --win nsis --x64 --config.publish.channel=latest
             packages: 1
+          # macOS is deliberately held back and publishes no package.
+          #
+          # Workspace-local session storage needs an openat-style descriptor
+          # namespace. macOS exposes /dev/fd but not the /dev/fd/<n>/child
+          # traversal `workspace-session-storage` requires, so it cannot create
+          # `.cc-web`, and there is no fallback to reach for: the create route
+          # derives its storage root from the working directory and loads
+          # workspace sessions for it either way, so every conversation fails
+          # with `workspace_persistence_unavailable`. Publishing a build that
+          # cannot open a conversation is worse than publishing none.
+          #
+          # Restore both legs together with the macOS storage support. The
+          # signed release path still requires the macOS packages through
+          # `scripts/validate-release-assets.js`, so a signed release cannot be
+          # cut while they are absent — it fails loudly on the missing DMG
+          # rather than publishing an incomplete set.
+          #
           # These remain native builds because node-pty is selected for the
           # build host. The channel names keep architecture feeds separate.
-          - os: macos-15-intel
-            label: macOS x64
-            args: --mac dmg zip --x64 --config.publish.channel=latest-x64
-            packages: 1
-          - os: macos-15
-            label: macOS arm64
-            args: --mac dmg zip --arm64 --config.publish.channel=latest-arm64
-            packages: 1
+          # - os: macos-15-intel
+          #   label: macOS x64
+          #   args: --mac dmg zip --x64 --config.publish.channel=latest-x64
+          #   packages: 1
+          # - os: macos-15
+          #   label: macOS arm64
+          #   args: --mac dmg zip --arm64 --config.publish.channel=latest-arm64
+          #   packages: 1
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -849,15 +866,19 @@ jobs:
           # `needs: desktop` already fails this job if any matrix leg failed.
           # Name every installable package anyway, so a future matrix or
           # artifactName change cannot quietly publish a partial release.
+          # Restore the two macOS DMGs here when the macOS legs return to the
+          # desktop matrix, so a silently missing package still fails closed.
           for name in \
             "Code-Agents-Web-CLI-${VERSION}-linux-x64.AppImage" \
             "Code-Agents-Web-CLI-${VERSION}-linux-x64.flatpak" \
-            "Code-Agents-Web-CLI-${VERSION}-win-x64.exe" \
-            "Code-Agents-Web-CLI-${VERSION}-mac-x64.dmg" \
-            "Code-Agents-Web-CLI-${VERSION}-mac-arm64.dmg"; do
+            "Code-Agents-Web-CLI-${VERSION}-win-x64.exe"; do
             test -f "release-assets/published/$name" \
               || { echo "Missing expected release package: $name" >&2; exit 1; }
           done
+          if find release-assets/published -maxdepth 1 -name '*-mac-*' -print -quit | grep -q .; then
+            echo 'A macOS package was produced while macOS is held back; update the release notes.' >&2
+            exit 1
+          fi
           cd release-assets/published
           find . -maxdepth 1 -type f \( -name '*.AppImage' -o -name '*.flatpak' \
             -o -name '*.exe' -o -name '*.dmg' \) -printf '%f\0' \
@@ -904,19 +925,24 @@ jobs:
             - `*.AppImage` — Linux x64, portable; mounted launches require FUSE2 and Chromium sandboxing requires unprivileged user namespaces.
             - `*.flatpak` — Linux x64, sandboxed Flatpak bundle. Install the bundle directly; this release publishes no signed Flatpak remote.
             - `*.exe` — Windows x64 NSIS installer.
-            - `*-x64.dmg` — macOS Intel (x64).
-            - `*-arm64.dmg` — macOS Apple Silicon (arm64).
             - `SHA256SUMS` — SHA-256 checksums for every desktop package.
 
-            **Workspace-local session storage is unavailable on macOS in this
-            release.** Binding a workspace directory without a rename race needs
-            an `openat`-style descriptor namespace; macOS exposes `/dev/fd`
-            without the child traversal this requires, so the server declines a
-            workspace root there rather than writing history through a path it
-            cannot verify. Linux always supports it. Windows supports it on
-            volumes where the storage layer can prove an open handle blocks an
-            ancestor rename, which ordinary NTFS volumes do — include
-            `.cc-web/` in backups there.
+            **There is no macOS package in this release, and that is
+            deliberate.** Workspace-local session storage needs an
+            `openat`-style descriptor namespace to bind a workspace directory
+            without a rename race. macOS exposes `/dev/fd` but not the child
+            traversal this requires, and there is no fallback to reach for, so
+            on macOS every attempt to open a conversation fails with
+            `workspace_persistence_unavailable`. Rather than publish a build
+            that cannot be used, macOS is held back until that support lands.
+            **macOS users should stay on the previous release.**
+
+            On the platforms published here, Linux always stores sessions in the
+            workspace. Windows does so on volumes where the storage layer can
+            prove an open handle blocks an ancestor rename, which ordinary NTFS
+            volumes do — include `.cc-web/` in your backups there. Where that
+            proof fails, such as some network filesystems, that workspace
+            reports `workspace_persistence_unavailable` instead.
 
             **In-app updates cannot install this release.** The updater
             manifests and blockmaps are published here, but the desktop updater
