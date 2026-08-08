@@ -527,6 +527,28 @@ describe('which model actually ran', () => {
       assert.strictEqual(models[0].description, 'openrouter');
     });
 
+    it('reads models through a managed Windows npm shim', async function () {
+      if (process.platform !== 'win32') this.skip();
+      const bin = path.join(dir, 'managed agent', 'prefix', 'bin');
+      const entry = path.join(bin, 'node_modules', 'example-pi', 'cli.js');
+      fs.mkdirSync(path.dirname(entry), { recursive: true });
+      fs.writeFileSync(
+        entry,
+        `process.stdout.write(${JSON.stringify(fixture('pi-models-list.txt'))});`,
+      );
+      const shim = path.join(bin, 'pi.cmd');
+      fs.writeFileSync(
+        shim,
+        '@ECHO off\r\n"%dp0%\\node.exe" "%dp0%\\node_modules\\example-pi\\cli.js" %*\r\n',
+      );
+      const models = await installedModels('pi', shim);
+      assert.deepStrictEqual(models.map((model) => model.value), [
+        '~anthropic/claude-opus-latest',
+        'anthropic/claude-opus-4.1',
+        'moonshotai/kimi-k3',
+      ]);
+    });
+
     it('takes the list from a CLI that printed it and then exited unhappily', async () => {
       const models = await installedModels(
         'grok',

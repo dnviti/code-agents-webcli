@@ -168,6 +168,7 @@ export async function probeLaunchedAgentVersion(
       env: wrapped.env,
       timeoutMs: 2_000,
       inheritEnv: false,
+      windowsVerbatimArguments: wrapped.windowsVerbatimArguments,
     });
     const match = `${result.stdout}\n${result.stderr}`
       .replace(/\x1b\[[0-?]*[ -/]*[@-~]/gu, '')
@@ -1269,6 +1270,7 @@ export class ClaudeCodeWebServer {
         const result = await childProcessRunner.run(wrapped.command, wrapped.args, {
           env: wrapped.env,
           timeoutMs: 2_000,
+          windowsVerbatimArguments: wrapped.windowsVerbatimArguments,
         });
         raw = result.stdout.trim();
       } catch {

@@ -53,7 +53,12 @@ export interface AgentMaintenanceOptions { store: AgentMaintenanceStore; probe: 
 export function managedVersionRoot(appRoot: string, target: AgentMaintenanceTarget, agent: AgentMaintenanceCatalogEntry, version: string): string {
   if (!/^[0-9A-Za-z][0-9A-Za-z._+-]{0,127}$/u.test(version)) throw new Error('Unsafe official version identifier.');
   const identity = createHash('sha256').update(target.key).digest('hex');
-  return path.join(appRoot, 'agent-maintenance', identity, agent.id, 'versions', version);
+  // Publisher installers create caches, package trees and atomic temp names
+  // beneath this root. A full SHA-256 directory plus redundant layout segments
+  // pushed ordinary Windows installs beyond legacy MAX_PATH consumers. A
+  // 96-bit opaque identity remains collision-resistant while keeping all
+  // publisher-visible paths comfortably shorter.
+  return path.join(appRoot, 'agent-maintenance', identity.slice(0, 24), agent.id, version);
 }
 export function managedInstallEnvironment(stagingRoot: string): Record<string, string> {
   return { HOME: path.join(stagingRoot, 'home'), npm_config_prefix: path.join(stagingRoot, 'prefix') };
@@ -132,8 +137,8 @@ export class AgentMaintenanceService {
           targetKey: target.key,
           agentId: agent.id,
           latestVersion: release.version,
-          state: sameVersion(installed.version, release.version)
-            || sameVersion(installed.managedVersion ?? null, release.version)
+          state: sameVersionOrNewer(installed.version, release.version)
+            || sameVersionOrNewer(installed.managedVersion ?? null, release.version)
             ? 'current'
             : 'update_available',
         };
@@ -172,6 +177,7 @@ export class AgentMaintenanceService {
   private async run(target: AgentMaintenanceTarget, agent: AgentMaintenanceCatalogEntry, initial: AgentMaintenanceOperation): Promise<AgentMaintenanceOperation> {
     let op = initial;
     let root: string | null = null;
+    let preserveFailedRoot = false;
     const controller = new AbortController(); this.controllers.set(op.id, controller);
     try {
       const release = await this.deps.releases.latest(target, agent, controller.signal);
@@ -179,7 +185,7 @@ export class AgentMaintenanceService {
       if (afterRelease?.phase === 'cancelled') return afterRelease;
       if (!release || (release.prerelease && agent.channel === 'stable')) throw new Error('No eligible official stable release is available.');
       op = this.advance(op, 'downloading', release.version);
-      root = path.join(this.deps.rootFor(target, agent, release.version), 'attempts', op.id);
+      root = path.join(this.deps.rootFor(target, agent, release.version), 'attempts', op.id.replace(/-/gu, ''));
       await this.deps.installer.install({
         target,
         agent,
@@ -198,7 +204,10 @@ export class AgentMaintenanceService {
       const verified = normalizedVersion(await this.deps.probe.version(target, agent, root));
       const afterVerification = this.operation(op.id);
       if (afterVerification?.phase === 'cancelled') return afterVerification;
-      if (!verified) throw new Error(this.platformGuidance(target, agent) || 'The managed copy did not provide a normalized version.');
+      if (!verified) {
+        const guidance = this.platformGuidance(target, agent);
+        throw new Error(`The managed copy did not provide a normalized version.${guidance ? ` ${guidance}` : ''}`);
+      }
       if (!sameVersion(verified, release.version)) throw new Error(`The managed copy reported ${verified}, not the selected official release ${release.version}.`);
       op = this.advance(op, 'activating', verified);
       op = { ...op, canCancel: false, cancelReason: 'Activation begins only after a known-good copy is verified.' };
@@ -213,10 +222,10 @@ export class AgentMaintenanceService {
       expiry.unref?.();
       return op;
     }
-    catch (error) { if (this.operation(op.id)?.phase === 'cancelled') return this.operation(op.id)!; op = { ...op, phase: 'failed', error: error instanceof Error ? error.message : 'Installation failed.', retryable: true, canCancel: false, cancelReason: 'The operation has finished.', updatedAt: this.now() }; this.persist(op); return op; }
+    catch (error) { preserveFailedRoot = (error as { preserveStaging?: unknown })?.preserveStaging === true; const cancelled = this.operation(op.id); if (cancelled?.phase === 'cancelled') { if (preserveFailedRoot) { const cleanupFailed = { ...cancelled, error: error instanceof Error ? error.message : 'Windows PATH cleanup failed after cancellation.', retryable: true, cancelReason: 'Cancellation finished, but managed PATH cleanup requires a retry.', updatedAt: this.now() }; this.persist(cleanupFailed); return cleanupFailed; } return cancelled; } op = { ...op, phase: 'failed', error: error instanceof Error ? error.message : 'Installation failed.', retryable: true, canCancel: false, cancelReason: 'The operation has finished.', updatedAt: this.now() }; this.persist(op); return op; }
     finally {
       this.controllers.delete(op.id);
-      if (root && this.operation(op.id)?.phase !== 'complete') {
+      if (root && this.operation(op.id)?.phase !== 'complete' && !preserveFailedRoot) {
         try { await this.deps.installer.discard?.({ target, agent, stagingRoot: root }); } catch { /* best effort */ }
       }
     }
@@ -227,3 +236,43 @@ export class AgentMaintenanceService {
 
 function normalizedVersion(value: string | null): string | null { if (!value) return null; const clean = value.replace(/\x1b\[[0-?]*[ -/]*[@-~]/gu, '').trim().replace(/^v/i, ''); return /^[0-9]+(?:\.[0-9A-Za-z.+-]+)+$/u.test(clean) ? clean : null; }
 function sameVersion(left: string | null, right: string): boolean { return normalizedVersion(left) === normalizedVersion(right); }
+function sameVersionOrNewer(left: string | null, right: string): boolean {
+  const installed = normalizedVersion(left);
+  const available = normalizedVersion(right);
+  if (!installed || !available) return false;
+  if (installed === available) return true;
+  const parsedInstalled = comparableVersion(installed);
+  const parsedAvailable = comparableVersion(available);
+  if (!parsedInstalled || !parsedAvailable) return false;
+  const coreLength = Math.max(parsedInstalled.core.length, parsedAvailable.core.length);
+  for (let index = 0; index < coreLength; index++) {
+    const comparison = (parsedInstalled.core[index] ?? 0) - (parsedAvailable.core[index] ?? 0);
+    if (comparison !== 0) return comparison > 0;
+  }
+  if (!parsedInstalled.prerelease && parsedAvailable.prerelease) return true;
+  if (parsedInstalled.prerelease && !parsedAvailable.prerelease) return false;
+  if (!parsedInstalled.prerelease || !parsedAvailable.prerelease) return true;
+  const prereleaseLength = Math.max(parsedInstalled.prerelease.length, parsedAvailable.prerelease.length);
+  for (let index = 0; index < prereleaseLength; index++) {
+    const installedPart = parsedInstalled.prerelease[index];
+    const availablePart = parsedAvailable.prerelease[index];
+    if (installedPart === undefined) return false;
+    if (availablePart === undefined) return true;
+    if (installedPart === availablePart) continue;
+    const installedNumeric = /^\d+$/u.test(installedPart);
+    const availableNumeric = /^\d+$/u.test(availablePart);
+    if (installedNumeric && availableNumeric) return Number(installedPart) > Number(availablePart);
+    if (installedNumeric !== availableNumeric) return !installedNumeric;
+    return installedPart.localeCompare(availablePart, 'en') > 0;
+  }
+  return true;
+}
+
+function comparableVersion(value: string): { core: number[]; prerelease: string[] | null } | null {
+  const match = value.match(/^(\d+(?:\.\d+)*)(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?$/u);
+  if (!match) return null;
+  const core = match[1].split('.').map(Number);
+  return core.every(Number.isSafeInteger)
+    ? { core, prerelease: match[2] ? match[2].split('.') : null }
+    : null;
+}

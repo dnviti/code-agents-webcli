@@ -207,7 +207,12 @@ export abstract class BaseBridge {
         { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true },
       );
       if (this.platform !== 'win32') return command;
-      return String(output).split(/\r?\n/).map((line) => line.trim()).find(Boolean) || null;
+      for (const line of String(output).split(/\r?\n/)) {
+        const candidate = line.trim().replace(/^"|"$/g, '');
+        const extension = path.win32.extname(candidate).toLowerCase();
+        if (['.exe', '.com', '.cmd', '.bat'].includes(extension)) return candidate;
+      }
+      return null;
     } catch {
       return null;
     }
@@ -219,7 +224,13 @@ export abstract class BaseBridge {
     options: ExecFileSyncOptionsWithStringEncoding,
   ): string {
     const launch = wrapHostCommand(this.resolvedCommand, args, this.platform, this.hostEnv);
-    return this.execFile(launch.command, launch.args, options);
+    return this.execFile(launch.command, launch.args, {
+      ...options,
+      ...(launch.envPatch ? {
+        env: { ...(options.env || this.hostEnv), ...launch.envPatch },
+      } : {}),
+      windowsVerbatimArguments: launch.windowsVerbatimArguments,
+    } as ExecFileSyncOptionsWithStringEncoding);
   }
 
   async startSession(
@@ -295,7 +306,7 @@ export abstract class BaseBridge {
         throw new Error('Container environment did not provide verified process control');
       }
 
-      const ptyProcess = spawnPty(launch.command, launch.args, {
+      const ptyProcess = spawnPty(launch.command, launch.windowsVerbatimArguments ? launch.args.join(' ') : launch.args, {
         // In a container the engine sets the working directory itself, and the
         // host path means nothing to the engine client.
         cwd: environment.kind === 'container' ? undefined : workingDir,

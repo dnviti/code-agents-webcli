@@ -109,20 +109,92 @@ function mergedEnv(extra?: Record<string, string>): Record<string, string> {
  * directly. Route only those script types through ComSpec; real executables
  * stay direct and container commands never pass through this host wrapper.
  */
+const CMD_META = /([()\][%!^"`<>&|;, *?])/gu;
+
+function escapeCmdCommand(value: string): string {
+  return value.replace(CMD_META, '^$1');
+}
+
+// Based on the qntm/cross-spawn algorithm: quote for CreateProcess first,
+// then caret-escape cmd.exe metacharacters. The resulting command line is
+// marked verbatim at every Windows spawn site, so neither Node nor cmd gets a
+// chance to reinterpret a prompt/model/path as shell syntax.
+function escapeCmdArgument(value: string, doubleEscapeMeta: boolean): string {
+  let escaped = value
+    .replace(/(?=(\\+?)?)\1"/gu, '$1$1\\"')
+    .replace(/(?=(\\+?)?)\1$/gu, '$1$1');
+  escaped = `"${escaped}"`.replace(CMD_META, '^$1');
+  return doubleEscapeMeta ? escaped.replace(CMD_META, '^$1') : escaped;
+}
+
+export interface HostCommandLaunch {
+  command: string;
+  args: string[];
+  windowsVerbatimArguments?: boolean;
+  envPatch?: Record<string, string>;
+}
+
+function npmShimLaunch(
+  command: string,
+  args: string[],
+  env: NodeJS.ProcessEnv,
+): HostCommandLaunch | null {
+  try {
+    const source = fs.readFileSync(command, 'utf8');
+    const matches = [...source.matchAll(/"%(?:~?dp0|dp0)%?\\([^"\r\n]+)"\s+%\*/giu)];
+    const relativeEntry = matches[matches.length - 1]?.[1];
+    if (!relativeEntry) return null;
+    const entry = path.resolve(path.dirname(command), relativeEntry.replace(/\\/gu, path.sep));
+    if (!fs.existsSync(entry)) return null;
+    const shimDir = path.dirname(command);
+    const siblingNode = path.join(shimDir, 'node.exe');
+    const managedNode = path.resolve(shimDir, '..', '..', 'node-runtime');
+    const managedNodeBinary = path.join(managedNode, 'node.exe');
+    const existingPath = env.PATH || env.Path || '';
+    const managedPi = fs.existsSync(managedNodeBinary)
+      && path.basename(command).toLowerCase() === 'pi.cmd';
+    return {
+      command: fs.existsSync(siblingNode) ? siblingNode : 'node.exe',
+      args: [entry, ...args],
+      // Launching an npm bin's JS entry directly avoids every cmd.exe
+      // quoting/injection trap. Managed Pi additionally needs its private
+      // npm/npx tools exposed so `pi install` and `pi update` keep working.
+      ...(managedPi ? {
+        envPatch: {
+          PATH: [shimDir, managedNode, existingPath].filter(Boolean).join(path.delimiter),
+          npm_config_prefix: shimDir,
+          PI_NPM_INSTALL_PREFIX: shimDir,
+        },
+      } : {}),
+    };
+  } catch {
+    return null;
+  }
+}
+
 export function wrapHostCommand(
   command: string,
   args: string[],
   platform: NodeJS.Platform = process.platform,
   env: NodeJS.ProcessEnv = process.env,
-): { command: string; args: string[] } {
+): HostCommandLaunch {
   if (platform !== 'win32' || !/\.(?:cmd|bat)$/i.test(command)) {
     return { command, args };
   }
+  const npmShim = npmShimLaunch(command, args, env);
+  if (npmShim) return npmShim;
+  const normalizedCommand = path.normalize(command);
+  const doubleEscapeMeta = /node_modules[\\/]\.bin[\\/][^\\/]+\.cmd$/iu.test(normalizedCommand);
+  const shellCommand = [
+    escapeCmdCommand(normalizedCommand),
+    ...args.map((argument) => escapeCmdArgument(argument, doubleEscapeMeta)),
+  ].join(' ');
   return {
     command: env.ComSpec || env.COMSPEC || 'cmd.exe',
-    // /d disables AutoRun, /s applies cmd's quoting rules, /v:off prevents
-    // delayed expansion from rewriting `!` inside a profile argument.
-    args: ['/d', '/s', '/v:off', '/c', command, ...args],
+    // /d disables AutoRun, /s applies cmd's quoting rules, and /v:off keeps
+    // literal `!` intact. The outer quotes are cmd's required /s + /c pair.
+    args: ['/d', '/s', '/v:off', '/c', `"${shellCommand}"`],
+    windowsVerbatimArguments: true,
   };
 }
 
@@ -160,10 +232,14 @@ export class HostEnvironment implements UserEnvironment {
   }
 
   wrap(command: string, args: string[], options: WrapOptions = {}): WrappedCommand {
-    const launch = wrapHostCommand(command, args);
+    const baseEnv = options.inheritHostEnv === false
+      ? { ...(options.env || {}) }
+      : mergedEnv(options.env);
+    const launch = wrapHostCommand(command, args, process.platform, baseEnv);
+    const { envPatch, ...processLaunch } = launch;
     return {
-      ...launch,
-      env: options.inheritHostEnv === false ? { ...(options.env || {}) } : mergedEnv(options.env),
+      ...processLaunch,
+      env: { ...baseEnv, ...(envPatch || {}) },
     };
   }
 }

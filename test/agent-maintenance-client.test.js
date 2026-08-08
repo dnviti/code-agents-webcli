@@ -142,7 +142,7 @@ describe('AgentMaintenanceStrip', function () {
     assert.match(install, />Restart…</);
     assert.doesNotMatch(install, /dismiss|close/i);
     assert.match(install, /role="group" aria-label="Agent maintenance actions"/);
-    assert.match(install, /href="https:\/\/code\.claude\.com\/docs\/en\/getting-started"/);
+    assert.match(install, /href="https:\/\/code\.claude\.com\/docs\/en\/setup"/);
     assert.match(install, /target="_blank"/);
     assert.match(install, /rel="noopener noreferrer"/);
     assert.match(install, />Official install guide</);

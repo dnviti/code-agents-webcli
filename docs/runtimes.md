@@ -37,8 +37,8 @@ Rename any of them in the UI with the
 The launcher gives each managed runtime a small maintenance row. It says which
 target is being inspected, the running version, whether that copy is **External**,
 **Managed**, **Not installed**, or **Project managed**, and its publisher
-channel. Claude Code, Codex CLI, pi, Qwen Code, Kimi, and Oh My Pi are labelled
-**Stable**; Grok is **Early beta**; Antigravity is **Preview**. Cursor Agent is
+channel. Claude Code, Codex CLI, pi, Grok, Qwen Code, Kimi, and Oh My Pi are
+labelled **Stable**; Antigravity is **Preview**. Cursor Agent is
 launchable when manually installed, but it is not offered as a managed runtime
 and has no maintenance row.
 
@@ -87,19 +87,19 @@ The automatic control is deliberately unavailable when the publisher does not
 support the target platform/architecture. Follow the linked official installer
 when a platform is unavailable or a prerequisite is missing.
 
-The managed pi path downloads the matching official Node.js 22 archive into the
-same managed root and verifies its published SHA-256 checksum before running
-pi's installer. It does not alter a system Node.js installation. Windows still
-needs a user-provided Bash implementation such as Git Bash; CODE AGENTS does
-not provision system-wide tools or WSL.
+The managed pi and Windows Qwen paths download the matching official Node.js 22
+archive into the same managed root and verify its published SHA-256 checksum
+before installing the exact official npm package version. They do not alter a
+system Node.js installation. Pi and Kimi still need a user-provided Git Bash at
+runtime for shell tools; installation itself does not require Bash or WSL.
 
 | Runtime | Supported automatic targets | Important manual guidance |
 | --- | --- | --- |
-| [Claude Code](https://code.claude.com/docs/en/getting-started) | macOS, Linux, Windows — x64 and arm64 | WSL2 enables sandboxing on Windows. |
-| [Codex CLI](https://github.com/openai/codex/blob/main/docs/install.md) | macOS, Linux, Windows — x64 and arm64 | Follow the official Windows/WSL2 requirements guidance. |
-| [pi](https://github.com/badlogic/pi-mono/tree/main/packages/coding-agent) | macOS, Linux, Windows — x64 and arm64 | Windows needs a supported Bash implementation, such as Git Bash. |
-| [Grok](https://docs.x.ai/build/overview) | macOS, Linux, Windows — x64 and arm64 | Use the official xAI installer; Windows supports PowerShell or WSL. |
-| [Qwen Code](https://github.com/QwenLM/qwen-code) | macOS/Linux x64 and arm64; Windows x64 | Windows arm64 is unsupported. |
+| [Claude Code](https://code.claude.com/docs/en/setup) | macOS, Linux, Windows — x64 and arm64 | Native Windows is supported; WSL2 is optional for Linux tooling and sandboxing. |
+| [Codex CLI](https://learn.chatgpt.com/docs/codex/cli) | macOS, Linux, Windows — x64 and arm64 | Native 64-bit Windows is supported. |
+| [pi](https://pi.dev/docs/latest) | macOS, Linux, Windows — x64 and arm64 | Managed Windows installation includes Node.js; Git Bash is needed when Pi runs shell tools. |
+| [Grok](https://docs.x.ai/build/overview) | macOS, Linux, Windows — x64 and arm64 | The managed path follows the official stable channel. |
+| [Qwen Code](https://github.com/QwenLM/qwen-code) | macOS, Linux, Windows — x64 and arm64 | Managed Windows installation includes a private Node.js 22 runtime. |
 | [Kimi](https://github.com/MoonshotAI/kimi-code) | macOS, Linux, Windows — x64 and arm64 | Windows needs Git for Windows or `KIMI_SHELL_PATH`. |
 | [Oh My Pi](https://github.com/can1357/oh-my-pi) | macOS/Linux x64 and arm64; Windows x64 | Windows arm64 is unsupported; Alpine needs `libstdc++` and `libgcc`. |
 | [Antigravity](https://antigravity.google/docs/cli/install) | macOS, Linux, Windows — x64 and arm64 | Use Google's official Antigravity CLI installer. |

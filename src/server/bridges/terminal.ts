@@ -422,7 +422,7 @@ export class TerminalBridge {
 
       const terminalProcess = this.spawnPty(
         launch.command,
-        launch.args,
+        launch.windowsVerbatimArguments ? launch.args.join(' ') : launch.args,
         {
           // A container exec sets its own working directory through the
           // engine, and the host path does not exist for the engine client, so

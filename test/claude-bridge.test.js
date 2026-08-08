@@ -27,7 +27,11 @@ describe('ClaudeBridge', function() {
         existsSync() { return false; },
         execFileSync(file, args) {
           calls.push([file, ...args]);
-          if (args[0] === 'claude') return 'C:\\Users\\alice\\AppData\\Roaming\\npm\\claude.cmd\r\n';
+          if (args[0] === 'claude') return [
+            'C:\\Users\\alice\\AppData\\Roaming\\npm\\claude',
+            'C:\\Users\\alice\\AppData\\Roaming\\npm\\claude.cmd',
+            '',
+          ].join('\r\n');
           throw new Error('missing');
         },
       });
@@ -40,8 +44,8 @@ describe('ClaudeBridge', function() {
   });
 
   describe('commandExists', function() {
-    it('should return true for existing commands like "ls"', function() {
-      const result = bridge.commandExists('ls');
+    it('should return true for an existing command', function() {
+      const result = bridge.commandExists(process.platform === 'win32' ? 'node' : 'ls');
       assert.strictEqual(result, true);
     });
 

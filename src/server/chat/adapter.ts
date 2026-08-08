@@ -424,6 +424,7 @@ export abstract class BaseChatAdapter implements ChatAdapter {
       cwd: environment?.kind === 'container' ? undefined : this.options.workingDir,
       env: launch.env,
       stdio,
+      windowsVerbatimArguments: launch.windowsVerbatimArguments,
     }) as ChildProcessWithoutNullStreams;
     let resolveClosed!: () => void;
     const closedPromise = new Promise<void>((resolve) => {

@@ -17,9 +17,10 @@ import {
  *
  * Two things make this adapter shaped differently from the other three:
  *
- * 1. `--mode json -p <prompt>` is one-shot: pi processes exactly one prompt
- *    and exits. There is no persistent stdio pipe to hold a session open and
- *    write a second turn into it (checked against `pi --help`; no such flag
+ * 1. `--mode json -p` is one-shot: pi reads one prompt from a pipe that is
+ *    immediately closed and exits. There is no persistent stdio pipe to hold
+ *    a session open and write a second turn into it (checked against
+ *    `pi --help`; no such flag
  *    exists — `--mode rpc` is undocumented beyond its name and untested here,
  *    so it is not used). Multi-turn is implemented by respawning pi once per
  *    `send()`, passing `--session-id` so pi resumes its own on-disk session
@@ -346,13 +347,15 @@ export class PiChatAdapter extends BaseChatAdapter {
     const args = this.buildTurnArgs(turn);
 
     return new Promise<void>((resolve, reject) => {
-      // stdin is closed, not piped. The prompt arrives in argv via `-p`, so
-      // nothing is ever written here — and pi waits on stdin when it is a
-      // pipe that stays open, producing no output at all and never exiting.
-      // Measured: an open empty stdin yields 0 bytes and no exit; 'ignore'
-      // completes the same prompt in ~8s. A turn that never answers is
-      // exactly what this looked like from the browser.
-      const child = this.launchChild(args, ['ignore', 'pipe', 'pipe']) as AdapterChild;
+      // Pi officially merges piped stdin into the print-mode prompt. Keeping
+      // arbitrary user text out of argv avoids cmd.exe's metacharacter and
+      // multiline parsing on Windows. End the pipe immediately: an open empty
+      // stdin makes pi wait forever, while prompt + EOF starts the turn.
+      const child = this.launchChild(args, ['pipe', 'pipe', 'pipe']) as AdapterChild;
+      const input = child.stdin;
+      if (!input) throw new Error('pi: prompt pipe was not created');
+      input.on('error', () => {});
+      input.end(turn.text);
 
       this.child = child;
       this.exited = false;
@@ -494,7 +497,7 @@ export class PiChatAdapter extends BaseChatAdapter {
         args.push(`@${attachment.path}`);
       }
     }
-    args.push('-p', turn.text);
+    args.push('-p');
     return args;
   }
 
