@@ -7,6 +7,7 @@ const { CodexAppServerAdapter } = require('../dist/server/chat/adapters/codex.js
 const { AcpChatAdapter } = require('../dist/server/chat/adapters/acp.js');
 const { PiChatAdapter } = require('../dist/server/chat/adapters/pi.js');
 const { createTranscript, applyChatEvent } = require('../dist/shared/chat-reducer.js');
+const { feed, wire } = require('./acp-fixture-harness.js');
 
 // The projection is client TypeScript with no build of its own, so it is
 // bundled the same way chat-activity.test.js does it.
@@ -142,18 +143,13 @@ async function acpEvents(name) {
     readFile: async () => '',
     writeFile: async () => {},
   });
-  adapter.writeLine = () => {};
+  const sent = [];
+  wire(adapter, sent);
   const lines = fixture(name === 'grok' ? 'acp-grok' : name === 'kimi' ? 'acp-kimi-tools' : 'acp-omp');
   const done = adapter.handshake();
-  for (const line of lines.slice(0, 2)) {
-    adapter.handleMessage(line);
-    await flush();
-  }
+  await feed(adapter, lines.slice(0, 2), sent);
   await done;
-  for (const line of lines.slice(2)) {
-    adapter.handleMessage(line);
-    await flush();
-  }
+  await feed(adapter, lines.slice(2), sent);
   return events;
 }
 

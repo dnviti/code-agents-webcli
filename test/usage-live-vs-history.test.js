@@ -30,6 +30,7 @@ const { UsageStore } = require('../dist/server/services/usage-store.js');
 const { AppDatabase } = require('../dist/server/services/database.js');
 const { applyChatEvent, createTranscript } = require('../dist/shared/chat-reducer.js');
 const { tokenTotal } = require('../dist/shared/usage-records.js');
+const { feed, wire } = require('./acp-fixture-harness.js');
 
 const { ClaudeChatAdapter } = require('../dist/server/chat/adapters/claude.js');
 const { PiChatAdapter } = require('../dist/server/chat/adapters/pi.js');
@@ -79,21 +80,16 @@ function acpRun(name, runtime) {
       readFile: async () => '',
       ...(runtime ? { runtime, acpArgs: ['acp'] } : null),
     });
-    adapter.writeLine = () => {};
+    const sent = [];
+    wire(adapter, sent);
     const lines = fixture(name);
     const done = adapter.handshake();
-    for (const line of lines.slice(0, 2)) {
-      adapter.handleMessage(line);
-      await flush();
-    }
+    await feed(adapter, lines.slice(0, 2), sent);
     await done;
     // The prompt goes out before the updates, as it did on the wire: the
     // captured turn result is the reply to it, and carries the token counts.
     const sending = adapter.send({ text: 'go' });
-    for (const line of lines.slice(2)) {
-      adapter.handleMessage(line);
-      await flush();
-    }
+    await feed(adapter, lines.slice(2), sent);
     await sending;
     return events;
   };

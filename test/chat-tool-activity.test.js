@@ -17,6 +17,7 @@ const {
   chatCapableRuntimes,
   createChatAdapter,
 } = require('../dist/server/chat/registry.js');
+const { feed, wire } = require('./acp-fixture-harness.js');
 
 /**
  * Issue #73: work an agent does has to show up as work.
@@ -187,13 +188,11 @@ for (const entry of RUNTIMES) {
       acpArgs: ['acp'],
       emit,
     });
-    adapter.writeLine = () => {};
+    const sent = [];
+    wire(adapter, sent);
     const lines = fixture(entry.fixture);
     const done = adapter.handshake();
-    for (const line of lines.slice(0, 2)) {
-      adapter.handleMessage(line);
-      await flush();
-    }
+    await feed(adapter, lines.slice(0, 2), sent);
     await done;
     // The user's message as the *session* writes it, because the session is the
     // only thing that writes one — the ACP adapters used to echo it back and
@@ -206,10 +205,7 @@ for (const entry of RUNTIMES) {
     // anything at all. Feeding the capture without it drops the one message
     // that says what the turn cost.
     const sending = adapter.send({ text: 'do the thing' });
-    for (const line of lines.slice(2)) {
-      adapter.handleMessage(line);
-      await flush();
-    }
+    await feed(adapter, lines.slice(2), sent);
     await sending;
   };
 }

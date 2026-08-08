@@ -6,6 +6,7 @@ const path = require('path');
 const { AcpChatAdapter } = require('../dist/server/chat/adapters/acp.js');
 const { ChatSession } = require('../dist/server/chat/session.js');
 const { createTranscript, applyChatEvent } = require('../dist/shared/chat-reducer.js');
+const { feed, wire } = require('./acp-fixture-harness.js');
 
 /**
  * Issue #129: one prompt, one bubble.
@@ -56,7 +57,7 @@ function harness(runtime = 'omp') {
     acpArgs: ['acp'],
     emit: (event) => events.push(event),
   });
-  adapter.writeLine = (line) => sent.push(line);
+  wire(adapter, sent);
   return { adapter, events, sent };
 }
 
@@ -95,19 +96,13 @@ describe('one prompt makes one user turn (#129)', function () {
       const h = harness();
       const lines = fixture('acp-omp');
       const done = h.adapter.handshake();
-      for (const line of lines.slice(0, 2)) {
-        h.adapter.handleMessage(line);
-        await flush();
-      }
+      await feed(h.adapter, lines.slice(0, 2), h.sent);
       await done;
 
       const prompt = 'What is the magic word?';
       h.events.length = 0;
       const sending = h.adapter.send({ text: prompt });
-      for (const line of lines.slice(2)) {
-        h.adapter.handleMessage(line);
-        await flush();
-      }
+      await feed(h.adapter, lines.slice(2), h.sent);
       await sending;
 
       const state = fold([...askedByTheSession(prompt), ...h.events]);
@@ -142,10 +137,7 @@ describe('one prompt makes one user turn (#129)', function () {
       const h = harness();
       const lines = fixture('acp-omp');
       const done = h.adapter.handshake();
-      for (const line of lines.slice(0, 2)) {
-        h.adapter.handleMessage(line);
-        await flush();
-      }
+      await feed(h.adapter, lines.slice(0, 2), h.sent);
       await done;
 
       const briefing = 'Here is everything that was said in the conversation this was branched from.';
