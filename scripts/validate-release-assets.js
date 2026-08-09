@@ -27,6 +27,8 @@ const one = (pattern, label) => {
 
 const artifacts = {
   appImage: one(new RegExp(`^Code-Agents-Web-CLI-${escapedVersion}-linux-x64\\.AppImage$`), 'AppImage'),
+  deb: one(new RegExp(`^Code-Agents-Web-CLI-${escapedVersion}-linux-x64\\.deb$`), 'Debian package'),
+  rpm: one(new RegExp(`^Code-Agents-Web-CLI-${escapedVersion}-linux-x64\\.rpm$`), 'RPM package'),
   flatpak: one(new RegExp(`^Code-Agents-Web-CLI-${escapedVersion}-linux-x64\\.flatpak$`), 'Flatpak bundle'),
   flatpakRef: one(new RegExp(`^Code-Agents-Web-CLI-${escapedVersion}-linux-x64\\.flatpakref$`), 'Flatpak reference'),
   flatpakRepo: one(new RegExp(`^Code-Agents-Web-CLI-${escapedVersion}-linux-x64\\.flatpakrepo$`), 'Flatpak repository descriptor'),
@@ -123,6 +125,8 @@ async function main() {
 
   const humanPackages = [
     artifacts.appImage,
+    artifacts.deb,
+    artifacts.rpm,
     artifacts.flatpak,
     artifacts.flatpakRef,
     artifacts.flatpakRepo,

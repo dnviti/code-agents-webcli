@@ -49,7 +49,8 @@ Maintainers publish these packages by pushing a version tag such as `v6.1.0`
 from `main`. The tag must match the version in `package.json`; GitHub Actions
 then verifies the source, builds each package on its native operating system,
 runs the packaged smoke checks, installs and launches the produced Flatpak under
-Xvfb/X11, and attaches all five installers plus `SHA256SUMS` to the GitHub
+Xvfb/X11, and attaches all seven installers (AppImage, Debian, RPM, Flatpak,
+Windows installer, and both macOS DMGs) plus `SHA256SUMS` to the GitHub
 Release for that exact tag. The installed Flatpak check exercises its sandboxed
 renderer, workspace-local persistence, and binary attachment round trip, then
 uninstalls the test package with its generated data. It does not automate a
@@ -61,7 +62,9 @@ version, never a silent replacement of the same release.
 
 | Your computer | Download | Install or run |
 | --- | --- | --- |
-| Linux x64 | `*.AppImage` | Make it executable (`chmod +x <file>.AppImage`) and open it. No installation is needed. If it will not start, install FUSE/FUSE2 for your distribution or run it with `--appimage-extract-and-run`. |
+|| Linux x64 | `*.AppImage` | Make it executable (`chmod +x <file>.AppImage`) and open it. No installation is needed. If it will not start, install FUSE/FUSE2 for your distribution or run it with `--appimage-extract-and-run`. |
+| Linux x64 | `*.deb` | Debian/Ubuntu package: `sudo apt install ./Code-Agents-Web-CLI-<version>-linux-x64.deb`. |
+| Linux x64 | `*.rpm` | Red Hat/Fedora package: `sudo dnf install ./Code-Agents-Web-CLI-<version>-linux-x64.rpm`. |
 | Linux x64 | `*.flatpakref` (preferred) or `*.flatpak` | Open the ref with your software center or run `flatpak install --user <file>.flatpakref`. The bundled `.flatpak` also records the signed project remote, so it can update after installation. |
 | Windows x64 | `*.exe` | Open the signed NSIS installer and follow its prompts. Confirm the publisher shown by Windows matches the project release documentation. |
 | macOS Intel | `*-x64.dmg` | Open the DMG and drag the app to Applications. |

@@ -16,6 +16,8 @@ function createReleaseFixture(version = '6.1.0') {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'cc-web-release-assets-'));
   const names = {
     appImage: `Code-Agents-Web-CLI-${version}-linux-x64.AppImage`,
+    deb: `Code-Agents-Web-CLI-${version}-linux-x64.deb`,
+    rpm: `Code-Agents-Web-CLI-${version}-linux-x64.rpm`,
     flatpak: `Code-Agents-Web-CLI-${version}-linux-x64.flatpak`,
     flatpakRef: `Code-Agents-Web-CLI-${version}-linux-x64.flatpakref`,
     flatpakRepo: `Code-Agents-Web-CLI-${version}-linux-x64.flatpakrepo`,
@@ -57,7 +59,7 @@ function createReleaseFixture(version = '6.1.0') {
     fs.writeFileSync(path.join(directory, name), JSON.stringify(value));
   }
   const human = [
-    'appImage', 'flatpak', 'flatpakRef', 'flatpakRepo', 'windows', 'macX64Dmg', 'macArm64Dmg',
+    'appImage', 'deb', 'rpm', 'flatpak', 'flatpakRef', 'flatpakRepo', 'windows', 'macX64Dmg', 'macArm64Dmg',
   ];
   fs.writeFileSync(path.join(directory, 'SHA256SUMS'), human.map((key) => {
     const digest = crypto.createHash('sha256').update(contents[key]).digest('hex');

@@ -102,3 +102,44 @@ jobs:
           load: false
           platforms: linux/amd64
           tags: code-agents-webcli:ci
+
+  linux-packages:
+    name: Build Debian and RPM packages
+    runs-on: ubuntu-24.04
+    needs: verify
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+
+      - name: Install packaging tooling
+        run: |
+          sudo apt-get update
+          # deb needs fakeroot; rpm shells out to `rpmbuild` (the `rpm` package).
+          sudo apt-get install --yes fakeroot rpm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build the Debian package
+        run: npm run desktop:dist:linux:deb
+
+      - name: Build the RPM package
+        run: npm run desktop:dist:linux:rpm
+
+      - name: Verify both packages were produced
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(node -e 'process.stdout.write(require("./package.json").version)')"
+          test -f "release/Code-Agents-Web-CLI-${version}-linux-x64.deb"
+          test -f "release/Code-Agents-Web-CLI-${version}-linux-x64.rpm"
+          echo "deb and rpm for ${version} produced."

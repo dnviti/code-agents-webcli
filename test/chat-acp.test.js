@@ -1008,5 +1008,35 @@ describe('acp chat adapter', function () {
       assert.ok(only(h.events, 'error').some((event) => event.fatal));
       assert.strictEqual(only(h.events, 'state').pop().state, 'error');
     });
+
+    it('does not blame authentication once existing credentials were accepted', async function () {
+      // omp authenticates with its existing local credentials (the harness
+      // auto-replies {} to `authenticate` at id 2) and *then* may refuse
+      // session/new because the question-server MCP child failed to start —
+      // which omp reports as a bare `Internal error`. Before the guard, that
+      // was rewritten into the false "this agent needs authentication" prompt;
+      // the real cause must be shown instead.
+      const h = harness();
+      const done = h.adapter.handshake().then(
+        () => null,
+        (error) => error,
+      );
+      h.adapter.handleMessage(fixture('acp-omp')[0]);
+      await flush();
+      // A successful authenticate has already been auto-replied (id 2), so
+      // session/new sits at id 3 and refuses with a technical error.
+      h.adapter.handleMessage({
+        jsonrpc: '2.0',
+        id: 3,
+        error: { code: -32603, message: 'Internal error', data: { details: 'spawn ... ENOENT' } },
+      });
+      const error = await done;
+
+      assert.ok(error instanceof Error);
+      assert.match(error.message, /Internal error/);
+      assert.match(error.message, /ENOENT/);
+      assert.ok(!/needs authentication/.test(error.message),
+        'an authenticated agent cannot fail session/new for lack of login');
+    });
   });
 });
