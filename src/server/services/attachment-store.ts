@@ -1,18 +1,31 @@
 import { createHash, randomBytes } from 'node:crypto';
-import { constants as fsConstants, type BigIntStats } from 'node:fs';
+import fsSync, { constants as fsConstants, type BigIntStats } from 'node:fs';
 import fsp, { type FileHandle } from 'node:fs/promises';
 import path from 'node:path';
-import type { Readable } from 'node:stream';
+import { Readable } from 'node:stream';
 import type { ChatAttachment } from '../../shared/chat-events.js';
 import type { SessionStorageScope } from '../types.js';
 import { sniffImageType, type ImageKind } from './paste-store.js';
 import {
+  openCanonicalDirectoryLeaseSync,
   resolveWorkspaceEntryMutationPolicy,
   workspaceDescriptorRoot,
   workspacePathMutationsAreHandlePinned,
   workspaceSessionAccessDirectory,
+  workspaceSessionFileParentLease,
   type WorkspaceEntryMutationPolicy,
 } from './workspace-session-storage.js';
+import {
+  createTemporaryWorkspaceCwdFile,
+  ensureWorkspaceCwdDirectory,
+  inspectWorkspaceCwdDirectory,
+  listWorkspaceCwdEntries,
+  readCompleteWorkspaceCwdFile,
+  readWorkspaceCwdFile,
+  removeWorkspaceCwdEntry,
+  runWorkspaceCwdHelper,
+  statWorkspaceCwdFile,
+} from './workspace-cwd-helper.js';
 
 /**
  * Files and images attached to a chat turn.
@@ -164,7 +177,7 @@ export interface AttachmentStoreOptions {
   quotaBytes?: number;
   maxFiles?: number;
   randomId?: () => string;
-  /** Force a backend in tests; pathname traversal remains read-only unless its handles pin names. */
+  /** Force a backend in tests; an explicit pathname backend remains read-only. */
   directoryBackend?: AttachmentDirectoryBackend;
   /** Deterministic race injection for security tests; never set by production composition. */
   testHooks?: {
@@ -183,7 +196,8 @@ type ResolvedAttachmentDirectoryBackend = Exclude<AttachmentDirectoryBackend, 'a
  * Keep platform selection pure and injectable so macOS/BSD and Windows policy
  * are covered on Linux CI. Descriptor traversal is selected only after the
  * shared resolver has proved real child create/rename/unlink through procfs or
- * fdescfs. Windows always uses its separately-probed handle-pinned path mode.
+ * fdescfs. Windows uses the path backend for reads and the cwd helper for
+ * direct namespace mutations.
  */
 export function resolveAttachmentDirectoryBackend(
   requested: AttachmentDirectoryBackend = 'auto',
@@ -214,6 +228,7 @@ export class AttachmentStore implements AttachmentStoreLike {
   private readonly randomId: () => string;
   private readonly directoryBackend: ResolvedAttachmentDirectoryBackend;
   private readonly descriptorRoot: string | null;
+  private readonly allowCwdHelper: boolean;
   private readonly testHooks: AttachmentStoreOptions['testHooks'];
 
   constructor(options: AttachmentStoreOptions = {}) {
@@ -228,6 +243,8 @@ export class AttachmentStore implements AttachmentStoreLike {
       descriptorRoot !== null,
     );
     this.descriptorRoot = this.directoryBackend === 'descriptor' ? descriptorRoot : null;
+    this.allowCwdHelper = options.directoryBackend !== 'path'
+      && this.directoryBackend === 'path';
     this.testHooks = options.testHooks;
   }
 
@@ -253,6 +270,7 @@ export class AttachmentStore implements AttachmentStoreLike {
         true,
         this.directoryBackend,
         this.descriptorRoot,
+        this.allowCwdHelper,
       );
       let storedName: string | null = null;
       let created = false;
@@ -281,13 +299,17 @@ export class AttachmentStore implements AttachmentStoreLike {
         // O_EXCL protects collisions. The portable backend additionally binds
         // the zero-byte inode to the validated parent before any user bytes are
         // written, then verifies both bindings again afterwards.
-        const handle = await createAttachmentFile(dir, storedName);
+        const handle = await createAttachmentFile(dir, storedName, input.bytes);
         created = true;
         try {
-          await handle.writeFile(input.bytes);
-          await verifyVisibleFile(dir, storedName, handle);
+          if (dir.mutationPolicy === 'cwd-helper') {
+            verifyCwdAttachmentFile(dir, storedName);
+          } else {
+            await handle!.writeFile(input.bytes);
+            await verifyVisibleFile(dir, storedName, handle!);
+          }
         } finally {
-          await handle.close();
+          await handle?.close();
         }
 
         // A runtime still consumes an ordinary path. Do not return one unless it
@@ -374,7 +396,38 @@ export class AttachmentStore implements AttachmentStoreLike {
   ): Promise<{ bytes: Buffer; digest: string; serve: ServeKind; version: string }> {
     const opened = await this.openStored(source, storedName, 'download');
     try {
-      const before = await opened.handle.stat({ bigint: true });
+      if (opened.data && opened.cwdStat) {
+        const before = opened.cwdStat;
+        if (before.nlink !== 1n) {
+          throw errno('SOURCE_ATTACHMENT_CHANGED', 'source attachment identity is unsafe');
+        }
+        if (before.size <= 0 || before.size > this.maxBytes) {
+          throw errno('FILE_TOO_LARGE', 'source attachment exceeds the branch copy limit');
+        }
+        const version = cwdAttachmentVersion(before);
+        const chunks: Buffer[] = [];
+        const hash = createHash('sha256');
+        let bytes = 0;
+        for (let offset = 0; offset < opened.data.length; offset += 64 * 1024) {
+          const value = opened.data.subarray(offset, Math.min(offset + 64 * 1024, opened.data.length));
+          bytes += value.length;
+          hash.update(value);
+          chunks.push(value);
+          await this.testHooks?.afterBranchCloneChunk?.(pass, bytes);
+        }
+        const after = cwdAttachmentStat(opened.directory, storedName, before.identity);
+        if (bytes !== before.size || cwdAttachmentVersion(after) !== version) {
+          throw errno('SOURCE_ATTACHMENT_CHANGED', 'source attachment changed while it was copied');
+        }
+        return {
+          bytes: Buffer.concat(chunks, bytes), digest: hash.digest('hex'), serve: opened.serve, version,
+        };
+      }
+      const handle = opened.handle;
+      if (!handle) {
+        throw errno('UNSAFE_ATTACHMENT_DIR', 'attachment helper did not provide source data');
+      }
+      const before = await handle.stat({ bigint: true });
       if (!before.isFile() || before.nlink !== 1n) {
         throw errno('SOURCE_ATTACHMENT_CHANGED', 'source attachment identity is unsafe');
       }
@@ -385,7 +438,7 @@ export class AttachmentStore implements AttachmentStoreLike {
       const chunks: Buffer[] = [];
       const hash = createHash('sha256');
       let bytes = 0;
-      const stream = opened.handle.createReadStream({ autoClose: false, start: 0 });
+      const stream = handle.createReadStream({ autoClose: false, start: 0 });
       try {
         for await (const chunk of stream) {
           const value = Buffer.from(chunk);
@@ -402,7 +455,7 @@ export class AttachmentStore implements AttachmentStoreLike {
         stream.destroy();
         throw error;
       }
-      const after = await opened.handle.stat({ bigint: true });
+      const after = await handle.stat({ bigint: true });
       if (bytes !== Number(before.size) || attachmentFileVersion(after) !== version) {
         throw errno('SOURCE_ATTACHMENT_CHANGED', 'source attachment changed while it was copied');
       }
@@ -413,7 +466,7 @@ export class AttachmentStore implements AttachmentStoreLike {
         version,
       };
     } finally {
-      await opened.handle.close().catch(() => undefined);
+      await opened.handle?.close().catch(() => undefined);
       await closeReadableAttachmentDirectory(opened.directory).catch(() => undefined);
     }
   }
@@ -437,6 +490,7 @@ export class AttachmentStore implements AttachmentStoreLike {
           false,
           this.directoryBackend,
           this.descriptorRoot,
+          this.allowCwdHelper,
         );
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
@@ -477,7 +531,7 @@ export class AttachmentStore implements AttachmentStoreLike {
         serve: opened.serve,
       };
     } finally {
-      await opened.handle.close();
+      await opened.handle?.close();
       await closeReadableAttachmentDirectory(opened.directory);
     }
   }
@@ -515,7 +569,9 @@ export class AttachmentStore implements AttachmentStoreLike {
     // can close because renames and symlink swaps cannot redirect an open inode.
     await closeReadableAttachmentDirectory(opened.directory);
     return {
-      stream: opened.handle.createReadStream({ autoClose: true, start: 0 }),
+      stream: opened.data
+        ? Readable.from(opened.data)
+        : opened.handle!.createReadStream({ autoClose: true, start: 0 }),
       serve: opened.serve,
       bytes: opened.bytes,
     };
@@ -527,7 +583,9 @@ export class AttachmentStore implements AttachmentStoreLike {
     operation: 'resolve' | 'download',
   ): Promise<{
     directory: ReadableAttachmentDirectory;
-    handle: FileHandle;
+    handle: FileHandle | null;
+    data: Buffer | null;
+    cwdStat: CwdAttachmentStat | null;
     serve: ServeKind;
     bytes: number;
   }> {
@@ -544,6 +602,7 @@ export class AttachmentStore implements AttachmentStoreLike {
         false,
         this.directoryBackend,
         this.descriptorRoot,
+        this.allowCwdHelper,
       );
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
@@ -597,6 +656,18 @@ function attachmentFileVersion(stat: BigIntStats): string {
   ].join(':');
 }
 
+function cwdAttachmentVersion(stat: CwdAttachmentStat): string {
+  return [
+    stat.identity.dev,
+    stat.identity.ino,
+    stat.mode,
+    stat.nlink,
+    stat.size,
+    stat.mtimeNs,
+    stat.ctimeNs,
+  ].join(':');
+}
+
 function assertBranchCloneOwners(
   source: AttachmentSessionRef,
   target: AttachmentSessionRef,
@@ -629,13 +700,27 @@ async function inspectStoredAttachment(
   testHooks: AttachmentStoreOptions['testHooks'],
 ): Promise<{
   directory: ReadableAttachmentDirectory;
-  handle: FileHandle;
+  handle: FileHandle | null;
+  data: Buffer | null;
+  cwdStat: CwdAttachmentStat | null;
   serve: ServeKind;
   bytes: number;
 }> {
   let handle: FileHandle | null = null;
   try {
     await testHooks?.afterDirectoryOpened?.(operation);
+    if (directory.mutationPolicy === 'cwd-helper') {
+      const initial = cwdAttachmentStat(directory, storedName);
+      const read = readCompleteCwdAttachment(directory, storedName, initial);
+      return {
+        directory,
+        handle: null,
+        data: read.data,
+        cwdStat: read.stat,
+        bytes: read.stat.size,
+        serve: serveKind(read.data.subarray(0, 64), storedName),
+      };
+    }
     handle = await openAttachmentFile(directory, storedName);
     const stat = await handle.stat();
     if (!stat.isFile()) throw errno('NOT_FOUND', 'no such attachment');
@@ -645,6 +730,8 @@ async function inspectStoredAttachment(
     return {
       directory,
       handle,
+      data: null,
+      cwdStat: null,
       bytes: stat.size,
       serve: serveKind(buffer.subarray(0, bytesRead), storedName),
     };
@@ -675,6 +762,15 @@ async function legacyAttachmentIsReferenced(
     'chat.plan',
   ];
   for (const name of candidates) {
+    const helperLease = workspaceSessionFileParentLease(path.join(accessDir, name));
+    if (helperLease?.entryMutationPolicy === 'cwd-helper') {
+      try {
+        if (await cwdFileContains(helperLease, name, needle)) return true;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+      }
+      continue;
+    }
     const handle = await fsp.open(
       path.join(accessDir, name),
       fsConstants.O_RDONLY | optionalFlag(fsConstants.O_NOFOLLOW),
@@ -690,6 +786,106 @@ async function legacyAttachmentIsReferenced(
     } finally {
       await handle.close();
     }
+  }
+  return false;
+}
+
+type CwdAttachmentStat = {
+  identity: { dev: bigint; ino: bigint };
+  size: number;
+  nlink: bigint;
+  mode: bigint;
+  mtimeNs: bigint;
+  ctimeNs: bigint;
+  birthtimeNs: bigint;
+};
+
+function cwdAttachmentLease(dir: AttachmentFileDirectory) {
+  return syncDirectoryLease(dir.visibleDir, dir.attachments);
+}
+
+function cwdAttachmentStat(
+  dir: AttachmentFileDirectory,
+  storedName: string,
+  expected?: { dev: bigint; ino: bigint },
+): CwdAttachmentStat {
+  const result = statWorkspaceCwdFile(cwdAttachmentLease(dir), storedName, expected);
+  if (result.dev === undefined || result.ino === undefined
+    || result.mtimeNs === undefined || result.ctimeNs === undefined || result.birthtimeNs === undefined) {
+    throw errno('UNSAFE_ATTACHMENT_DIR', 'attachment helper omitted file identity');
+  }
+  const size = Number(result.size);
+  if (!Number.isSafeInteger(size) || size < 0) {
+    throw errno('UNSAFE_ATTACHMENT_DIR', 'attachment helper returned an invalid file size');
+  }
+  return {
+    identity: { dev: result.dev, ino: result.ino }, size,
+    nlink: BigInt(result.nlink), mode: BigInt(result.mode),
+    mtimeNs: BigInt(result.mtimeNs), ctimeNs: BigInt(result.ctimeNs), birthtimeNs: BigInt(result.birthtimeNs),
+  };
+}
+
+function sameCwdAttachmentVersion(left: CwdAttachmentStat, right: CwdAttachmentStat): boolean {
+  return left.identity.dev === right.identity.dev
+    && left.identity.ino === right.identity.ino
+    && left.size === right.size
+    && left.nlink === right.nlink
+    && left.mode === right.mode
+    && left.mtimeNs === right.mtimeNs
+    && left.ctimeNs === right.ctimeNs
+    && left.birthtimeNs === right.birthtimeNs;
+}
+
+function readCompleteCwdAttachment(
+  dir: AttachmentFileDirectory,
+  storedName: string,
+  initial?: CwdAttachmentStat,
+): { data: Buffer; stat: CwdAttachmentStat } {
+  const before = initial ?? cwdAttachmentStat(dir, storedName);
+  if (before.size > DEFAULT_MAX_ATTACHMENT_BYTES) {
+    throw errno('FILE_TOO_LARGE', 'attachment exceeds the supported size');
+  }
+  const read = readCompleteWorkspaceCwdFile(cwdAttachmentLease(dir), storedName, DEFAULT_MAX_ATTACHMENT_BYTES);
+  if (read.identity.dev !== before.identity.dev || read.identity.ino !== before.identity.ino) {
+    throw errno('UNSAFE_ATTACHMENT_DIR', 'attachment changed while helper read it');
+  }
+  const after = cwdAttachmentStat(dir, storedName, before.identity);
+  if (!sameCwdAttachmentVersion(before, after) || read.data.length !== before.size) {
+    throw errno('UNSAFE_ATTACHMENT_DIR', 'attachment changed while helper read it');
+  }
+  return { data: read.data, stat: after };
+}
+
+async function cwdFileContains(
+  lease: ReturnType<typeof workspaceSessionFileParentLease> & {},
+  name: string,
+  needle: Buffer,
+): Promise<boolean> {
+  if (!lease) return false;
+  const initial = statWorkspaceCwdFile(lease, name);
+  if (initial.dev === undefined || initial.ino === undefined) {
+    throw errno('UNSAFE_ATTACHMENT_DIR', 'workspace helper omitted legacy file identity');
+  }
+  const size = Number(initial.size);
+  if (!Number.isSafeInteger(size) || size < 0) {
+    throw errno('UNSAFE_ATTACHMENT_DIR', 'workspace helper returned an invalid legacy file size');
+  }
+  let carry = Buffer.alloc(0);
+  for (let offset = 0; offset < size;) {
+    const response = readWorkspaceCwdFile(
+      lease, name, offset, Math.min(64 * 1024, size - offset), { dev: initial.dev, ino: initial.ino },
+    );
+    if (response.size !== initial.size || response.mtimeNs !== initial.mtimeNs || response.ctimeNs !== initial.ctimeNs) {
+      throw errno('UNSAFE_ATTACHMENT_DIR', 'legacy attachment reference changed while reading');
+    }
+    const chunk = Buffer.from(response.data, 'base64');
+    if (chunk.length === 0 || chunk.length > size - offset) {
+      throw errno('UNSAFE_ATTACHMENT_DIR', 'workspace helper returned an invalid legacy read');
+    }
+    const combined = carry.length ? Buffer.concat([carry, chunk]) : chunk;
+    if (combined.includes(needle)) return true;
+    carry = combined.subarray(Math.max(0, combined.length - needle.length + 1));
+    offset += chunk.length;
   }
   return false;
 }
@@ -784,6 +980,22 @@ export function serveKind(head: Buffer, storedName: string): ServeKind {
 }
 
 async function usage(dir: OpenAttachmentDirectory): Promise<{ files: number; bytes: number }> {
+  if (dir.mutationPolicy === 'cwd-helper') {
+    let files = 0;
+    let bytes = 0;
+    for (const entry of listWorkspaceCwdEntries(cwdAttachmentLease(dir))) {
+      if (entry.type !== 'file') continue;
+      if (entry.size > BigInt(Number.MAX_SAFE_INTEGER)) {
+        throw errno('UNSAFE_ATTACHMENT_DIR', 'attachment helper returned an oversized file');
+      }
+      files += 1;
+      bytes += Number(entry.size);
+      if (!Number.isSafeInteger(bytes)) {
+        throw errno('UNSAFE_ATTACHMENT_DIR', 'attachment usage exceeds a safe integer');
+      }
+    }
+    return { files, bytes };
+  }
   if (dir.backend === 'path') await verifyVisibleDirectory(dir);
   const root = attachmentDirectoryAccessPath(dir);
   const entries = await fsp.readdir(root, { withFileTypes: true });
@@ -918,22 +1130,29 @@ type ReadableAttachmentDirectory = OpenAttachmentDirectory | OpenLegacyAttachmen
  *
  * Node has no public openat(2), so a capability-probed
  * `/proc/self/fd/<n>/child` or `/dev/fd/<n>/child` is the Unix equivalent.
- * Path traversal remains useful for inode-verified reads; entry mutations use
- * it only on Windows volumes where the shared probe proves live handles deny
- * both rename and removal. Every other pathname fallback is read-only.
+ * Path traversal remains useful for inode-verified reads; on Windows and
+ * pathname-only POSIX hosts, entry mutations are delegated to the cwd helper.
+ * An explicitly requested path fallback remains read-only.
  */
 async function openAttachmentDirectory(
   identity: AttachmentStorageIdentity,
   create: boolean,
   backend: ResolvedAttachmentDirectoryBackend,
   descriptorRoot: string | null,
+  allowCwdHelper: boolean,
 ): Promise<OpenAttachmentDirectory> {
   const resolvedWorkingDir = path.resolve(identity.workspaceRoot);
   if (resolvedWorkingDir === path.parse(resolvedWorkingDir).root) {
     throw errno('UNSAFE_ATTACHMENT_DIR', 'refusing an attachment directory at filesystem root');
   }
 
-  const realWorkingDir = await fsp.realpath(resolvedWorkingDir).catch(() => '');
+  const useCwdProof = allowCwdHelper && backend === 'path';
+  const rootProof = useCwdProof
+    ? openCanonicalDirectoryLeaseSync(resolvedWorkingDir, { forceCwdHelper: true })
+    : null;
+  const realWorkingDir = rootProof
+    ? rootProof.canonicalPath
+    : await fsp.realpath(resolvedWorkingDir).catch(() => '');
   if (!realWorkingDir) {
     throw errno('UNSAFE_ATTACHMENT_DIR', 'attachment working directory does not exist');
   }
@@ -943,13 +1162,15 @@ async function openAttachmentDirectory(
   let owner: FileHandle | null = null;
   let attachments: FileHandle | null = null;
   try {
-    working = await openDirectory(realWorkingDir, realWorkingDir);
-    const mutationPolicy = resolveWorkspaceEntryMutationPolicy(
+    working = rootProof ? directoryProofFileHandle(rootProof) : await openDirectory(realWorkingDir, realWorkingDir);
+    const mutationPolicy = !allowCwdHelper && backend === 'path'
+      ? 'deny'
+      : resolveWorkspaceEntryMutationPolicy(
       descriptorRoot,
       process.platform,
       backend === 'path'
         && workspacePathMutationsAreHandlePinned(realWorkingDir, working.fd),
-    );
+      );
     container = await openChildDirectory(
       working,
       realWorkingDir,
@@ -1026,14 +1247,20 @@ async function openLegacyAttachmentDirectory(
   if (resolvedWorkingDir === path.parse(resolvedWorkingDir).root) {
     throw errno('UNSAFE_ATTACHMENT_DIR', 'refusing an attachment directory at filesystem root');
   }
-  const realWorkingDir = await fsp.realpath(resolvedWorkingDir).catch(() => '');
+  const useCwdProof = backend === 'path';
+  const rootProof = useCwdProof
+    ? openCanonicalDirectoryLeaseSync(resolvedWorkingDir, { forceCwdHelper: true })
+    : null;
+  const realWorkingDir = rootProof
+    ? rootProof.canonicalPath
+    : await fsp.realpath(resolvedWorkingDir).catch(() => '');
   if (!realWorkingDir) throw errno('UNSAFE_ATTACHMENT_DIR', 'attachment workspace does not exist');
 
   let working: FileHandle | null = null;
   let container: FileHandle | null = null;
   let attachments: FileHandle | null = null;
   try {
-    working = await openDirectory(realWorkingDir, realWorkingDir);
+    working = rootProof ? directoryProofFileHandle(rootProof) : await openDirectory(realWorkingDir, realWorkingDir);
     const mutationPolicy = resolveWorkspaceEntryMutationPolicy(
       descriptorRoot,
       process.platform,
@@ -1078,11 +1305,13 @@ async function openLegacyAttachmentDirectory(
 
 async function openDirectory(target: string, expectedRealPath: string): Promise<FileHandle> {
   let handle: FileHandle;
+  let beforeIdentity: { dev: bigint; ino: bigint };
   try {
-    const before = await fsp.lstat(target);
+    const before = await fsp.lstat(target, { bigint: true });
     if (before.isSymbolicLink() || !before.isDirectory()) {
       throw errno('UNSAFE_ATTACHMENT_DIR', 'attachment path component is not a real directory');
     }
+    beforeIdentity = { dev: before.dev, ino: before.ino };
     handle = await fsp.open(
       target,
       fsConstants.O_RDONLY | optionalFlag(fsConstants.O_DIRECTORY) | optionalFlag(fsConstants.O_NOFOLLOW),
@@ -1098,12 +1327,29 @@ async function openDirectory(target: string, expectedRealPath: string): Promise<
     throw error;
   }
   try {
+    const opened = await handle.stat({ bigint: true });
+    if (opened.dev !== beforeIdentity!.dev || opened.ino !== beforeIdentity!.ino) {
+      throw errno('UNSAFE_ATTACHMENT_DIR', 'attachment directory changed while opening');
+    }
     await verifyPathBinding(expectedRealPath, handle, 'directory');
     return handle;
   } catch (error) {
     await handle.close().catch(() => undefined);
     throw error;
   }
+}
+
+function directoryProofFileHandle(
+  proof: ReturnType<typeof openCanonicalDirectoryLeaseSync>,
+): FileHandle {
+  return {
+    fd: proof.fd,
+    stat: async (options?: { bigint?: boolean }) => fsSync.fstatSync(
+      proof.fd,
+      options?.bigint ? { bigint: true } : undefined,
+    ),
+    close: async () => { proof.close(); },
+  } as unknown as FileHandle;
 }
 
 async function openChildDirectory(
@@ -1120,6 +1366,13 @@ async function openChildDirectory(
   const target = backend === 'descriptor'
     ? path.join(descriptorAccessPath(parent, descriptorRoot), name)
     : visibleTarget;
+  if (mutationPolicy === 'cwd-helper') {
+    const lease = syncDirectoryLease(visibleParent, parent);
+    const identity = create
+      ? ensureWorkspaceCwdDirectory(lease, name, true)
+      : inspectWorkspaceCwdDirectory(lease, name);
+    return openVerifiedChild(target, visibleTarget, parent, visibleParent, identity);
+  }
   try {
     return await openVerifiedChild(target, visibleTarget, parent, visibleParent);
   } catch (error) {
@@ -1138,9 +1391,16 @@ async function openVerifiedChild(
   visibleTarget: string,
   parent: FileHandle,
   visibleParent: string,
+  expected?: { dev?: bigint; ino?: bigint },
 ): Promise<FileHandle> {
   const opened = await openDirectory(target, visibleTarget);
   try {
+    if (expected?.dev !== undefined && expected.ino !== undefined) {
+      const identity = await opened.stat({ bigint: true });
+      if (identity.dev !== expected.dev || identity.ino !== expected.ino) {
+        throw errno('UNSAFE_ATTACHMENT_DIR', 'attachment child does not match helper-created inode');
+      }
+    }
     await verifyPathBinding(visibleParent, parent, 'directory');
     return opened;
   } catch (error) {
@@ -1153,6 +1413,24 @@ function optionalFlag(value: number | undefined): number {
   return typeof value === 'number' ? value : 0;
 }
 
+function syncDirectoryLease(visiblePath: string, handle: FileHandle): {
+  canonicalPath: string; fd: number; verify(): void;
+} {
+  return {
+    canonicalPath: visiblePath,
+    fd: handle.fd,
+    verify: () => {
+      const visible = fsSync.lstatSync(visiblePath, { bigint: true });
+      const opened = fsSync.fstatSync(handle.fd, { bigint: true });
+      if (visible.isSymbolicLink() || !visible.isDirectory() || !opened.isDirectory()
+        || visible.dev !== opened.dev || visible.ino !== opened.ino
+        || fsSync.realpathSync(visiblePath) !== visiblePath) {
+        throw errno('UNSAFE_ATTACHMENT_DIR', 'attachment helper parent changed');
+      }
+    },
+  };
+}
+
 function requireAttachmentEntryMutation(
   policy: WorkspaceEntryMutationPolicy,
   target: string,
@@ -1160,7 +1438,7 @@ function requireAttachmentEntryMutation(
   if (policy !== 'deny') return;
   throw errno(
     'UNSAFE_ATTACHMENT_DIR',
-    `attachment entry mutation requires descriptor-relative or handle-pinned access: ${target}`,
+    `attachment entry mutation requires descriptor-relative or cwd-bound helper access: ${target}`,
   );
 }
 
@@ -1233,9 +1511,17 @@ function sameFileIdentity(left: Awaited<ReturnType<FileHandle['stat']>>, right: 
 async function createAttachmentFile(
   dir: OpenAttachmentDirectory,
   storedName: string,
-): Promise<FileHandle> {
+  bytes: Buffer,
+): Promise<FileHandle | null> {
   requireAttachmentEntryMutation(dir.mutationPolicy, dir.visibleDir);
   if (dir.backend === 'path') await verifyVisibleDirectory(dir);
+  if (dir.mutationPolicy === 'cwd-helper') {
+    const expected = createTemporaryWorkspaceCwdFile(
+      syncDirectoryLease(dir.visibleDir, dir.attachments), storedName, bytes,
+    );
+    verifyCwdAttachmentFile(dir, storedName, expected);
+    return null;
+  }
   const handle = await fsp.open(
     path.join(attachmentDirectoryAccessPath(dir), storedName),
     fsConstants.O_WRONLY
@@ -1257,19 +1543,44 @@ async function createAttachmentFile(
 async function openAttachmentFile(
   dir: AttachmentFileDirectory,
   storedName: string,
+  expected?: { dev?: bigint; ino?: bigint },
 ): Promise<FileHandle> {
+  if (dir.mutationPolicy === 'cwd-helper') {
+    throw errno('UNSAFE_ATTACHMENT_DIR', 'cwd-helper attachment reads must stay in the helper');
+  }
   if (dir.backend === 'path') await verifyVisibleDirectory(dir);
   const handle = await fsp.open(
     path.join(attachmentDirectoryAccessPath(dir), storedName),
     fsConstants.O_RDONLY | optionalFlag(fsConstants.O_NOFOLLOW),
   );
   try {
+    if (expected?.dev !== undefined && expected.ino !== undefined) {
+      const identity = await handle.stat({ bigint: true });
+      if (identity.dev !== expected.dev || identity.ino !== expected.ino) {
+        throw errno('UNSAFE_ATTACHMENT_DIR', 'attachment file does not match helper-created inode');
+      }
+    }
     if (dir.backend === 'path') await verifyVisibleFile(dir, storedName, handle);
     return handle;
   } catch (error) {
     await handle.close().catch(() => undefined);
     throw error;
   }
+}
+
+function verifyCwdAttachmentFile(
+  dir: AttachmentFileDirectory,
+  storedName: string,
+  expected?: { dev?: bigint; ino?: bigint },
+): CwdAttachmentStat {
+  const identity = expected?.dev !== undefined && expected.ino !== undefined
+    ? { dev: expected.dev, ino: expected.ino }
+    : undefined;
+  const stat = cwdAttachmentStat(dir, storedName, identity);
+  if (stat.nlink !== 1n) {
+    throw errno('UNSAFE_ATTACHMENT_DIR', 'attachment helper file has an unsafe link count');
+  }
+  return stat;
 }
 
 async function verifyVisibleFile(
@@ -1288,7 +1599,16 @@ async function removeCreatedAttachment(
 ): Promise<void> {
   requireAttachmentEntryMutation(dir.mutationPolicy, dir.visibleDir);
   if (dir.backend === 'path') await verifyVisibleDirectory(dir);
-  await fsp.rm(path.join(attachmentDirectoryAccessPath(dir), storedName), { force: true });
+  if (dir.mutationPolicy === 'cwd-helper') {
+    const entry = verifyCwdAttachmentFile(dir, storedName);
+    removeWorkspaceCwdEntry(
+      syncDirectoryLease(dir.visibleDir, dir.attachments),
+      storedName,
+      entry.identity,
+    );
+  } else {
+    await fsp.rm(path.join(attachmentDirectoryAccessPath(dir), storedName), { force: true });
+  }
   if (dir.backend === 'path') await verifyVisibleDirectory(dir);
 }
 
@@ -1296,17 +1616,30 @@ async function deleteAttachmentNamespace(dir: OpenAttachmentDirectory): Promise<
   requireAttachmentEntryMutation(dir.mutationPolicy, dir.visibleDir);
   await verifyVisibleDirectory(dir);
   const accessRoot = attachmentDirectoryAccessPath(dir);
-  const entries = await fsp.readdir(accessRoot, { withFileTypes: true });
-  if (entries.some((entry) => !entry.isFile() || !STORED_NAME.test(entry.name))) {
-    throw errno('UNSAFE_ATTACHMENT_DIR', 'attachment namespace contains an unsafe entry');
-  }
-  for (const entry of entries) {
-    // This namespace is application-owned, but fail closed on an unexpected
-    // directory, symlink or filename rather than turning session deletion into
-    // an arbitrary recursive remover.
+  if (dir.mutationPolicy === 'cwd-helper') {
+    const entries = listWorkspaceCwdEntries(cwdAttachmentLease(dir));
+    if (entries.some((entry) => entry.type !== 'file' || !STORED_NAME.test(entry.name))) {
+      throw errno('UNSAFE_ATTACHMENT_DIR', 'attachment namespace contains an unsafe entry');
+    }
+    for (const entry of entries) {
+      const expected = { dev: entry.dev, ino: entry.ino };
+      const current = verifyCwdAttachmentFile(dir, entry.name, expected);
+      removeWorkspaceCwdEntry(
+        cwdAttachmentLease(dir), entry.name, current.identity,
+      );
+    }
+  } else {
+    const entries = await fsp.readdir(accessRoot, { withFileTypes: true });
+    if (entries.some((entry) => !entry.isFile() || !STORED_NAME.test(entry.name))) {
+      throw errno('UNSAFE_ATTACHMENT_DIR', 'attachment namespace contains an unsafe entry');
+    }
+    for (const entry of entries) {
+      // This namespace is application-owned, but fail closed on an unexpected
+      // directory, symlink or filename rather than turning session deletion into
+      // an arbitrary recursive remover.
     const handle = await openAttachmentFile(dir, entry.name);
     try {
-      const stat = await handle.stat();
+      const stat = await handle.stat({ bigint: true });
       if (!stat.isFile()) {
         throw errno('UNSAFE_ATTACHMENT_DIR', 'attachment changed during session deletion');
       }
@@ -1324,18 +1657,28 @@ async function deleteAttachmentNamespace(dir: OpenAttachmentDirectory): Promise<
       await verifyVisibleDirectory(dir);
     }
   }
+  }
 
   await verifyVisibleDirectory(dir);
   const visibleOwner = path.dirname(dir.visibleDir);
   await verifyPathBinding(visibleOwner, dir.owner, 'directory');
-  // Windows will not remove a directory while its validation handle is open.
-  // Closing only the exact session handle leaves the owner/sibling binding in
-  // place for the rmdir and its post-check.
+  const helperDirectoryIdentity = await dir.attachments.stat({ bigint: true });
+  // Windows will not remove the process cwd used by the helper. Close this
+  // separate validation handle before asking that child to perform rmdir.
   await dir.attachments.close().catch(() => undefined);
   const target = dir.backend === 'descriptor'
     ? path.join(descriptorAccessPath(dir.owner, dir.descriptorRoot), path.basename(dir.visibleDir))
     : dir.visibleDir;
-  await fsp.rmdir(target);
+  if (dir.mutationPolicy === 'cwd-helper') {
+    removeWorkspaceCwdEntry(
+      syncDirectoryLease(visibleOwner, dir.owner),
+      path.basename(dir.visibleDir),
+      { dev: helperDirectoryIdentity.dev, ino: helperDirectoryIdentity.ino },
+      true,
+    );
+  } else {
+    await fsp.rmdir(target);
+  }
   await verifyPathBinding(visibleOwner, dir.owner, 'directory');
 }
 

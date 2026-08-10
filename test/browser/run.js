@@ -1,25 +1,24 @@
 #!/usr/bin/env node
 // Bundles the browser checks, runs them in headless Chrome, and fails the
 // process if any check reports FAIL.
-const { execFile, spawn, spawnSync } = require('child_process');
+const { execFile, spawn } = require('child_process');
 const fs = require('fs');
 const http = require('http');
 const os = require('os');
 const path = require('path');
 const WebSocket = require('ws');
+const { findCommand } = require('./find-command.js');
 
 const dir = __dirname;
-const chrome = ['google-chrome', 'google-chrome-stable', 'chromium', 'chromium-browser'].find((bin) => {
-  return spawnSync('which', [bin], { stdio: 'ignore' }).status === 0;
-});
+const strict = process.argv.slice(2).includes('--strict') || Boolean(process.env.CI);
+const chrome = findCommand(['google-chrome', 'google-chrome-stable', 'chromium', 'chromium-browser']);
 
 if (!chrome) {
-  // Skipping is a convenience for a machine that happens to have no browser,
-  // never for CI: these checks are the only thing covering defects that a
-  // layout engine has to be running to see, and a silent skip there would
-  // report a green build for a suite that never ran.
-  if (process.env.CI) {
-    console.error('No Chrome/Chromium on PATH. CI must run the browser checks, not skip them.');
+  // Skipping is a convenience for a non-strict local run that happens to have
+  // no browser. Strict runs are the release gate for defects only a layout
+  // engine can expose, so they must fail rather than report a false green.
+  if (strict) {
+    console.error('No Chrome/Chromium on PATH. Strict browser checks must run, not skip.');
     process.exit(1);
   }
   console.log('Skipping browser checks: no Chrome/Chromium on PATH.');
@@ -31,6 +30,7 @@ if (!fs.existsSync(path.join(dir, '..', '..', 'dist', 'public', 'css', 'componen
   process.exit(1);
 }
 
+function prepareBrowserFixtures() {
 // What a real workflow reports, in the form the browser receives it (#117).
 //
 // Derived here rather than written into checks.ts, because a check driven by
@@ -159,6 +159,7 @@ require('esbuild').buildSync({
   minify: true,
   target: require('../../scripts/client-bundle.js').CLIENT_TARGET,
 });
+}
 
 // Served over HTTP rather than opened from disk, because one of the things
 // under test is a chunk the app fetches by absolute path at runtime: from a
@@ -215,7 +216,68 @@ const server = http.createServer((request, response) => {
   fs.createReadStream(found).pipe(response);
 });
 
-server.listen(0, '127.0.0.1', () => run(server.address().port));
+// Probe loopback before starting the real fixture server. Some managed
+// environments deny listeners outright; report that as a clean local skip,
+// while strict mode must fail before Chrome is launched (and before an
+// uncaught listen error can leave the process hanging).
+function probeLoopback(timeoutMilliseconds = 2_000) {
+  return new Promise((resolve, reject) => {
+    const probe = http.createServer();
+    let settled = false;
+    let timer;
+    const finish = (error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      try { probe.close(); } catch {}
+      if (error) reject(error);
+      else resolve();
+    };
+    const onError = (error) => {
+      finish(error);
+    };
+    timer = setTimeout(() => {
+      const error = Object.assign(new Error(`listener did not become ready within ${timeoutMilliseconds}ms`), {
+        code: 'ETIMEDOUT',
+      });
+      finish(error);
+    }, timeoutMilliseconds);
+    probe.once('error', onError);
+    try {
+      probe.listen(0, '127.0.0.1', () => probe.close((error) => finish(error)));
+      probe.unref();
+    } catch (error) {
+      finish(error);
+    }
+  });
+}
+
+async function startFixtureServer() {
+  try {
+    await probeLoopback();
+  } catch (error) {
+    const message = `loopback listener unavailable: ${String(error?.message || error)}`;
+    if (strict) {
+      console.error(`Strict browser checks cannot run: ${message}`);
+      process.exitCode = 1;
+    } else {
+      console.log(`Skipping browser checks: ${message}`);
+    }
+    return;
+  }
+  prepareBrowserFixtures();
+  server.once('error', (error) => {
+    const message = `loopback listener unavailable: ${String(error?.message || error)}`;
+    console.error(`Browser checks failed after the loopback preflight: ${message}`);
+    process.exitCode = 1;
+  });
+  server.listen(0, '127.0.0.1', () => run(server.address().port));
+}
+
+startFixtureServer().catch((error) => {
+  console.error(`Browser checks could not start: ${String(error?.stack || error)}`);
+  process.exitCode = 1;
+});
 
 function timeout(promise, milliseconds, label) {
   let timer;

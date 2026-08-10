@@ -4,6 +4,7 @@ const crypto = require('node:crypto');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
+const YAML = require('yaml');
 
 const root = path.join(__dirname, '..');
 const read = (...parts) => fs.readFileSync(path.join(root, ...parts), 'utf8');
@@ -71,6 +72,7 @@ function createReleaseFixture(version = '6.1.0') {
 describe('desktop release update pipeline', function () {
   it('pins native updates to the project and supports optional release signing', function () {
     const builder = read('electron-builder.yml');
+    const notarize = read('scripts', 'notarize.js');
     const pkg = JSON.parse(read('package.json'));
     assert.match(builder, /publish:\s*\n\s*provider: github\s*\n\s*owner: dnviti\s*\n\s*repo: code-agents-webcli/);
     assert.match(builder, /forceCodeSigning: false/);
@@ -78,6 +80,8 @@ describe('desktop release update pipeline', function () {
     assert.match(builder, /entitlements: build\/entitlements\.mac\.plist/);
     assert.match(builder, /- zip/);
     assert.match(builder, /afterSign: scripts\/notarize\.js/);
+    assert.match(notarize, /CODE_AGENTS_WEBCLI_SKIP_NOTARIZATION === '1'/);
+    assert.match(notarize, /cannot be both required and explicitly disabled/);
     assert.match(builder, /--talk-name=org\.freedesktop\.portal\.Flatpak/);
     assert.match(builder, /--talk-name=org\.freedesktop\.Flatpak/);
     assert.match(builder, /flatpak-update-public-key\.asc/);
@@ -114,6 +118,9 @@ describe('desktop release update pipeline', function () {
     assert.match(workflow, /--config\.publish\.channel=latest-x64/);
     assert.match(workflow, /--config\.publish\.channel=latest-arm64/);
     assert.match(workflow, /--config\.forceCodeSigning=\$signing/);
+    assert.match(workflow, /--config\.win\.signExecutable=false/);
+    assert.match(workflow, /--config\.mac\.identity=null/);
+    assert.match(workflow, /--config\.mac\.hardenedRuntime=false/);
     assert.match(workflow, /signing is not configured; the package will be built unsigned/);
     assert.match(workflow, /Incomplete \$platform signing identity/);
     assert.match(workflow, /needs\.release-identities\.outputs\.all_signed == 'true'/);
@@ -130,6 +137,12 @@ describe('desktop release update pipeline', function () {
     assert.match(workflow, /TeamIdentifier/);
     assert.match(workflow, /MACOS_CERT_AUTHORITY/);
     assert.match(workflow, /release\/\*\.zip\.blockmap/);
+    assert.match(workflow, /Code-Agents-Web-CLI-\$\{VERSION\}-mac-x64\.dmg/);
+    assert.match(workflow, /Code-Agents-Web-CLI-\$\{VERSION\}-mac-arm64\.dmg/);
+    assert.match(workflow, /Code-Agents-Web-CLI-\$\{VERSION\}-mac-x64\.zip/);
+    assert.match(workflow, /Code-Agents-Web-CLI-\$\{VERSION\}-mac-arm64\.zip/);
+    assert.match(workflow, /latest-x64-mac\.yml/);
+    assert.match(workflow, /latest-arm64-mac\.yml/);
     assert.doesNotMatch(workflow, /release\/\*\.AppImage\.blockmap/);
     assert.match(workflow, /cp -a docs\/\. pages-root\//);
     assert.match(workflow, /flatpak-candidates\/\$\{\{ needs\.verify\.outputs\.tag \}\}/);
@@ -158,6 +171,86 @@ describe('desktop release update pipeline', function () {
     }
   });
 
+  it('builds and smokes unsigned native packages on each supported desktop host', function () {
+    const ci = read('.github', 'workflows', 'ci.yml');
+    const pkg = JSON.parse(read('package.json'));
+    assert.strictEqual(pkg.engines.node, '>=24.16.0');
+    for (const script of [
+      'desktop:dist:win:unsigned',
+      'desktop:dist:mac:x64:unsigned',
+      'desktop:dist:mac:arm64:unsigned',
+    ]) assert.ok(pkg.scripts[script], `missing ${script}`);
+    assert.match(pkg.scripts['desktop:dist:win:unsigned'], /--config\.win\.signExecutable=false/);
+    assert.match(pkg.scripts['desktop:dist:mac:x64:unsigned'], /--config\.mac\.identity=null/);
+    assert.match(pkg.scripts['desktop:dist:mac:arm64:unsigned'], /--config\.mac\.identity=null/);
+    assert.match(pkg.scripts['desktop:dist:mac:x64:unsigned'], /--config\.mac\.hardenedRuntime=false/);
+    assert.match(pkg.scripts['desktop:dist:mac:arm64:unsigned'], /--config\.mac\.hardenedRuntime=false/);
+    assert.match(pkg.scripts['desktop:dist:mac:x64:unsigned'], /CODE_AGENTS_WEBCLI_SKIP_NOTARIZATION=1/);
+    assert.match(pkg.scripts['desktop:dist:mac:arm64:unsigned'], /CODE_AGENTS_WEBCLI_SKIP_NOTARIZATION=1/);
+    assert.match(ci, /native-packaged-smoke:/);
+    for (const runner of ['windows-latest', 'macos-15-intel', 'macos-15']) {
+      assert.match(ci, new RegExp(`os: ${runner}`));
+    }
+    assert.match(ci, /DESKTOP_WORKSPACE_ATTACHMENT_SMOKE_OK/);
+    assert.match(ci, /WORKSPACE_ENTRY_HELPER_OK app\.asar/);
+    assert.match(ci, /Exercise the native workspace helper and serialized database/);
+    assert.match(ci, /npm run test:strict -- --test-file test\/workspace-portable-storage\.test\.js --test-file test\/sqlite-adapter\.test\.js/);
+    assert.doesNotMatch(ci, /npx mocha --exit test\/workspace-portable-storage\.test\.js test\/sqlite-adapter\.test\.js/);
+    assert.doesNotMatch(ci, /run:\s+npm test(?:\s|$)/);
+  });
+
+  it('requires and validates the complete unsigned updater asset set before publishing', function () {
+    const workflow = read('.github', 'workflows', 'release-on-main.yml');
+    const unsigned = workflow.slice(
+      workflow.indexOf('  unsigned-release:'),
+      workflow.indexOf('\n  flatpak-pages-stage:'),
+    );
+    assert.match(
+      unsigned,
+      /node "\$GITHUB_WORKSPACE\/scripts\/validate-release-assets\.js" "\$PWD" "\$VERSION" --unsigned/,
+    );
+    const packageLoop = /for name in \\\n([\s\S]*?)\s*; do/.exec(unsigned);
+    assert.ok(packageLoop, 'unsigned release must name its complete expected asset set');
+    const namedAssets = [...packageLoop[1].matchAll(/['"]([^'"]+)['"]/g)].map((match) => match[1]);
+    assert.deepStrictEqual(namedAssets, [
+      'Code-Agents-Web-CLI-${VERSION}-linux-x64.AppImage',
+      'Code-Agents-Web-CLI-${VERSION}-linux-x64.deb',
+      'Code-Agents-Web-CLI-${VERSION}-linux-x64.rpm',
+      'Code-Agents-Web-CLI-${VERSION}-linux-x64.flatpak',
+      'Code-Agents-Web-CLI-${VERSION}-win-x64.exe',
+      'Code-Agents-Web-CLI-${VERSION}-win-x64.exe.blockmap',
+      'Code-Agents-Web-CLI-${VERSION}-mac-x64.dmg',
+      'Code-Agents-Web-CLI-${VERSION}-mac-arm64.dmg',
+      'Code-Agents-Web-CLI-${VERSION}-mac-x64.zip',
+      'Code-Agents-Web-CLI-${VERSION}-mac-arm64.zip',
+      'Code-Agents-Web-CLI-${VERSION}-mac-x64.zip.blockmap',
+      'Code-Agents-Web-CLI-${VERSION}-mac-arm64.zip.blockmap',
+      'latest.yml',
+      'latest-linux.yml',
+      'latest-x64-mac.yml',
+      'latest-arm64-mac.yml',
+    ]);
+  });
+
+  it('fails closed rather than publishing an interrupted signed draft as unsigned', function () {
+    const workflow = YAML.parse(read('.github', 'workflows', 'release-on-main.yml'));
+    const unsigned = workflow.jobs['unsigned-release'];
+    const guard = unsigned.steps.find((step) => step.name === 'Refuse unsigned resume of a draft release');
+    assert.ok(guard, 'the unsigned job must have an explicit draft-resume guard');
+    assert.strictEqual(guard.if, "needs.verify.outputs.resume_draft == 'true'");
+    assert.match(guard.run, /interrupted signed draft can contain signed-only assets/i);
+    assert.match(guard.run, /Delete the draft release manually, then re-run this tag workflow from a clean release slot/i);
+    assert.match(guard.run, /exit 1/);
+
+    const releaseCheck = unsigned.steps.find((step) => step.name === 'Refuse to replace an already published release');
+    assert.ok(releaseCheck, 'the unsigned job must check its release slot before publishing');
+    assert.doesNotMatch(releaseCheck.run, /200:true\) ;;/);
+    assert.match(
+      releaseCheck.run,
+      /200:true\) echo "Unsigned releases cannot resume draft \$tag; delete the draft and restart from a clean release slot\." >&2; exit 1 ;;/,
+    );
+  });
+
   it('exposes only boolean signing decisions from the protected identity check', function () {
     const workflow = read('.github', 'workflows', 'release-on-main.yml');
     const identityJob = workflow.slice(
@@ -170,6 +263,7 @@ describe('desktop release update pipeline', function () {
     assert.match(identityJob, /all_signed: .*outputs\.all_signed/);
     assert.doesNotMatch(identityJob, /echo .*CSC_LINK.*GITHUB_OUTPUT/);
     assert.doesNotMatch(identityJob, /echo .*GPG_PRIVATE_KEY.*GITHUB_OUTPUT/);
+    assert.match(identityJob, /Partial desktop signing configuration is unsafe/);
     assert.match(workflow, /runner\.os == 'macOS' && secrets\.MACOS_CSC_LINK \|\| ''/);
   });
 
@@ -196,6 +290,30 @@ describe('desktop release update pipeline', function () {
       delete appImageManifest.files[0].blockMapSize;
       fs.writeFileSync(path.join(fixture.directory, 'latest-linux.yml'), JSON.stringify(appImageManifest));
       assert.throws(validate, /positive embedded blockMapSize/);
+    } finally {
+      fs.rmSync(fixture.directory, { recursive: true, force: true });
+    }
+  });
+
+  it('validates unsigned updater manifests without requiring unavailable Flatpak remote descriptors', function () {
+    const fixture = createReleaseFixture();
+    const validateUnsigned = () => childProcess.execFileSync('node', [
+      'scripts/validate-release-assets.js', fixture.directory, fixture.version, '--unsigned',
+    ], { cwd: root, encoding: 'utf8', stdio: 'pipe' });
+    try {
+      for (const key of ['flatpakRef', 'flatpakRepo']) {
+        fs.rmSync(path.join(fixture.directory, fixture.names[key]));
+      }
+      const checksums = fs.readFileSync(path.join(fixture.directory, 'SHA256SUMS'), 'utf8')
+        .split('\n')
+        .filter((line) => !line.endsWith(fixture.names.flatpakRef) && !line.endsWith(fixture.names.flatpakRepo))
+        .join('\n');
+      fs.writeFileSync(path.join(fixture.directory, 'SHA256SUMS'), checksums);
+      assert.match(validateUnsigned(), /exact updater metadata.*unsigned/);
+
+      fixture.manifests['latest.yml'].files[0].sha512 = 'not-the-asset-hash';
+      fs.writeFileSync(path.join(fixture.directory, 'latest.yml'), JSON.stringify(fixture.manifests['latest.yml']));
+      assert.throws(validateUnsigned, /sha512 does not match/);
     } finally {
       fs.rmSync(fixture.directory, { recursive: true, force: true });
     }

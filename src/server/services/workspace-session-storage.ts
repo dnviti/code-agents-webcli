@@ -2,6 +2,12 @@ import { randomBytes } from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import {
+  ensureWorkspaceCwdDirectory,
+  hardenWorkspaceCwdFile,
+  inspectWorkspaceCwdDirectory,
+  runWorkspaceCwdHelper,
+} from './workspace-cwd-helper.js';
 
 /**
  * An optional, immutable location for artefacts which belong to one workspace.
@@ -44,7 +50,6 @@ interface SessionDirectoryLeaseRecord {
 
 const sessionDirectoryLeases = new Map<string, SessionDirectoryLeaseRecord>();
 let descriptorRootCache: string | null | undefined;
-const handlePinCapabilityCache = new Map<string, boolean>();
 
 interface OpenDirectory {
   readonly canonicalPath: string;
@@ -88,6 +93,8 @@ export interface WorkspaceSessionFileParentLease {
 export interface WorkspaceStorageOpenOptions {
   /** Exercise the strict pathname backend; entry mutations fail closed in this test seam. */
   forcePathFallback?: boolean;
+  /** Exercise the portable cwd-bound mutation backend on any test host. */
+  forceCwdHelper?: boolean;
   /** Open an existing hierarchy without creating any missing component. */
   createIfMissing?: boolean;
   /** Require `.cc-web` to be the inode authorised before lifecycle suspension. */
@@ -97,15 +104,14 @@ export interface WorkspaceStorageOpenOptions {
 /**
  * How direct child entry mutations are bound to their parent.
  *
- * `handle-pinned-path` is selected only after a Windows volume probe proves
- * that the handles Node opens deny both ancestor rename and directory deletion
- * while live. A pathname verified before and after a syscall cannot detect a
- * swap restored during that syscall, so every other fallback fails closed for
- * create, unlink and rename.
+ * Windows directory handles remain useful for binding reads, but do not grant
+ * pathname mutation authority. Windows and pathname-only POSIX hosts use the
+ * one-shot cwd helper: the child verifies the cwd inode, and the OS pins its
+ * process cwd against rename/removal for the syscall lifetime.
  */
 export type WorkspaceEntryMutationPolicy =
   | 'descriptor'
-  | 'handle-pinned-path'
+  | 'cwd-helper'
   | 'deny';
 
 function unsafe(message: string): Error {
@@ -118,6 +124,16 @@ function safeComponent(value: unknown, name: string): string {
     throw unsafe(`Refusing unsafe ${name} for workspace storage: ${JSON.stringify(text)}`);
   }
   return text;
+}
+
+function inspectedDirectoryComponent(value: string): string {
+  if (!value || value === '.' || value === '..' || value.includes('\0')
+    || path.basename(value) !== value || Buffer.byteLength(value, 'utf8') > 255
+    || (process.platform === 'win32' && (
+      /[<>:"/\\|?*]/.test(value) || /[. ]$/.test(value)
+      || /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i.test(value)
+    ))) throw unsafe(`Unsafe directory path component: ${JSON.stringify(value)}`);
+  return value;
 }
 
 /** True when a ref opts in to workspace-local artefacts. */
@@ -254,7 +270,30 @@ function hardenMode(fd: number, mode: number): void {
  * No contents are read or rewritten. The only mutation is fchmod(0600) on the
  * exact regular-file descriptor whose identity is checked before and after.
  */
-function hardenExistingWorkspaceGitignore(container: OpenDirectory, ignorePath: string): void {
+function hardenExistingWorkspaceGitignore(
+  container: OpenDirectory,
+  ignorePath: string,
+  expected?: { dev?: bigint; ino?: bigint },
+  entryMutationPolicy?: WorkspaceEntryMutationPolicy,
+): void {
+  if (entryMutationPolicy === 'cwd-helper') {
+    hardenWorkspaceCwdFile(
+      {
+        canonicalPath: container.canonicalPath,
+        fd: container.fd,
+        verify: () => verifyDirectoryBinding(
+          container.canonicalPath,
+          container.fd,
+          container.accessPath,
+        ),
+      },
+      '.gitignore',
+      expected?.dev !== undefined && expected.ino !== undefined
+        ? { dev: expected.dev, ino: expected.ino }
+        : undefined,
+    );
+    return;
+  }
   verifyDirectoryBinding(container.canonicalPath, container.fd, container.accessPath);
   let before: fs.Stats;
   try {
@@ -284,6 +323,12 @@ function hardenExistingWorkspaceGitignore(container: OpenDirectory, ignorePath: 
     }
 
     const opened = fs.fstatSync(fd);
+    if (expected?.dev !== undefined && expected.ino !== undefined) {
+      const exact = fs.fstatSync(fd, { bigint: true });
+      if (exact.dev !== expected.dev || exact.ino !== expected.ino) {
+        throw unsafe('Workspace .gitignore does not match the helper-created inode');
+      }
+    }
     const afterOpen = fs.lstatSync(ignorePath);
     if (
       afterOpen.isSymbolicLink()
@@ -347,101 +392,16 @@ function verifyCreatedWorkspaceGitignore(
 }
 
 /**
- * Windows has no openat-like descriptor namespace, so the pathname fallback is
- * permitted only where a live handle demonstrably pins the directory namespace.
- * Probe the real workspace volume instead of assuming libuv's CreateFile
- * sharing mode: a live descendant handle must prevent its ancestor from being
- * renamed, and that exact rename must become possible as soon as the handle
- * closes, which separates handle pinning from an ACL, read-only mount,
- * antivirus lock or other unrelated failure.
- *
- * This deliberately no longer also requires a handle to prevent its own
- * directory from being removed. libuv opens directories with FILE_SHARE_DELETE,
- * so that condition is unreachable through Node's fs API on every Windows host;
- * requiring it made this capability always fail, which left the policy at
- * `deny` and made `.cc-web` impossible to create on Windows at all.
- *
- * The residual exposure is the narrow window in which something already able to
- * mutate the workspace root could exchange it for the duration of a single
- * mkdir. That is detected rather than silently accepted: `openChildDirectory`
- * re-verifies the pinned parent through `verifyDirectoryBinding` after the
- * operation, so a surviving symlink or a different directory fails the identity
- * comparison. Planting the directory symlink such an exchange needs also
- * requires Developer Mode or elevation on a default Windows installation.
- */
-function probeHandlePinsMutationNamespace(parent: OpenDirectory): boolean {
-  const token = randomBytes(12).toString('hex');
-  const renameParent = path.join(parent.accessPath, `.cc-web-pin-rename-${token}`);
-  const renameChild = path.join(renameParent, 'child');
-  const movedParent = `${renameParent}.moved`;
-  let pinFd: number | null = null;
-  let currentRenameParent = renameParent;
-  try {
-    verifyDirectoryBinding(parent.canonicalPath, parent.fd, parent.accessPath);
-    fs.mkdirSync(renameParent, { mode: 0o700 });
-    fs.mkdirSync(renameChild, { mode: 0o700 });
-    pinFd = fs.openSync(renameChild, DIRECTORY_FLAGS);
-    const childStat = fs.fstatSync(pinFd);
-    if (!childStat.isDirectory()) return false;
-
-    let renameBlockedWhileOpen = false;
-    try {
-      fs.renameSync(renameParent, movedParent);
-      currentRenameParent = movedParent;
-    } catch (error) {
-      const code = (error as NodeJS.ErrnoException).code;
-      if (code !== 'EACCES' && code !== 'EPERM' && code !== 'EBUSY') return false;
-      renameBlockedWhileOpen = true;
-    }
-    fs.closeSync(pinFd);
-    pinFd = null;
-
-    if (!renameBlockedWhileOpen) return false;
-    // Distinguish a handle sharing denial from ACL/read-only failures: the
-    // exact rename must become possible as soon as the child handle closes.
-    fs.renameSync(renameParent, movedParent);
-    currentRenameParent = movedParent;
-    fs.renameSync(movedParent, renameParent);
-    currentRenameParent = renameParent;
-
-    verifyDirectoryBinding(parent.canonicalPath, parent.fd, parent.accessPath);
-    return true;
-  } catch {
-    return false;
-  } finally {
-    if (pinFd !== null) {
-      try { fs.closeSync(pinFd); } catch { /* Probe cleanup is best effort. */ }
-    }
-    const child = path.join(currentRenameParent, 'child');
-    try { fs.rmdirSync(child); } catch { /* Never recurse over an unexpected entry. */ }
-    try { fs.rmdirSync(currentRenameParent); } catch { /* Never recurse over an unexpected entry. */ }
-    if (currentRenameParent !== renameParent) {
-      try { fs.rmdirSync(renameParent); } catch { /* Already moved or occupied. */ }
-    }
-  }
-}
-
-function handlePinsMutationNamespace(parent: OpenDirectory): boolean {
-  if (process.platform !== 'win32') return false;
-  const stat = fs.fstatSync(parent.fd);
-  // Filesystem filters and network providers can change sharing semantics even
-  // under one drive letter. Cache per canonical workspace, not merely per
-  // volume root, so a successful NTFS probe never blesses an unrelated mount.
-  const key = `${stat.dev}:${parent.canonicalPath.toLowerCase()}`;
-  const cached = handlePinCapabilityCache.get(key);
-  if (cached !== undefined) return cached;
-  const supported = probeHandlePinsMutationNamespace(parent);
-  handlePinCapabilityCache.set(key, supported);
-  return supported;
-}
-
-/**
- * Run the real rename+rmdir probe without consulting platform/cache.
- * Exported so security tests can deterministically model Windows sharing
- * errors on non-Windows CI; production should use the cached wrapper below.
+ * Compatibility seam retained for callers which used to probe Windows handle
+ * sharing. Such a probe is insufficient to authorise pathname mutation.
  */
 export function probeWorkspacePathMutationPin(canonicalPath: string, fd: number): boolean {
-  return probeHandlePinsMutationNamespace({ canonicalPath, accessPath: canonicalPath, fd });
+  // Ancestor rename denial does not bind a final pathname lookup to the open
+  // directory handle. Keep the arguments for the source-compatible test seam,
+  // but never promote this observation to mutation authority.
+  void canonicalPath;
+  void fd;
+  return false;
 }
 
 /** Pure selector used by both workspace artefacts and attachment storage. */
@@ -451,14 +411,16 @@ export function resolveWorkspaceEntryMutationPolicy(
   windowsHandlePinned: boolean,
 ): WorkspaceEntryMutationPolicy {
   if (descriptorRoot) return 'descriptor';
-  if (platform === 'win32' && windowsHandlePinned) return 'handle-pinned-path';
-  return 'deny';
+  void windowsHandlePinned;
+  void platform;
+  return 'cwd-helper';
 }
 
-/** Probe the real workspace volume before allowing any pathname entry mutation. */
+/** Windows pathname mutation is never authorised by a handle-sharing probe. */
 export function workspacePathMutationsAreHandlePinned(canonicalPath: string, fd: number): boolean {
-  if (process.platform !== 'win32') return false;
-  return handlePinsMutationNamespace({ canonicalPath, accessPath: canonicalPath, fd });
+  void canonicalPath;
+  void fd;
+  return false;
 }
 
 function verifyDirectoryBinding(target: string, fd: number, accessPath: string): void {
@@ -502,19 +464,42 @@ function openChildDirectory(
   name: string,
   descriptorRoot: string | null,
   createIfMissing = true,
-  allowPathMutation = false,
+  mutationPolicy: WorkspaceEntryMutationPolicy = 'deny',
   expectedIdentity?: WorkspaceStorageIdentity,
+  hardenDirectory = true,
 ): OpenDirectory {
   verifyDirectoryBinding(parent.canonicalPath, parent.fd, parent.accessPath);
-  const component = safeComponent(name, 'directory component');
+  const component = hardenDirectory
+    ? safeComponent(name, 'directory component')
+    : inspectedDirectoryComponent(name);
   const target = path.join(parent.accessPath, component);
   const canonicalPath = path.join(parent.canonicalPath, component);
   let exists = true;
-  try {
-    fs.lstatSync(target);
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
-    exists = false;
+  let helperCreatedIdentity: { dev?: bigint; ino?: bigint } | null = null;
+  let preOpenIdentity: { dev: bigint; ino: bigint } | null = null;
+  if (mutationPolicy === 'cwd-helper') {
+    const helperLease = {
+      canonicalPath: parent.canonicalPath,
+      fd: parent.fd,
+      verify: () => verifyDirectoryBinding(parent.canonicalPath, parent.fd, parent.accessPath),
+    };
+    helperCreatedIdentity = !createIfMissing && !hardenDirectory
+      ? inspectWorkspaceCwdDirectory(helperLease, component)
+      : ensureWorkspaceCwdDirectory(
+        helperLease,
+        component,
+        createIfMissing,
+        expectedIdentity,
+        hardenDirectory,
+      );
+  } else {
+    try {
+      const before = fs.lstatSync(target, { bigint: true });
+      preOpenIdentity = { dev: before.dev, ino: before.ino };
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+      exists = false;
+    }
   }
   if (!exists) {
     if (!createIfMissing) {
@@ -522,7 +507,7 @@ function openChildDirectory(
         code: 'ENOENT',
       });
     }
-    if (descriptorRoot === null && !allowPathMutation) {
+    if (descriptorRoot === null && mutationPolicy === 'deny') {
       // A pathname-only mkdir cannot be bound to the already-open parent. An
       // attacker could exchange the parent for a symlink for exactly the
       // duration of mkdir and restore it before either identity check. Hosts
@@ -545,9 +530,19 @@ function openChildDirectory(
   const accessPath = descriptorRoot ? fdAccessPath(fd, descriptorRoot) : canonicalPath;
   try {
     verifyDirectoryBinding(canonicalPath, fd, accessPath);
-    // In the path-based Windows backend the parent handle is the stable
-    // reference. Checking it again after the child open detects a directory
-    // exchange during the operation; the opened child is never used on fail.
+    if (helperCreatedIdentity?.dev !== undefined && helperCreatedIdentity.ino !== undefined) {
+      const opened = fs.fstatSync(fd, { bigint: true });
+      if (opened.dev !== helperCreatedIdentity.dev || opened.ino !== helperCreatedIdentity.ino) {
+        throw unsafe(`Workspace ${component} directory does not match the helper-created inode`);
+      }
+    } else if (preOpenIdentity) {
+      const opened = fs.fstatSync(fd, { bigint: true });
+      if (opened.dev !== preOpenIdentity.dev || opened.ino !== preOpenIdentity.ino) {
+        throw unsafe(`Workspace ${component} directory changed while it was opened`);
+      }
+    }
+    // In a path-based backend the parent handle remains the stable read
+    // reference; namespace mutation itself is delegated to the cwd helper.
     verifyDirectoryBinding(parent.canonicalPath, parent.fd, parent.accessPath);
     if (expectedIdentity) {
       const opened = fs.fstatSync(fd, { bigint: true });
@@ -559,11 +554,61 @@ function openChildDirectory(
         throw unsafe(`Workspace ${component} storage is not the authorised inode`);
       }
     }
-    hardenMode(fd, 0o700);
+    if (hardenDirectory && mutationPolicy !== 'cwd-helper') hardenMode(fd, 0o700);
     return { canonicalPath, accessPath, fd };
   } catch (error) {
     fs.closeSync(fd);
     throw error;
+  }
+}
+
+/** Read-only root-to-leaf proof for an existing canonical absolute directory. */
+export function openCanonicalDirectoryLeaseSync(
+  directory: string,
+  options: { forceCwdHelper?: boolean } = {},
+): WorkspaceStorageDirectoryLease {
+  if (!path.isAbsolute(directory) || path.resolve(directory) !== directory
+    || (process.platform === 'win32' && /^\\\\[?.]\\/.test(directory))) {
+    throw unsafe('Directory proof requires a canonical absolute filesystem path');
+  }
+  const parsedRoot = path.parse(directory).root;
+  if (!parsedRoot) throw unsafe('Directory proof has no filesystem root');
+  const descriptorRoot = options.forceCwdHelper ? null : fdRoot();
+  const root = verifiedDirectory(parsedRoot, descriptorRoot);
+  const policy = resolveWorkspaceEntryMutationPolicy(descriptorRoot, process.platform, false);
+  const chain: OpenDirectory[] = [root];
+  let current = root;
+  let returned = false;
+  try {
+    for (const component of path.relative(parsedRoot, directory).split(path.sep).filter(Boolean)) {
+      current = openChildDirectory(current, component, descriptorRoot, false, policy, undefined, false);
+      chain.push(current);
+    }
+    const pinned = chain[chain.length - 1];
+    let closed = false;
+    const lease: WorkspaceStorageDirectoryLease = {
+      canonicalPath: pinned.canonicalPath,
+      accessPath: pinned.accessPath,
+      fd: pinned.fd,
+      pathFallback: descriptorRoot === null,
+      entryMutationPolicy: policy,
+      verify: () => {
+        if (closed) throw unsafe('Directory proof lease is closed');
+        for (const entry of chain) {
+          verifyDirectoryBinding(entry.canonicalPath, entry.fd, entry.accessPath);
+        }
+      },
+      close: () => {
+        if (closed) return;
+        closed = true;
+        for (const entry of [...chain].reverse()) fs.closeSync(entry.fd);
+      },
+    };
+    lease.verify();
+    returned = true;
+    return lease;
+  } finally {
+    if (!returned) for (const ancestor of [...chain].reverse()) fs.closeSync(ancestor.fd);
   }
 }
 
@@ -575,18 +620,27 @@ export function openWorkspaceStorageDirectorySync(
   if (!path.isAbsolute(workspaceRoot)) throw unsafe('Workspace root must be absolute');
   const root = path.resolve(workspaceRoot);
   if (root === path.parse(root).root) throw unsafe('Refusing a filesystem root as workspace storage');
-  const stat = fs.lstatSync(root);
-  if (!stat.isDirectory() || stat.isSymbolicLink() || fs.realpathSync(root) !== root) {
-    throw unsafe('Workspace storage requires a real canonical non-symlink root');
-  }
-  const descriptorRoot = options.forcePathFallback ? null : fdRoot();
+  const descriptorRoot = (options.forcePathFallback || options.forceCwdHelper) ? null : fdRoot();
   const createIfMissing = options.expectedIdentity ? false : options.createIfMissing !== false;
-  const rootDirectory = verifiedDirectory(root, descriptorRoot);
-  const entryMutationPolicy = resolveWorkspaceEntryMutationPolicy(
-    descriptorRoot,
-    process.platform,
-    !options.forcePathFallback && handlePinsMutationNamespace(rootDirectory),
-  );
+  const entryMutationPolicy = options.forcePathFallback
+    ? 'deny'
+    : options.forceCwdHelper
+      ? 'cwd-helper'
+      : resolveWorkspaceEntryMutationPolicy(
+        descriptorRoot,
+        process.platform,
+        false,
+      );
+  const rootProof = entryMutationPolicy === 'cwd-helper'
+    ? openCanonicalDirectoryLeaseSync(root, { forceCwdHelper: true })
+    : null;
+  if (!rootProof) {
+    const stat = fs.lstatSync(root);
+    if (!stat.isDirectory() || stat.isSymbolicLink() || fs.realpathSync(root) !== root) {
+      throw unsafe('Workspace storage requires a real canonical non-symlink root');
+    }
+  }
+  const rootDirectory: OpenDirectory = rootProof ?? verifiedDirectory(root, descriptorRoot);
   let container: OpenDirectory | null = null;
   try {
     container = openChildDirectory(
@@ -594,14 +648,31 @@ export function openWorkspaceStorageDirectorySync(
       '.cc-web',
       descriptorRoot,
       createIfMissing,
-      entryMutationPolicy === 'handle-pinned-path',
+      entryMutationPolicy,
       options.expectedIdentity,
     );
     const accessPath = container.accessPath;
     const ignorePath = path.join(accessPath, '.gitignore');
     let ignoreFd: number | null = null;
     let existingIgnore = false;
+    let helperIgnoreIdentity: { dev?: bigint; ino?: bigint } | undefined;
     if (createIfMissing && entryMutationPolicy !== 'deny') {
+      if (entryMutationPolicy === 'cwd-helper') {
+        try {
+          helperIgnoreIdentity = runWorkspaceCwdHelper({
+            canonicalPath: container.canonicalPath,
+            fd: container.fd,
+            verify: () => verifyDirectoryBinding(container!.canonicalPath, container!.fd, container!.accessPath),
+          }, { operation: 'create', name: '.gitignore', data: Buffer.from(GITIGNORE_BODY), mode: 0o600 });
+          existingIgnore = true;
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code === 'EEXIST') {
+            existingIgnore = true;
+          } else {
+            throw error;
+          }
+        }
+      } else {
       try {
         verifyDirectoryBinding(container.canonicalPath, container.fd, container.accessPath);
         ignoreFd = fs.openSync(
@@ -618,6 +689,7 @@ export function openWorkspaceStorageDirectorySync(
       } finally {
         if (ignoreFd !== null) fs.closeSync(ignoreFd);
       }
+      }
     }
     if (!existingIgnore) {
       try {
@@ -626,7 +698,12 @@ export function openWorkspaceStorageDirectorySync(
         if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
       }
     }
-    if (existingIgnore) hardenExistingWorkspaceGitignore(container, ignorePath);
+    if (existingIgnore) hardenExistingWorkspaceGitignore(
+      container,
+      ignorePath,
+      helperIgnoreIdentity,
+      entryMutationPolicy,
+    );
     verifyDirectoryBinding(container.canonicalPath, container.fd, container.accessPath);
     const pinned = container;
     container = null;
@@ -646,7 +723,8 @@ export function openWorkspaceStorageDirectorySync(
     };
   } finally {
     if (container !== null) fs.closeSync(container.fd);
-    fs.closeSync(rootDirectory.fd);
+    if (rootProof) rootProof.close();
+    else fs.closeSync(rootDirectory.fd);
   }
 }
 
@@ -655,7 +733,7 @@ export function openWorkspaceStorageDirectorySync(
  *
  * When descriptor traversal is available, `accessPath` remains attached to the
  * opened inode even if the visible workspace path is exchanged. Otherwise the
- * lease reports an explicit handle-pinned or deny mutation policy.
+ * lease reports an explicit cwd-helper or deny mutation policy.
  */
 export function openWorkspacePasteDirectorySync(
   workspaceRoot: string,
@@ -675,7 +753,7 @@ export function openWorkspacePasteDirectorySync(
       'pasted',
       descriptorRoot,
       options.createIfMissing !== false,
-      container.entryMutationPolicy === 'handle-pinned-path',
+      container.entryMutationPolicy,
     );
     const pinned = pasted;
     pasted = null;
@@ -717,7 +795,7 @@ export function openWorkspaceAttachmentRootDirectorySync(
       'attachments',
       descriptorRoot,
       options.createIfMissing !== false,
-      container.entryMutationPolicy === 'handle-pinned-path',
+      container.entryMutationPolicy,
     );
     const pinned = attachments;
     attachments = null;
@@ -776,7 +854,7 @@ export function openWorkspaceAttachmentDirectorySync(
         component,
         descriptorRoot,
         createIfMissing,
-        container.entryMutationPolicy === 'handle-pinned-path',
+        container.entryMutationPolicy,
       );
       opened.push(child);
       current = child;
@@ -814,7 +892,11 @@ export function workspaceSessionAccessDirectory(
   if (cached) {
     try {
       verifyDirectoryBinding(canonical, cached.fd, cached.accessPath);
-      const forcedPolicy = options.forcePathFallback ? 'deny' : null;
+      const forcedPolicy = options.forcePathFallback
+        ? 'deny'
+        : options.forceCwdHelper
+          ? 'cwd-helper'
+          : null;
       if (
         forcedPolicy === null
         || (cached.pathFallback && cached.entryMutationPolicy === forcedPolicy)
@@ -836,6 +918,7 @@ export function workspaceSessionAccessDirectory(
   if (!storageRoot) throw unsafe('Workspace storage root is unavailable');
   const container = openWorkspaceStorageDirectorySync(storageRoot, {
     forcePathFallback: options.forcePathFallback,
+    forceCwdHelper: options.forceCwdHelper,
   });
   const pathFallback = container.pathFallback;
   const descriptorRoot = pathFallback ? null : fdRoot();
@@ -853,21 +936,21 @@ export function workspaceSessionAccessDirectory(
       'sessions',
       descriptorRoot,
       true,
-      container.entryMutationPolicy === 'handle-pinned-path',
+      container.entryMutationPolicy,
     );
     owner = openChildDirectory(
       sessions,
       safeComponent(ref.ownerKey ?? ref.storageScope?.ownerKey ?? ref.ownerUserId, 'owner key'),
       descriptorRoot,
       true,
-      container.entryMutationPolicy === 'handle-pinned-path',
+      container.entryMutationPolicy,
     );
     session = openChildDirectory(
       owner,
       safeComponent(ref.id, 'session id'),
       descriptorRoot,
       true,
-      container.entryMutationPolicy === 'handle-pinned-path',
+      container.entryMutationPolicy,
     );
     verifyDirectoryBinding(canonical, session.fd, session.accessPath);
     const accessPath = session.accessPath;

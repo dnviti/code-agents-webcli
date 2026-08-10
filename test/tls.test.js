@@ -51,6 +51,25 @@ describeBuilt('TLS material', function () {
     }
   });
 
+  it('keeps localhost certificate names when interface inspection is capability-denied', function () {
+    for (const denied of [
+      Object.assign(new Error('network interfaces are unavailable'), {
+        code: 'ERR_ACCESS_DENIED', permission: 'os.networkInterfaces',
+      }),
+      Object.assign(new Error('uv_interface_addresses returned Unknown system error 1'), {
+        code: 'ERR_SYSTEM_ERROR', syscall: 'uv_interface_addresses', errno: 1,
+      }),
+    ]) {
+      const { dns, ip } = tls.localHosts({ networkInterfaces: () => { throw denied; } });
+      assert.ok(dns.includes('localhost'));
+      assert.deepStrictEqual(ip, ['127.0.0.1', '::1']);
+    }
+    assert.throws(
+      () => tls.localHosts({ networkInterfaces: () => { throw Object.assign(new Error('interface probe broke'), { code: 'EIO' }); } }),
+      /interface probe broke/,
+    );
+  });
+
   it('does not reissue on the next start', function () {
     // openssl prints IPv6 SANs expanded, so `::1` comes back as
     // 0:0:0:0:0:0:0:1. Comparing those literally made every restart issue a new

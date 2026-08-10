@@ -4,6 +4,17 @@ import {
   workspaceSessionFileParentLease,
   type WorkspaceSessionFileParentLease,
 } from './workspace-session-storage.js';
+import {
+  appendWorkspaceCwdFile,
+  listWorkspaceCwdEntries,
+  readWorkspaceCwdFile,
+  removeWorkspaceCwdEntry,
+  renameWorkspaceCwdFile,
+  runWorkspaceCwdHelper,
+  statWorkspaceCwdFile,
+  truncateWorkspaceCwdFile,
+  writeWorkspaceCwdFile,
+} from './workspace-cwd-helper.js';
 
 /**
  * Exact-component file operations for artefacts below a pinned session
@@ -37,6 +48,165 @@ function assertPrivateRegular(stat: fs.Stats, file: string): void {
 }
 
 type ParentLease = WorkspaceSessionFileParentLease | null;
+
+function helperStats(
+  result: ReturnType<typeof statWorkspaceCwdFile>,
+  bigint = false,
+): fs.Stats | fs.BigIntStats {
+  const value = (text: string | undefined): bigint => BigInt(text ?? '0');
+  const dev = value(result.dev?.toString());
+  const ino = value(result.ino?.toString());
+  const size = value(result.size);
+  const nlink = value(result.nlink);
+  const mode = value(result.mode);
+  const mtimeNs = value(result.mtimeNs);
+  const ctimeNs = value(result.ctimeNs);
+  const birthtimeNs = value(result.birthtimeNs);
+  const methods = {
+    isFile: () => true, isDirectory: () => false, isSymbolicLink: () => false,
+    isBlockDevice: () => false, isCharacterDevice: () => false, isFIFO: () => false,
+    isSocket: () => false,
+  };
+  if (bigint) return {
+    ...methods, dev, ino, size, nlink, mode, mtimeNs, ctimeNs, birthtimeNs,
+    uid: 0n, gid: 0n, rdev: 0n, blksize: 0n, blocks: 0n,
+    atimeMs: 0n, mtimeMs: mtimeNs / 1_000_000n, ctimeMs: ctimeNs / 1_000_000n,
+    birthtimeMs: birthtimeNs / 1_000_000n,
+    atime: new Date(0), mtime: new Date(Number(mtimeNs / 1_000_000n)),
+    ctime: new Date(Number(ctimeNs / 1_000_000n)), birthtime: new Date(Number(birthtimeNs / 1_000_000n)),
+  } as fs.BigIntStats;
+  return {
+    ...methods, dev: Number(dev), ino: Number(ino), size: Number(size), nlink: Number(nlink), mode: Number(mode),
+    uid: 0, gid: 0, rdev: 0, blksize: 0, blocks: 0, atimeMs: 0,
+    mtimeMs: Number(mtimeNs) / 1e6, ctimeMs: Number(ctimeNs) / 1e6,
+    birthtimeMs: Number(birthtimeNs) / 1e6, atime: new Date(0),
+    mtime: new Date(Number(mtimeNs) / 1e6), ctime: new Date(Number(ctimeNs) / 1e6),
+    birthtime: new Date(Number(birthtimeNs) / 1e6),
+  } as fs.Stats;
+}
+
+class CwdHelperReadHandle {
+  private closed = false;
+  private position = 0;
+  private readonly expected: { dev: bigint; ino: bigint };
+  constructor(
+    private readonly lease: WorkspaceSessionFileParentLease,
+    private readonly name: string,
+    private readonly initial: ReturnType<typeof statWorkspaceCwdFile>,
+  ) {
+    if (initial.dev === undefined || initial.ino === undefined) throw unsafe(name, 'helper omitted its identity');
+    this.expected = { dev: initial.dev, ino: initial.ino };
+  }
+  private assertStable(result: ReturnType<typeof statWorkspaceCwdFile>): void {
+    if (result.dev !== this.expected.dev || result.ino !== this.expected.ino
+      || result.size !== this.initial.size || result.mtimeNs !== this.initial.mtimeNs
+      || result.ctimeNs !== this.initial.ctimeNs) throw unsafe(this.name, 'changed while its helper handle was open');
+  }
+  async stat(options?: { bigint?: boolean }): Promise<fs.Stats | fs.BigIntStats> {
+    if (this.closed) throw Object.assign(new Error('FileHandle is closed'), { code: 'EBADF' });
+    const result = statWorkspaceCwdFile(this.lease, this.name, this.expected);
+    this.assertStable(result);
+    return helperStats(result, options?.bigint === true);
+  }
+  async read(
+    buffer: Buffer,
+    offset = 0,
+    length = buffer.length - offset,
+    position: number | null = null,
+  ): Promise<{ bytesRead: number; buffer: Buffer }> {
+    if (this.closed) throw Object.assign(new Error('FileHandle is closed'), { code: 'EBADF' });
+    const at = position ?? this.position;
+    const result = readWorkspaceCwdFile(this.lease, this.name, at, length, this.expected);
+    this.assertStable(result as ReturnType<typeof statWorkspaceCwdFile>);
+    const bytes = Buffer.from(result.data, 'base64');
+    if (bytes.length > length || bytes.toString('base64') !== result.data) {
+      throw unsafe(this.name, 'helper returned invalid read bytes');
+    }
+    bytes.copy(buffer, offset);
+    if (position === null) this.position += bytes.length;
+    return { bytesRead: bytes.length, buffer };
+  }
+  async readFile(options?: BufferEncoding | { encoding?: BufferEncoding | null }): Promise<Buffer | string> {
+    const stat = await this.stat({ bigint: true }) as fs.BigIntStats;
+    if (stat.size > 512n * 1024n * 1024n) throw unsafe(this.name, 'exceeds the bounded helper read limit');
+    const output = Buffer.alloc(Number(stat.size));
+    let offset = 0;
+    while (offset < output.length) {
+      const { bytesRead } = await this.read(output, offset, Math.min(24 * 1024 * 1024, output.length - offset), offset);
+      if (bytesRead === 0) break;
+      offset += bytesRead;
+    }
+    if (offset !== output.length) throw unsafe(this.name, 'changed while it was read');
+    const encoding = typeof options === 'string' ? options : options?.encoding;
+    return encoding ? output.toString(encoding) : output;
+  }
+  async close(): Promise<void> { this.closed = true; }
+}
+
+class CwdHelperWriteHandle {
+  private closed = false;
+  private position = 0;
+  constructor(
+    private readonly lease: WorkspaceSessionFileParentLease,
+    private readonly name: string,
+    private readonly expected: { dev: bigint; ino: bigint },
+  ) {}
+  async write(
+    buffer: Buffer | Uint8Array,
+    offset = 0,
+    length = buffer.byteLength - offset,
+    position: number | null = null,
+  ): Promise<{ bytesWritten: number; buffer: Buffer | Uint8Array }> {
+    if (this.closed) throw Object.assign(new Error('FileHandle is closed'), { code: 'EBADF' });
+    const bytes = Buffer.from(buffer).subarray(offset, offset + length);
+    const at = position ?? this.position;
+    writeWorkspaceCwdFile(this.lease, this.name, at, bytes, this.expected);
+    if (position === null) this.position += bytes.length;
+    return { bytesWritten: bytes.length, buffer };
+  }
+  async writeFile(data: string | Uint8Array, options?: BufferEncoding | { encoding?: BufferEncoding }): Promise<void> {
+    const encoding = typeof options === 'string' ? options : options?.encoding;
+    const bytes = typeof data === 'string' ? Buffer.from(data, encoding ?? 'utf8') : Buffer.from(data);
+    await this.write(bytes, 0, bytes.length, null);
+  }
+  async stat(options?: { bigint?: boolean }): Promise<fs.Stats | fs.BigIntStats> {
+    if (this.closed) throw Object.assign(new Error('FileHandle is closed'), { code: 'EBADF' });
+    return helperStats(statWorkspaceCwdFile(this.lease, this.name, this.expected), options?.bigint === true);
+  }
+  async truncate(length = 0): Promise<void> {
+    if (this.closed) throw Object.assign(new Error('FileHandle is closed'), { code: 'EBADF' });
+    truncateWorkspaceCwdFile(this.lease, this.name, length, this.expected);
+  }
+  async chmod(_mode: number): Promise<void> {
+    if (this.closed) throw Object.assign(new Error('FileHandle is closed'), { code: 'EBADF' });
+    /* Child hardens every write. */
+  }
+  async sync(): Promise<void> {
+    if (this.closed) throw Object.assign(new Error('FileHandle is closed'), { code: 'EBADF' });
+    /* Child fsyncs every write. */
+  }
+  async close(): Promise<void> { this.closed = true; }
+}
+
+class CwdHelperAppendHandle {
+  private closed = false;
+  constructor(
+    private readonly lease: WorkspaceSessionFileParentLease,
+    private readonly name: string,
+    private readonly expected: { dev: bigint; ino: bigint },
+  ) {}
+  async writeFile(data: string | Uint8Array, options?: BufferEncoding | { encoding?: BufferEncoding }): Promise<void> {
+    if (this.closed) throw Object.assign(new Error('FileHandle is closed'), { code: 'EBADF' });
+    const encoding = typeof options === 'string' ? options : options?.encoding;
+    const bytes = typeof data === 'string' ? Buffer.from(data, encoding ?? 'utf8') : Buffer.from(data);
+    appendWorkspaceCwdFile(this.lease, this.name, bytes, this.expected);
+  }
+  async stat(options?: { bigint?: boolean }): Promise<fs.Stats | fs.BigIntStats> {
+    return helperStats(statWorkspaceCwdFile(this.lease, this.name, this.expected), options?.bigint === true);
+  }
+  async chmod(_mode: number): Promise<void> { /* Child hardens every append. */ }
+  async close(): Promise<void> { this.closed = true; }
+}
 
 function bindParent(file: string): ParentLease {
   return workspaceSessionFileParentLease(file);
@@ -75,7 +245,37 @@ function requireEntryMutation(file: string, lease: ParentLease): void {
   }
 }
 
+async function exactEntryIdentity(
+  file: string,
+  lease: ParentLease,
+  allowSymlink = false,
+): Promise<{ dev: bigint; ino: bigint }> {
+  if (lease?.entryMutationPolicy === 'cwd-helper') {
+    if (allowSymlink) {
+      const entry = listWorkspaceCwdEntries(lease).find((candidate) => candidate.name === pathComponent(file));
+      if (!entry || (entry.type !== 'file' && entry.type !== 'symlink')
+        || (entry.type === 'file' && entry.nlink !== 1n)) throw unsafe(file);
+      return { dev: entry.dev, ino: entry.ino };
+    }
+    const stat = statWorkspaceCwdFile(lease, pathComponent(file));
+    if (stat.dev === undefined || stat.ino === undefined || BigInt(stat.nlink) !== 1n) throw unsafe(file);
+    return { dev: stat.dev, ino: stat.ino };
+  }
+  verifyParent(file, lease);
+  const stat = await fs.promises.lstat(boundPath(file, lease), { bigint: true });
+  if ((!stat.isFile() && !(allowSymlink && stat.isSymbolicLink()))
+    || (stat.isFile() && stat.nlink !== 1n)) throw unsafe(file);
+  verifyParent(file, lease);
+  return { dev: stat.dev, ino: stat.ino };
+}
+
 async function lstatOrNull(file: string, lease: ParentLease = bindParent(file)): Promise<fs.Stats | null> {
+  if (lease?.entryMutationPolicy === 'cwd-helper') {
+    try { return helperStats(statWorkspaceCwdFile(lease, pathComponent(file))) as fs.Stats; } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+      throw error;
+    }
+  }
   verifyParent(file, lease);
   try {
     const stat = await fs.promises.lstat(boundPath(file, lease));
@@ -93,12 +293,19 @@ async function verifyOpened(
   handle: fs.promises.FileHandle,
   before: fs.Stats | null,
   lease: ParentLease,
+  expected?: { dev?: bigint; ino?: bigint },
 ): Promise<fs.Stats> {
   // On the path fallback this check happens immediately after open and before
   // callers read, write, chmod, or truncate the opened inode.
   verifyParent(file, lease);
   const opened = await handle.stat();
   assertPrivateRegular(opened, file);
+  if (expected?.dev !== undefined && expected.ino !== undefined) {
+    const exact = await handle.stat({ bigint: true });
+    if (exact.dev !== expected.dev || exact.ino !== expected.ino) {
+      throw unsafe(file, 'does not match the entry created by the workspace helper');
+    }
+  }
   const visible = await lstatOrNull(file, lease).catch((error: NodeJS.ErrnoException) => {
     throw unsafe(file, 'changed while it was being opened', error);
   });
@@ -124,6 +331,7 @@ async function openExisting(
   file: string,
   flags: number,
   lease: ParentLease = bindParent(file),
+  expected?: { dev?: bigint; ino?: bigint },
 ): Promise<fs.promises.FileHandle> {
   const before = await lstatOrNull(file, lease);
   if (!before) throw Object.assign(new Error(`ENOENT: no such file or directory, open '${file}'`), { code: 'ENOENT' });
@@ -142,7 +350,7 @@ async function openExisting(
     throw error;
   }
   try {
-    await verifyOpened(file, handle, before, lease);
+    await verifyOpened(file, handle, before, lease, expected);
     return handle;
   } catch (error) {
     await handle.close().catch(() => undefined);
@@ -151,11 +359,49 @@ async function openExisting(
 }
 
 export async function openSessionFileForRead(file: string): Promise<fs.promises.FileHandle> {
+  const lease = bindParent(file);
+  if (lease?.entryMutationPolicy === 'cwd-helper') {
+    // Stat through the pinned child before returning the range-read facade so
+    // ENOENT and unsafe final components retain the ordinary open contract.
+    const initial = statWorkspaceCwdFile(lease, pathComponent(file));
+    return new CwdHelperReadHandle(lease, pathComponent(file), initial) as unknown as fs.promises.FileHandle;
+  }
   return openExisting(file, READ_FLAGS);
+}
+
+export function openWorkspaceCwdFileForRead(
+  lease: WorkspaceSessionFileParentLease,
+  name: string,
+): fs.promises.FileHandle {
+  const initial = statWorkspaceCwdFile(lease, name);
+  return new CwdHelperReadHandle(lease, name, initial) as unknown as fs.promises.FileHandle;
 }
 
 export async function openSessionFileForAppend(file: string): Promise<fs.promises.FileHandle> {
   const lease = bindParent(file);
+  if (lease?.entryMutationPolicy === 'cwd-helper') {
+    let identity: { dev: bigint; ino: bigint };
+    try {
+      const stat = statWorkspaceCwdFile(lease, pathComponent(file));
+      if (stat.dev === undefined || stat.ino === undefined) throw unsafe(file, 'helper omitted identity');
+      identity = { dev: stat.dev, ino: stat.ino };
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+      try {
+        const created = runWorkspaceCwdHelper(lease, {
+          operation: 'create', name: pathComponent(file), data: Buffer.alloc(0), mode: 0o600,
+        });
+        if (created.dev === undefined || created.ino === undefined) throw unsafe(file, 'helper omitted identity');
+        identity = { dev: created.dev, ino: created.ino };
+      } catch (createError) {
+        if ((createError as NodeJS.ErrnoException).code !== 'EEXIST') throw createError;
+        const raced = statWorkspaceCwdFile(lease, pathComponent(file));
+        if (raced.dev === undefined || raced.ino === undefined) throw unsafe(file, 'helper omitted identity');
+        identity = { dev: raced.dev, ino: raced.ino };
+      }
+    }
+    return new CwdHelperAppendHandle(lease, pathComponent(file), identity) as unknown as fs.promises.FileHandle;
+  }
   for (let attempt = 0; attempt < 3; attempt += 1) {
     try {
       const handle = await openExisting(file, WRITE_FLAGS | fs.constants.O_APPEND, lease);
@@ -202,6 +448,32 @@ export async function appendSessionFile(
   data: string | Uint8Array,
   encoding?: BufferEncoding,
 ): Promise<void> {
+  const lease = bindParent(file);
+  if (lease?.entryMutationPolicy === 'cwd-helper') {
+    const bytes = typeof data === 'string' ? Buffer.from(data, encoding ?? 'utf8') : Buffer.from(data);
+    const name = pathComponent(file);
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      try {
+        const current = statWorkspaceCwdFile(lease, name);
+        if (current.dev === undefined || current.ino === undefined) throw unsafe(file, 'helper omitted identity');
+        appendWorkspaceCwdFile(lease, name, bytes, { dev: current.dev, ino: current.ino });
+        return;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+      }
+      try {
+        const created = runWorkspaceCwdHelper(lease, {
+          operation: 'create', name, data: Buffer.alloc(0), mode: 0o600,
+        });
+        if (created.dev === undefined || created.ino === undefined) throw unsafe(file, 'helper omitted created identity');
+        appendWorkspaceCwdFile(lease, name, bytes, { dev: created.dev, ino: created.ino });
+        return;
+      } catch (createError) {
+        if ((createError as NodeJS.ErrnoException).code !== 'EEXIST') throw createError;
+      }
+    }
+    throw unsafe(file, 'changed repeatedly while it was being appended');
+  }
   const handle = await openSessionFileForAppend(file);
   try {
     if (typeof data === 'string') await handle.writeFile(data, { encoding: encoding ?? 'utf8' });
@@ -227,6 +499,14 @@ export async function statSessionFile(file: string): Promise<fs.Stats | null> {
 }
 
 export async function truncateSessionFile(file: string, length: number): Promise<void> {
+  const lease = bindParent(file);
+  if (lease?.entryMutationPolicy === 'cwd-helper') {
+    const name = pathComponent(file);
+    const current = statWorkspaceCwdFile(lease, name);
+    if (current.dev === undefined || current.ino === undefined) throw unsafe(file, 'helper omitted identity');
+    truncateWorkspaceCwdFile(lease, name, length, { dev: current.dev, ino: current.ino });
+    return;
+  }
   const handle = await openExisting(file, WRITE_FLAGS);
   try {
     await harden(handle);
@@ -243,6 +523,15 @@ async function openExclusive(
   let handle: fs.promises.FileHandle;
   try {
     requireEntryMutation(file, lease);
+    if (lease?.entryMutationPolicy === 'cwd-helper') {
+      const expected = runWorkspaceCwdHelper(lease, {
+        operation: 'create', name: pathComponent(file), data: Buffer.alloc(0), mode: 0o600,
+      });
+      if (expected.dev === undefined || expected.ino === undefined) throw unsafe(file, 'helper omitted identity');
+      return new CwdHelperWriteHandle(
+        lease, pathComponent(file), { dev: expected.dev, ino: expected.ino },
+      ) as unknown as fs.promises.FileHandle;
+    }
     verifyParent(file, lease);
     handle = await fs.promises.open(
       boundPath(file, lease),
@@ -273,7 +562,12 @@ export async function prepareSessionFile(file: string): Promise<fs.promises.File
     assertPrivateRegular(existing, file);
     requireEntryMutation(file, lease);
     verifyParent(file, lease);
-    await fs.promises.unlink(boundPath(file, lease));
+    if (lease?.entryMutationPolicy === 'cwd-helper') {
+      const expectedEntry = await exactEntryIdentity(file, lease);
+      removeWorkspaceCwdEntry(lease, pathComponent(file), expectedEntry);
+    } else {
+      await fs.promises.unlink(boundPath(file, lease));
+    }
     verifyParent(file, lease);
   }
   return openExclusive(file, lease);
@@ -307,6 +601,7 @@ export async function publishPreparedSessionFile(prepared: string, target: strin
   requireEntryMutation(target, targetLease);
   const source = await openSessionFileForRead(prepared);
   try {
+    const sourceIdentity = await source.stat({ bigint: true });
     const targetStat = await lstatOrNull(target, targetLease);
     if (targetStat) {
       if (targetStat.isSymbolicLink()) throw unsafe(target, 'is a symbolic link');
@@ -315,12 +610,27 @@ export async function publishPreparedSessionFile(prepared: string, target: strin
     verifyParent(prepared, sourceLease);
     verifyParent(target, targetLease);
     try {
-      await fs.promises.rename(boundPath(prepared, sourceLease), boundPath(target, targetLease));
+      if (sourceLease?.entryMutationPolicy === 'cwd-helper') {
+        renameWorkspaceCwdFile(
+          sourceLease,
+          pathComponent(prepared),
+          pathComponent(target),
+          { dev: sourceIdentity.dev, ino: sourceIdentity.ino },
+        );
+      } else {
+        await fs.promises.rename(boundPath(prepared, sourceLease), boundPath(target, targetLease));
+      }
     } finally {
       verifyParent(prepared, sourceLease);
       verifyParent(target, targetLease);
     }
-    await verifyOpened(target, source, null, targetLease);
+    if (targetLease?.entryMutationPolicy === 'cwd-helper') {
+      statWorkspaceCwdFile(targetLease, pathComponent(target), {
+        dev: sourceIdentity.dev, ino: sourceIdentity.ino,
+      });
+    } else {
+      await verifyOpened(target, source, null, targetLease);
+    }
   } finally {
     await source.close().catch(() => undefined);
   }
@@ -359,9 +669,14 @@ export async function unlinkSessionEntry(file: string): Promise<void> {
   requireEntryMutation(file, lease);
   verifyParent(file, lease);
   try {
-    await fs.promises.unlink(boundPath(file, lease)).catch((error: NodeJS.ErrnoException) => {
-      if (error.code !== 'ENOENT') throw error;
-    });
+    if (lease?.entryMutationPolicy === 'cwd-helper') {
+      const expectedEntry = await exactEntryIdentity(file, lease, true);
+      removeWorkspaceCwdEntry(lease, pathComponent(file), expectedEntry);
+    } else {
+      await fs.promises.unlink(boundPath(file, lease)).catch((error: NodeJS.ErrnoException) => {
+        if (error.code !== 'ENOENT') throw error;
+      });
+    }
   } finally {
     verifyParent(file, lease);
   }

@@ -228,15 +228,28 @@ export class SessionStore {
       this.database.close();
       return;
     }
-    for (const store of this.workspaceStores.values()) {
-      store.database.close();
+    let failure: unknown = null;
+    for (const [key, store] of this.workspaceStores) {
+      try {
+        store.database.close();
+        this.workspaceStores.delete(key);
+        this.suspendedWorkspaceScopes.delete(key);
+        this.workspaceResumeAuthorities.delete(key);
+        this.publishedWorkspaceScopes.delete(key);
+        this.workspacePublicationHolds.delete(key);
+        this.workspaceSaveErrors.delete(key);
+      } catch (error) {
+        if (failure === null) failure = error;
+      }
     }
-    this.workspaceStores.clear();
-    this.suspendedWorkspaceScopes.clear();
-    this.workspaceResumeAuthorities.clear();
-    this.publishedWorkspaceScopes.clear();
-    this.workspacePublicationHolds.clear();
-    this.workspaceSaveErrors.clear();
+    if (failure === null) {
+      this.suspendedWorkspaceScopes.clear();
+      this.workspaceResumeAuthorities.clear();
+      this.publishedWorkspaceScopes.clear();
+      this.workspacePublicationHolds.clear();
+      this.workspaceSaveErrors.clear();
+    }
+    if (failure) throw failure;
   }
 
   /**

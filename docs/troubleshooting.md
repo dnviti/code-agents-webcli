@@ -9,11 +9,11 @@ disabled".**
 npm 12 refuses git remotes unless told otherwise. Add `--allow-git=all`, or set
 it once with `npm config set allow-git all`.
 
-**"code-agents-webcli needs Node 22.13 or newer".**
-The app stores everything in Node's built-in SQLite, which is only available
-without a flag from 22.13. Upgrade Node. The check is deliberate — without it
-the first symptom would be `Cannot find module 'node:sqlite'` from deep inside
-the server.
+**"code-agents-webcli needs Node 24.16 or newer".**
+The app uses Node's built-in SQLite serialization APIs to store workspace
+databases safely on every supported host. Upgrade Node. The check is deliberate
+— without it the first symptom would be a SQLite serialization failure from
+deep inside the server.
 
 **"The @lydell/node-pty package could not find the platform-specific package".**
 Either your platform has no prebuilt terminal binary, or the install ran with
@@ -225,8 +225,9 @@ Session history now belongs to that workspace's `.cc-web/`, not to
 `--data-dir`. Open the authorised workspace root so the server can lazy-load
 `session-state.sqlite`; do not point it at the filesystem root or through a
 symlink. A restore must include the complete `.cc-web` tree and, for a live
-SQLite snapshot, its `-wal` and `-shm` files. See [backing up and
-restoring](configuration.md#backing-up-and-restoring).
+Linux SQLite snapshot, its `-wal` and `-shm` files. Windows and macOS atomically
+publish a complete database image and create no sidecars. See [backing up
+and restoring](configuration.md#backing-up-and-restoring).
 
 If the workspace was copied to a different root, or restored without the
 installation data directory that authenticated it, the history is retained but
@@ -234,24 +235,26 @@ the server treats its operational state as unrecognised. Reopen the real
 workspace and choose the runtime/approval settings again; native resume IDs and
 archived project paths are deliberately not trusted across that boundary.
 
-**The API reports `workspace_persistence_unavailable` on macOS.**
-Workspace-local storage is unavailable on macOS in this release. Binding a
-workspace directory without a rename race requires an `openat`-style descriptor
-namespace; Linux provides one through `/proc/self/fd`, but macOS exposes
-`/dev/fd` without the `/dev/fd/<n>/child` traversal this needs. Rather than
-write history through a path it cannot verify, the server declines the
-workspace root. This is expected on macOS and is not a misconfiguration.
+**The API reports `workspace_persistence_unavailable` on Windows or macOS.**
+Workspace-local storage is supported on Windows and macOS through the app's verified-cwd
+helper. Check that the workspace is a local, canonical directory without
+symlinked `.cc-web` components, that the current user can write it, and that no
+other web or desktop process owns its `.session-state.writer` lease. A packaged
+app must also retain its complete `app.asar`; moving individual JavaScript files
+out of the application bundle breaks the helper and is unsupported.
 
-**The API reports `workspace_persistence_unavailable` for one Windows volume
-but not another.**
-Windows has no `openat` namespace either, so the storage layer accepts a
-pathname fallback only after proving on that specific volume that an open
-descendant handle blocks an ancestor rename. Ordinary NTFS volumes pass and get
-full workspace-local storage, so include `.cc-web/` in your backups. Some
-network shares and filtered filesystems do not, and those workspaces report this
-error; keep such a workspace on a local NTFS volume if you want its history
-stored beside the code. `GET /api/sessions/persistence` reports which roots are
-loaded and which are unavailable.
+An unclean shutdown is reclaimed automatically only when the app can prove the
+recorded process incarnation is gone on this machine. A workspace copied from
+another host deliberately keeps an unprovable writer record fail-closed. If the
+copy is private and the source machine cannot access it, close every app using
+the copy and remove only `.cc-web/.session-state.writer*`; never do this to a
+shared or network-mounted workspace.
+
+Windows has no `openat` namespace either. The helper verifies the exact working
+directory before each relative mutation, while Win32 prevents that process cwd
+from being renamed or removed. Providers which cannot preserve those semantics
+fail closed; keep the workspace on a local filesystem. `GET
+/api/sessions/persistence` reports which roots are loaded and unavailable.
 
 **The API reports `workspace_persistence_unavailable`, or migration is
 incomplete.**
@@ -272,9 +275,9 @@ legacy assignments remain quarantined rather than choosing an owner silently.
 
 If the error contains `UNSAFE_WORKSPACE_STORAGE`, the current filesystem could
 not prove race-safe directory/file binding. Remove symlinks and check ownership
-first. On network, FUSE, unusual Windows volumes, or macOS/BSD systems without a
-working `/dev/fd`, move the workspace to a local filesystem that supports the
-required handle semantics. The server intentionally has no global-data fallback.
+first. On network or FUSE filesystems, or unusual Windows volumes, move the
+workspace to a local filesystem that supports the required cwd/descriptor semantics.
+The server intentionally has no global-data fallback.
 
 **A managed project reports that its session archive is crash-staged.**
 Do not rename, copy or delete the deterministic

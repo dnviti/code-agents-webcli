@@ -283,10 +283,16 @@ from this archive.
 
 Mutating an archive also requires a filesystem primitive that can prove the
 opened `.cc-web` directory did not change during the operation. Linux uses a
-verified descriptor-relative path. macOS/BSD use `/dev/fd` only after a live
-create/rename/unlink probe succeeds; Windows requires the volume to prove that
-an open directory handle pins rename/removal. A filesystem or volume that
-cannot provide either guarantee fails closed with `UNSAFE_WORKSPACE_STORAGE`;
+verified descriptor-relative path. macOS uses a one-shot helper whose working
+directory is pinned to the verified parent inode; the helper owns direct-child
+creation, publication, rename and removal. SQLite runs in memory there and
+publishes one complete image atomically, so it creates no WAL, SHM or rollback
+journal sidecars. Portable images are capped at 384 MiB, and one web or desktop
+process owns a workspace's writer lease at a time; account-specific views in
+the same server share that connection. Windows uses the same one-shot helper:
+the child verifies the exact cwd identity, and Win32 pins a process cwd against
+rename or removal while the relative namespace syscall runs. A host that cannot
+provide its platform's guarantee fails closed with `UNSAFE_WORKSPACE_STORAGE`;
 the app never falls back to installation-level session storage.
 
 Electron/Chromium Web Storage contains presentation preferences only. Draft
@@ -394,13 +400,14 @@ For a complete backup, include all three categories:
    [Projects](projects.md) and [Per-user environments](user-environments.md).
 
 Stop the server before a filesystem copy, or use a snapshot mechanism that
-captures each SQLite database together with its `-wal` and `-shm` sidecars.
-Restore `.cc-web` at the same workspace root and preserve its permissions. Do
-not use `--data-dir` as a session-history backup destination: it no longer
-receives new session artifacts. Restoring both the installation data directory
-and each `.cc-web` tree to their original canonical roots preserves archive
-authentication; restoring only `.cc-web` keeps the recorded history but causes
-the operational controls described above to be reset safely.
+captures each Linux SQLite database together with its `-wal` and `-shm`
+sidecars. The Windows/macOS backend publishes a complete database image and has
+no sidecars. Restore `.cc-web` at the same workspace root and preserve its
+permissions. Do not use `--data-dir` as a session-history backup destination:
+it no longer receives new session artifacts. Restoring both the installation
+data directory and each `.cc-web` tree to their original canonical roots
+preserves archive authentication; restoring only `.cc-web` keeps the recorded
+history but causes the operational controls described above to be reset safely.
 
 ## Examples
 

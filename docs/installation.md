@@ -10,7 +10,7 @@ You do not need a C++ toolchain, and there is no `npm rebuild` step.
 
 | | |
 | --- | --- |
-| **Node** | 22.13 or newer. That is the first release with an unflagged `node:sqlite`, which the app stores everything in. Check with `node --version`. |
+| **Node** | 24.16 or newer. The app uses `node:sqlite` serialization APIs to publish the workspace database safely on every supported desktop host. Check with `node --version`. |
 | **A GitHub OAuth App** | Sign-in is GitHub-only, and the app cannot serve a login page without one. [Set it up first](github-oauth.md) — it takes about a minute. |
 | **`openssl`** | On `PATH`. The server shells out to it to generate its own certificate authority on first start. Almost every system already has it; `dnf install openssl` / `apt install openssl` if not. Not needed if you bring [your own certificate](https-and-certificates.md#using-your-own-certificate). |
 | **A browser** | Anything current. The UI installs as a PWA if you want it to. |
@@ -141,7 +141,7 @@ starts.
 disabled"** — npm 12 without the flag. Add `--allow-git=all`, or set it once
 with `npm config set allow-git all`.
 
-**"needs Node 22.13 or newer"** — exactly what it says; the app refuses to start
+**"needs Node 24.16 or newer"** — exactly what it says; the app refuses to start
 rather than failing later with a confusing `Cannot find module 'node:sqlite'`.
 Upgrade Node.
 

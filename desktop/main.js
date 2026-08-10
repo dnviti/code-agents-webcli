@@ -592,9 +592,6 @@ async function runSmokeCheck(started) {
     workspaceRoot: path.join(workingDir, 'workspace-smoke'),
     dataDir: started.server.database.storageDir,
   });
-  // The mode is reported rather than assumed: workspace-local persistence is
-  // available only where the storage layer can prove race-safe directory
-  // binding, which today means Linux.
   console.log(`DESKTOP_WORKSPACE_ATTACHMENT_SMOKE_OK bytes=${persistence.bytes} ${persistence.mode}`);
   console.log('DESKTOP_SMOKE_STAGE packaged-renderer');
   await runPackagedRendererSmoke(started, persistence.sessionName);

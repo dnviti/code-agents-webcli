@@ -14,6 +14,7 @@ const { createWorkspaceRoutes } = require('../dist/server/routes/workspace.js');
 // own directory, and refuse a path outside it.
 
 let repo;
+let workspaceBase;
 let server;
 let base;
 let sessions;
@@ -67,7 +68,9 @@ async function get(url) {
 before(function () {
   this.timeout(30000);
 
-  repo = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'workspace-route-')));
+  workspaceBase = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'workspace-route-base-')));
+  repo = path.join(workspaceBase, 'repository');
+  fs.mkdirSync(repo);
   git('init', '-q', '-b', 'main');
   git('config', 'user.email', 'test@example.com');
   git('config', 'user.name', 'Test');
@@ -101,7 +104,7 @@ before(function () {
       // directory, which is what these fixtures live under — the real server
       // uses the user's home or the folder-mode root.
       validatePath: (target) => {
-        const base = fs.realpathSync(os.tmpdir());
+        const base = workspaceBase;
         const resolved = path.resolve(target);
         const ok = resolved === base || resolved.startsWith(base + path.sep);
         return ok ? { valid: true, path: resolved } : { valid: false, error: 'outside' };
@@ -125,7 +128,7 @@ before(function () {
 
 after(function () {
   if (server) server.close();
-  if (repo) fs.rmSync(repo, { recursive: true, force: true });
+  if (workspaceBase) fs.rmSync(workspaceBase, { recursive: true, force: true });
 });
 
 describe('workspace routes', function () {
@@ -808,7 +811,7 @@ describe('workspace routes', function () {
     it('refuses a session whose working directory is outside the allowed base', async function () {
       // A session record outlives the configuration that admitted it: the base
       // folder can be narrowed between runs and the record is restored anyway.
-      const outside = fs.mkdtempSync(path.join(os.homedir(), '.workspace-outside-'));
+      const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'workspace-outside-'));
       sessions.set('stale', sessionRecord({ id: 'stale', workingDir: outside }));
       try {
         const { status } = await get('/api/workspace/stale/files');

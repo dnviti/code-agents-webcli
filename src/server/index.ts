@@ -290,6 +290,9 @@ export class ClaudeCodeWebServer {
   private startInProgress: boolean;
   private shutdownRequested: boolean;
   private shutdownExecution: Promise<void> | null;
+  /** True only after runtime/network teardown reached retryable storage closes. */
+  private shutdownFinalizationPending: boolean;
+  private shutdownTerminalError: unknown | null;
   private shutdownWaiter: {
     promise: Promise<void>;
     resolve: () => void;
@@ -403,6 +406,8 @@ export class ClaudeCodeWebServer {
     this.startInProgress = false;
     this.shutdownRequested = false;
     this.shutdownExecution = null;
+    this.shutdownFinalizationPending = false;
+    this.shutdownTerminalError = null;
     this.shutdownWaiter = null;
     let dataDirWriterConstructionStarted = false;
     try {
@@ -2028,7 +2033,7 @@ export class ClaudeCodeWebServer {
         });
       }
       if (!(await this.saveSessionsToDisk(persistenceSnapshot))) {
-        throw new Error('Workspace session state could not be flushed before project replacement');
+        throw new Error('Workspace storage authority could not be flushed before project replacement');
       }
       const identity = this.sessionStore.workspaceStorageIdentity(scope);
       if (!identity) {
@@ -2923,7 +2928,17 @@ export class ClaudeCodeWebServer {
     this.shutdownExecution = execution;
     void execution.then(
       () => this.shutdownWaiter?.resolve(),
-      (error) => this.shutdownWaiter?.reject(error),
+      (error) => {
+        this.shutdownWaiter?.reject(error);
+        this.shutdownWaiter = null;
+        // A provider close may fail transiently while deliberately retaining
+        // its workspace authority and facade. Permit a later shutdown() call
+        // to retry only these idempotent finalizers; never replay runtime or
+        // listener teardown after an earlier-stage failure.
+        if (this.shutdownFinalizationPending && this.shutdownExecution === execution) {
+          this.shutdownExecution = null;
+        }
+      },
     );
     return execution;
   }
@@ -2932,7 +2947,8 @@ export class ClaudeCodeWebServer {
 
     let shutdownError: unknown;
     try {
-      await this.shutdownWithDataDirLeaseHeld();
+      if (this.shutdownFinalizationPending) this.finishShutdownStorage();
+      else await this.shutdownWithDataDirLeaseHeld();
     } catch (error) {
       shutdownError = error;
     }
@@ -3100,12 +3116,28 @@ export class ClaudeCodeWebServer {
     // Usage stores borrow the workspace SessionStore handles. Drop their
     // references before closing those SQLite databases, then close the
     // installation database last.
-    this.usageStore.close();
-    this.sessionStore.closeWorkspaces();
-    closeWorkspaceSessionDirectoryLeases();
-    this.database.close();
-    this.dataDirWritersClosed = true;
-    if (finalPersistenceError) throw finalPersistenceError;
+    this.shutdownTerminalError = finalPersistenceError;
+    this.shutdownFinalizationPending = true;
+    this.finishShutdownStorage();
+  }
+
+  private finishShutdownStorage(): void {
+    let shutdownFailure: unknown = null;
+    const finish = (operation: () => void): void => {
+      try { operation(); } catch (error) { shutdownFailure ??= error; }
+    };
+    finish(() => this.usageStore.close());
+    finish(() => this.sessionStore.closeWorkspaces());
+    finish(() => closeWorkspaceSessionDirectoryLeases());
+    try {
+      this.database.close();
+      this.dataDirWritersClosed = true;
+    } catch (error) {
+      shutdownFailure ??= error;
+    }
+    if (shutdownFailure) throw shutdownFailure;
+    this.shutdownFinalizationPending = false;
+    if (this.shutdownTerminalError) throw this.shutdownTerminalError;
   }
 
   private setupExpress(): void {

@@ -17,6 +17,7 @@ import {
   unlinkSessionEntry,
   writePreparedSessionFile,
 } from './safe-session-file.js';
+import { workspaceSessionFileParentLease } from './workspace-session-storage.js';
 
 /**
  * Append-only store of finalised scrollback lines, addressable by absolute line
@@ -306,7 +307,9 @@ export class HistoryStore implements HistoryStoreLike {
   }
 
   private async appendNow(base: string, lines: string[]): Promise<void> {
-    await fs.promises.mkdir(path.dirname(base), { recursive: true });
+    if (!workspaceSessionFileParentLease(`${base}.log`)) {
+      await fs.promises.mkdir(path.dirname(base), { recursive: true });
+    }
 
     const existed = this.states.has(base);
     const state = await this.loadState(base);

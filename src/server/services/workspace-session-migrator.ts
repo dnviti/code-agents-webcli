@@ -4,18 +4,33 @@ import path from 'node:path';
 import {
   closeWorkspaceSessionDirectoryLease,
   ensureWorkspaceSessionDirectory,
+  openCanonicalDirectoryLeaseSync,
   openWorkspaceAttachmentDirectorySync,
   openWorkspaceAttachmentRootDirectorySync,
   openWorkspacePasteDirectorySync,
   workspaceSessionAccessDirectory,
   workspaceDescriptorRoot,
-  resolveWorkspaceEntryMutationPolicy,
-  workspacePathMutationsAreHandlePinned,
   WorkspaceSessionIdentity,
   type WorkspaceStorageDirectoryLease,
   workspaceSessionDirectory,
+  workspaceSessionFileParentLease,
 } from './workspace-session-storage.js';
-import { unlinkSessionEntry } from './safe-session-file.js';
+import { openWorkspaceCwdFileForRead, unlinkSessionEntry } from './safe-session-file.js';
+import {
+  fingerprintWorkspaceCwdFile,
+  inspectWorkspaceCwdDirectory,
+  publishLargeWorkspaceCwdFile,
+  publishNewLargeWorkspaceCwdFile,
+  publishNewWorkspaceCwdFile,
+  removeWorkspaceCwdEntry,
+  recoverMigrationWorkspaceCwdRetirement,
+  recoverWorkspaceCwdPublication,
+  retireMigrationWorkspaceCwdEntry,
+  readWorkspaceCwdFile,
+  listWorkspaceCwdEntries,
+  migrationWorkspaceCwdRetirementPrefix,
+  statWorkspaceCwdFile,
+} from './workspace-cwd-helper.js';
 import {
   DEFAULT_ATTACHMENT_QUOTA_BYTES,
   DEFAULT_MAX_ATTACHMENT_BYTES,
@@ -135,6 +150,10 @@ interface ArtifactPaths {
   sourceDirectoryMissing?: boolean;
   /** Revalidate a pathname fallback or the visible binding around source I/O. */
   verifySourceDirectory?: () => void;
+  /** Exact destination namespace for cwd-helper publication outside session-file leases. */
+  targetLease?: WorkspaceStorageDirectoryLease;
+  /** Exact source namespace for cwd-helper backup and retirement mutations. */
+  sourceLease?: WorkspaceStorageDirectoryLease;
 }
 
 interface Fingerprint {
@@ -170,6 +189,8 @@ interface PreparedArtifact {
 }
 
 type BigFileStat = fs.BigIntStats;
+type ArtifactDirectoryLease = Pick<WorkspaceStorageDirectoryLease,
+  'canonicalPath' | 'accessPath' | 'fd' | 'pathFallback' | 'entryMutationPolicy' | 'verify'>;
 
 type DirectorySyncReason =
   | 'publish'
@@ -184,6 +205,8 @@ interface PinnedLegacyDirectoryLease {
   readonly canonicalPath: string;
   readonly accessPath: string;
   readonly fd: number;
+  readonly pathFallback: boolean;
+  readonly entryMutationPolicy: WorkspaceStorageDirectoryLease['entryMutationPolicy'];
   verify(): void;
   close(): void;
 }
@@ -315,6 +338,34 @@ async function lstatOrNull(target: string): Promise<BigFileStat | null> {
   });
 }
 
+async function leaseAwareFileStatOrNull(
+  target: string,
+  lease: ArtifactDirectoryLease | undefined,
+  unsafeReason: LegacyArtifactBlockReason,
+): Promise<BigFileStat | null> {
+  if (lease?.entryMutationPolicy !== 'cwd-helper') return lstatOrNull(target);
+  if (path.dirname(target) !== lease.accessPath && path.dirname(target) !== lease.canonicalPath) {
+    throw Object.assign(new Error('Portable migration file is outside its pinned namespace'), {
+      migrationReason: unsafeReason,
+    });
+  }
+  let handle: fs.promises.FileHandle;
+  try {
+    handle = openWorkspaceCwdFileForRead(lease, path.basename(target));
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+    throw Object.assign(error as object, { migrationReason: unsafeReason });
+  }
+  try {
+    return await handle.stat({ bigint: true });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+    throw Object.assign(error as object, { migrationReason: unsafeReason });
+  } finally {
+    await handle.close().catch(() => undefined);
+  }
+}
+
 function boundedMigrationFileBytes(
   stat: BigFileStat,
   maximumBytes: number,
@@ -338,6 +389,20 @@ async function syncDirectory(
   hooks: WorkspaceSessionArtifactMigratorHooks | undefined,
   reason: DirectorySyncReason,
 ): Promise<void> {
+  if (process.platform === 'win32') {
+    // Every Windows namespace mutation is already performed by the cwd helper.
+    // Win32 pins that cwd for containment, while Node cannot FlushFileBuffers
+    // on directory handles. Revalidate the visible directory and preserve the
+    // durability hook without turning that documented limitation into failure.
+    const opened = await fs.promises.lstat(directory, { bigint: true });
+    if (opened.isSymbolicLink() || !opened.isDirectory()) {
+      throw Object.assign(new Error('Migration durability target is not a directory'), {
+        migrationReason: 'io_error',
+      });
+    }
+    await hooks?.afterDirectorySync?.({ directory, reason });
+    return;
+  }
   const descriptorRoot = workspaceDescriptorRoot();
   const descriptorRelative = descriptorRoot
     ? path.relative(descriptorRoot, directory)
@@ -397,57 +462,10 @@ function unsafePinnedLegacyDirectory(message: string): Error {
 }
 
 function openPinnedLegacyRoot(canonicalPath: string): PinnedLegacyDirectoryLease {
-  const descriptorRoot = workspaceDescriptorRoot();
-  const visible = fs.lstatSync(canonicalPath, { bigint: true });
-  if (
-    visible.isSymbolicLink()
-    || !visible.isDirectory()
-    || fs.realpathSync(canonicalPath) !== canonicalPath
-  ) {
-    throw unsafePinnedLegacyDirectory('Legacy storage root is not a canonical directory');
-  }
-  const fd = fs.openSync(canonicalPath, fs.constants.O_RDONLY | NO_FOLLOW | DIRECTORY);
-  const accessPath = descriptorRoot
-    ? path.join(descriptorRoot, String(fd))
-    : canonicalPath;
-  const policy = resolveWorkspaceEntryMutationPolicy(
-    descriptorRoot,
-    process.platform,
-    descriptorRoot === null && workspacePathMutationsAreHandlePinned(canonicalPath, fd),
-  );
-  let closed = false;
-  const verify = (): void => {
-    if (closed) throw unsafePinnedLegacyDirectory('Legacy storage descriptor is closed');
-    const opened = fs.fstatSync(fd, { bigint: true });
-    const current = fs.lstatSync(canonicalPath, { bigint: true });
-    if (
-      policy === 'deny'
-      || current.isSymbolicLink()
-      || fs.realpathSync(canonicalPath) !== canonicalPath
-      || !sameDirectoryIdentity(visible, opened)
-      || !sameDirectoryIdentity(opened, current)
-      || (accessPath !== canonicalPath && fs.realpathSync(accessPath) !== canonicalPath)
-    ) {
-      throw unsafePinnedLegacyDirectory('Legacy storage root changed while pinned');
-    }
-  };
   try {
-    verify();
-    return {
-      canonicalPath,
-      accessPath,
-      fd,
-      verify,
-      close(): void {
-        if (closed) return;
-        closed = true;
-        fs.closeSync(fd);
-      },
-    };
+    return openCanonicalDirectoryLeaseSync(canonicalPath);
   } catch (error) {
-    closed = true;
-    fs.closeSync(fd);
-    throw error;
+    throw Object.assign(error as object, { migrationReason: 'unsafe_legacy_storage' });
   }
 }
 
@@ -459,15 +477,25 @@ function openPinnedLegacyChild(
   safeComponent(component, 'legacy directory component');
   const canonicalPath = path.join(parent.canonicalPath, component);
   const lookupPath = path.join(parent.accessPath, component);
-  let visible: BigFileStat;
-  try {
-    visible = fs.lstatSync(canonicalPath, { bigint: true });
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
-    throw error;
-  }
-  if (visible.isSymbolicLink() || !visible.isDirectory()) {
-    throw unsafePinnedLegacyDirectory('Legacy storage component is not a real directory');
+  let helperIdentity: { dev: bigint; ino: bigint } | undefined;
+  let visible: BigFileStat | undefined;
+  if (parent.entryMutationPolicy === 'cwd-helper') {
+    try {
+      helperIdentity = inspectWorkspaceCwdDirectory(parent, component);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+      throw error;
+    }
+  } else {
+    try {
+      visible = fs.lstatSync(canonicalPath, { bigint: true });
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+      throw error;
+    }
+    if (visible.isSymbolicLink() || !visible.isDirectory()) {
+      throw unsafePinnedLegacyDirectory('Legacy storage component is not a real directory');
+    }
   }
   const fd = fs.openSync(lookupPath, fs.constants.O_RDONLY | NO_FOLLOW | DIRECTORY);
   const descriptorRoot = workspaceDescriptorRoot();
@@ -481,7 +509,9 @@ function openPinnedLegacyChild(
     if (
       current.isSymbolicLink()
       || fs.realpathSync(canonicalPath) !== canonicalPath
-      || !sameDirectoryIdentity(visible, opened)
+      || (helperIdentity
+        ? opened.dev !== helperIdentity.dev || opened.ino !== helperIdentity.ino
+        : !sameDirectoryIdentity(visible!, opened))
       || !sameDirectoryIdentity(opened, current)
       || (accessPath !== canonicalPath && fs.realpathSync(accessPath) !== canonicalPath)
     ) {
@@ -494,6 +524,8 @@ function openPinnedLegacyChild(
       canonicalPath,
       accessPath,
       fd,
+      pathFallback: accessPath === canonicalPath,
+      entryMutationPolicy: parent.entryMutationPolicy,
       verify,
       close(): void {
         if (closed) return;
@@ -559,6 +591,7 @@ function pinFixedArtifactDefinitions(
           source,
           sourceRoot: parent.accessPath,
           backup: backupPath(source),
+          sourceLease: parent,
           verifySourceDirectory: parent.verify,
         };
       }),
@@ -680,7 +713,17 @@ async function fingerprintPublishedFile(
   unsafeReason: LegacyArtifactBlockReason,
   hooks?: WorkspaceSessionArtifactMigratorHooks,
   maximumBytes?: number,
+  targetLease?: Pick<WorkspaceStorageDirectoryLease, 'canonicalPath' | 'fd' | 'verify' | 'entryMutationPolicy'>,
 ): Promise<Fingerprint> {
+  const helperLease = targetLease ?? workspaceSessionFileParentLease(target);
+  if (helperLease?.entryMutationPolicy === 'cwd-helper') {
+    recoverWorkspaceCwdPublication(helperLease, path.basename(target));
+    try {
+      return fingerprintWorkspaceCwdFile(helperLease, path.basename(target), maximumBytes);
+    } catch (error) {
+      throw Object.assign(error as object, { migrationReason: unsafeReason });
+    }
+  }
   const targetStat = await lstatOrNull(target);
   if (
     !targetStat
@@ -808,7 +851,93 @@ async function copyAndPublish(
   unsafeReason: LegacyArtifactBlockReason,
   hooks?: WorkspaceSessionArtifactMigratorHooks,
   maximumBytes?: number,
+  targetLease?: ArtifactDirectoryLease,
+  sourceLease?: WorkspaceStorageDirectoryLease,
+  sourceName?: string,
 ): Promise<Fingerprint> {
+  const helperLease = targetLease ?? workspaceSessionFileParentLease(target) ?? undefined;
+  if (helperLease?.entryMutationPolicy === 'cwd-helper') {
+    const hash = createHash('sha256');
+    const chunk = Buffer.allocUnsafe(COPY_CHUNK_BYTES);
+    let offset = 0;
+    publishNewLargeWorkspaceCwdFile(helperLease, path.basename(target), (writeTargetChunk) => {
+      for (;;) {
+        const remaining = maximumBytes === undefined
+          ? chunk.length
+          : Math.min(chunk.length, maximumBytes + 1 - offset);
+        if (remaining <= 0) throw Object.assign(new Error('Migration artifact exceeds its per-file limit'), {
+          migrationReason: unsafeReason,
+        });
+        let bytesRead: number;
+        if (sourceLease?.entryMutationPolicy === 'cwd-helper') {
+          if (!sourceName) throw Object.assign(new Error('Portable migration source name is missing'), {
+            migrationReason: 'unsafe_source',
+          });
+          const result = readWorkspaceCwdFile(
+            sourceLease,
+            sourceName,
+            offset,
+            remaining,
+            { dev: sourceBefore.dev, ino: sourceBefore.ino },
+          );
+          const bytes = Buffer.from(result.data, 'base64');
+          if (
+            bytes.length > remaining
+            || bytes.toString('base64') !== result.data
+            || result.dev !== sourceBefore.dev
+            || result.ino !== sourceBefore.ino
+            || BigInt(result.size) !== sourceBefore.size
+            || result.nlink === undefined || BigInt(result.nlink) !== sourceBefore.nlink
+            || result.mtimeNs === undefined || BigInt(result.mtimeNs) !== sourceBefore.mtimeNs
+            || result.ctimeNs === undefined || BigInt(result.ctimeNs) !== sourceBefore.ctimeNs
+          ) {
+            throw Object.assign(new Error('Portable migration source changed while it was copied'), {
+              migrationReason: 'source_changed',
+            });
+          }
+          bytes.copy(chunk, 0);
+          bytesRead = bytes.length;
+        } else {
+          bytesRead = fs.readSync(sourceHandle.fd, chunk, 0, remaining, offset);
+        }
+        if (bytesRead === 0) break;
+        writeTargetChunk(chunk.subarray(0, bytesRead), offset);
+        hash.update(chunk.subarray(0, bytesRead));
+        offset += bytesRead;
+        if (maximumBytes !== undefined && offset > maximumBytes) {
+          throw Object.assign(new Error('Migration artifact exceeds its per-file limit'), {
+            migrationReason: unsafeReason,
+          });
+        }
+      }
+      const sourceAfter = sourceLease?.entryMutationPolicy === 'cwd-helper'
+        ? statWorkspaceCwdFile(
+          sourceLease,
+          sourceName!,
+          { dev: sourceBefore.dev, ino: sourceBefore.ino },
+        )
+        : fs.fstatSync(sourceHandle.fd, { bigint: true });
+      const sourceStayedStable = sourceLease?.entryMutationPolicy === 'cwd-helper'
+        ? sourceAfter.dev === sourceBefore.dev
+          && sourceAfter.ino === sourceBefore.ino
+          && sourceAfter.size === sourceBefore.size
+          && sourceAfter.nlink === sourceBefore.nlink
+          && sourceAfter.mtimeNs === sourceBefore.mtimeNs
+          && sourceAfter.ctimeNs === sourceBefore.ctimeNs
+        : stableFile(sourceBefore, sourceAfter as BigFileStat);
+      if (!sourceStayedStable || BigInt(offset) !== sourceAfter.size) {
+        throw Object.assign(new Error('Source changed while it was copied'), {
+          migrationReason: 'source_changed',
+        });
+      }
+    });
+    const expected = { bytes: offset, sha256: hash.digest('hex') };
+    const published = await fingerprintPublishedFile(target, unsafeReason, hooks, maximumBytes, helperLease);
+    if (!sameFingerprint(expected, published)) throw Object.assign(
+      new Error('Published file changed before isolation'), { migrationReason: unsafeReason },
+    );
+    return published;
+  }
   const temporary = path.join(
     path.dirname(target),
     `${controlledPublishTemporaryStem(target)}-${process.pid}-${randomBytes(8).toString('hex')}.tmp`,
@@ -907,7 +1036,18 @@ async function publishBuffer(
   target: string,
   unsafeReason: LegacyArtifactBlockReason,
   hooks?: WorkspaceSessionArtifactMigratorHooks,
+  targetLease?: ArtifactDirectoryLease,
 ): Promise<Fingerprint> {
+  const helperLease = targetLease ?? workspaceSessionFileParentLease(target) ?? undefined;
+  if (helperLease?.entryMutationPolicy === 'cwd-helper') {
+    publishNewWorkspaceCwdFile(helperLease, path.basename(target), buffer);
+    const expected = fingerprintBuffer(buffer);
+    const published = await fingerprintPublishedFile(target, unsafeReason, hooks, undefined, helperLease);
+    if (!sameFingerprint(expected, published)) throw Object.assign(
+      new Error('Generated artifact changed before isolation'), { migrationReason: unsafeReason },
+    );
+    return published;
+  }
   const temporary = path.join(
     path.dirname(target),
     `${controlledPublishTemporaryStem(target)}-${process.pid}-${randomBytes(8).toString('hex')}.tmp`,
@@ -1064,19 +1204,14 @@ async function assertCanonicalSourceRoot(root: string): Promise<'available' | 'a
       migrationReason: 'unsafe_source',
     });
   }
-  const stat = await lstatOrNull(root);
-  if (!stat) return 'absent';
-  if (stat.isSymbolicLink() || !stat.isDirectory()) {
-    throw Object.assign(new Error('Legacy workspace root is not a safe directory'), {
-      migrationReason: 'unsafe_source',
-    });
+  let lease: WorkspaceStorageDirectoryLease;
+  try {
+    lease = openCanonicalDirectoryLeaseSync(root);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return 'absent';
+    throw Object.assign(error as object, { migrationReason: 'unsafe_source' });
   }
-  if (await fs.promises.realpath(root) !== root) {
-    throw Object.assign(new Error('Legacy workspace root is reached through a symlink'), {
-      migrationReason: 'unsafe_source',
-    });
-  }
-  return 'available';
+  try { lease.verify(); return 'available'; } finally { lease.close(); }
 }
 
 async function readBoundedStableFile(
@@ -1084,12 +1219,17 @@ async function readBoundedStableFile(
   maximumBytes: number,
   unsafeReason: LegacyArtifactBlockReason,
   hooks?: WorkspaceSessionArtifactMigratorHooks,
+  targetLease?: ArtifactDirectoryLease,
 ): Promise<Buffer | null> {
-  const visible = await lstatOrNull(target);
+  const helperLease = targetLease ?? workspaceSessionFileParentLease(target) ?? undefined;
+  if (helperLease?.entryMutationPolicy === 'cwd-helper' && unsafeReason === 'unsafe_target') {
+    recoverWorkspaceCwdPublication(helperLease, path.basename(target));
+  }
+  const visible = await leaseAwareFileStatOrNull(target, helperLease, unsafeReason);
   if (!visible) return null;
   if (visible.nlink !== 1n && unsafeReason === 'unsafe_target') {
-    await fingerprintPublishedFile(target, unsafeReason, hooks, maximumBytes);
-    return readBoundedStableFile(target, maximumBytes, unsafeReason, hooks);
+    await fingerprintPublishedFile(target, unsafeReason, hooks, maximumBytes, helperLease);
+    return readBoundedStableFile(target, maximumBytes, unsafeReason, hooks, helperLease);
   }
   if (
     visible.isSymbolicLink()
@@ -1101,9 +1241,11 @@ async function readBoundedStableFile(
       migrationReason: unsafeReason,
     });
   }
-  const handle = await fs.promises.open(target, READ_FLAGS).catch((error: NodeJS.ErrnoException) => {
-    throw Object.assign(error, { migrationReason: unsafeReason });
-  });
+  const handle = helperLease?.entryMutationPolicy === 'cwd-helper'
+    ? openWorkspaceCwdFileForRead(helperLease, path.basename(target))
+    : await fs.promises.open(target, READ_FLAGS).catch((error: NodeJS.ErrnoException) => {
+      throw Object.assign(error, { migrationReason: unsafeReason });
+    });
   try {
     const before = await handle.stat({ bigint: true });
     if (
@@ -1126,7 +1268,7 @@ async function readBoundedStableFile(
       offset += bytesRead;
     }
     const after = await handle.stat({ bigint: true });
-    const visibleAfter = await lstatOrNull(target);
+    const visibleAfter = await leaseAwareFileStatOrNull(target, helperLease, unsafeReason);
     if (
       offset > maximumBytes
       || offset !== Number(before.size)
@@ -1168,17 +1310,23 @@ async function collectAttachmentReferencesFromFile(
   names: Set<string>,
   unsafeReason: LegacyArtifactBlockReason,
   hooks?: WorkspaceSessionArtifactMigratorHooks,
+  targetLease?: ArtifactDirectoryLease,
 ): Promise<void> {
-  const visible = await lstatOrNull(target);
+  const helperLease = targetLease ?? workspaceSessionFileParentLease(target) ?? undefined;
+  if (helperLease?.entryMutationPolicy === 'cwd-helper' && unsafeReason === 'unsafe_target') {
+    recoverWorkspaceCwdPublication(helperLease, path.basename(target));
+  }
+  const visible = await leaseAwareFileStatOrNull(target, helperLease, unsafeReason);
   if (!visible) return;
   if (visible.nlink !== 1n && unsafeReason === 'unsafe_target') {
-    await fingerprintPublishedFile(target, unsafeReason, hooks);
+    await fingerprintPublishedFile(target, unsafeReason, hooks, undefined, helperLease);
     return collectAttachmentReferencesFromFile(
       target,
       sessionId,
       names,
       unsafeReason,
       hooks,
+      helperLease,
     );
   }
   if (visible.isSymbolicLink() || !visible.isFile() || visible.nlink !== 1n) {
@@ -1186,9 +1334,11 @@ async function collectAttachmentReferencesFromFile(
       migrationReason: unsafeReason,
     });
   }
-  const handle = await fs.promises.open(target, READ_FLAGS).catch((error: NodeJS.ErrnoException) => {
-    throw Object.assign(error, { migrationReason: unsafeReason });
-  });
+  const handle = helperLease?.entryMutationPolicy === 'cwd-helper'
+    ? openWorkspaceCwdFileForRead(helperLease, path.basename(target))
+    : await fs.promises.open(target, READ_FLAGS).catch((error: NodeJS.ErrnoException) => {
+      throw Object.assign(error, { migrationReason: unsafeReason });
+    });
   const prefix = `/api/sessions/${encodeURIComponent(sessionId)}/chat-attachments/`;
   const overlap = prefix.length + 140;
   const chunk = Buffer.alloc(64 * 1024);
@@ -1229,7 +1379,7 @@ async function collectAttachmentReferencesFromFile(
       offset += bytesRead;
     }
     const after = await handle.stat({ bigint: true });
-    const visibleAfter = await lstatOrNull(target);
+    const visibleAfter = await leaseAwareFileStatOrNull(target, helperLease, unsafeReason);
     if (
       !visibleAfter
       || !sameFileIdentity(after, visibleAfter)
@@ -1270,6 +1420,26 @@ async function namespacedAttachmentNames(
   let scanned = 0;
   try {
     lease.verify();
+    if (lease.entryMutationPolicy === 'cwd-helper') {
+      const entries = listWorkspaceCwdEntries(lease);
+      scanned = entries.length;
+      if (scanned > MAX_ATTACHMENT_DIRECTORY_ENTRIES) {
+        throw Object.assign(new Error('Legacy attachment directory exceeds its scan bound'), {
+          migrationReason: 'unsafe_source',
+        });
+      }
+      for (const entry of entries) {
+        if (entry.type !== 'file' || !STORED_ATTACHMENT_NAME.test(entry.name)) continue;
+        names.push(entry.name);
+        if (names.length > MAX_ATTACHMENT_FILES) {
+          throw Object.assign(new Error('Legacy attachment namespace exceeds its bound'), {
+            migrationReason: 'unsafe_source',
+          });
+        }
+      }
+      lease.verify();
+      return names;
+    }
     const opened = await fs.promises.opendir(lease.accessPath);
     try {
       for await (const entry of opened) {
@@ -1366,9 +1536,15 @@ async function sourceOrBackup(definition: ArtifactPaths): Promise<string | null>
   definition.verifySourceDirectory?.();
   await recoverLegacyRetirement(definition, definition.source);
   await recoverLegacyRetirement(definition, definition.backup);
-  if (await lstatOrNull(definition.source)) return definition.source;
+  if (await leaseAwareFileStatOrNull(
+    definition.source,
+    definition.sourceLease,
+    'unsafe_source',
+  )) return definition.source;
   const backup = definition.backup;
-  return await lstatOrNull(backup) ? backup : null;
+  return await leaseAwareFileStatOrNull(backup, definition.sourceLease, 'unsafe_source')
+    ? backup
+    : null;
 }
 
 async function buildBinaryArtifactPlan(
@@ -1426,6 +1602,7 @@ async function buildBinaryArtifactPlan(
           attachmentNames,
           'unsafe_source',
           hooks,
+          definition.sourceLease,
         );
       }
       await collectAttachmentReferencesFromFile(
@@ -1434,6 +1611,7 @@ async function buildBinaryArtifactPlan(
         attachmentNames,
         'unsafe_target',
         hooks,
+        definition.targetLease,
       );
       if (attachmentNames.size > MAX_ATTACHMENT_FILES) {
         throw Object.assign(new Error('Legacy attachment reference count exceeds its bound'), {
@@ -1443,7 +1621,7 @@ async function buildBinaryArtifactPlan(
     }
 
     for (const root of roots) {
-      if (!await lstatOrNull(root)) continue;
+      if (await assertCanonicalSourceRoot(root) === 'absent') continue;
       for (const namespace of new Set([ownerKey, String(ref.ownerUserId)])) {
         for (const name of await namespacedAttachmentNames(root, namespace, sessionId)) {
           attachmentNames.add(name);
@@ -1506,30 +1684,28 @@ async function buildBinaryArtifactPlan(
         source: string;
         sourceRoot: string;
         backup: string;
+        lease: WorkspaceStorageDirectoryLease;
         verifySourceDirectory: () => void;
       }> = [];
       for (const candidate of [...candidates.values()].sort(
         (left, right) => left.canonical.localeCompare(right.canonical),
       )) {
-        if (
-          !await lstatOrNull(candidate.canonical)
-          && !await lstatOrNull(backupPath(candidate.canonical))
-          && !await lstatOrNull(legacyRetirementDirectory(candidate.canonical))
-          && !await lstatOrNull(legacyRetirementDirectory(backupPath(candidate.canonical)))
-        ) {
-          continue;
-        }
         const canonicalDirectory = path.dirname(candidate.canonical);
         let sourceLease = sourceAttachmentLeases.get(canonicalDirectory);
         if (!sourceLease) {
-          sourceLease = candidate.namespace === null
-            ? openWorkspaceAttachmentRootDirectorySync(candidate.root, { createIfMissing: false })
-            : openWorkspaceAttachmentDirectorySync(
-              candidate.root,
-              candidate.namespace,
-              sessionId,
-              { createIfMissing: false },
-            );
+          try {
+            sourceLease = candidate.namespace === null
+              ? openWorkspaceAttachmentRootDirectorySync(candidate.root, { createIfMissing: false })
+              : openWorkspaceAttachmentDirectorySync(
+                candidate.root,
+                candidate.namespace,
+                sessionId,
+                { createIfMissing: false },
+              );
+          } catch (error) {
+            if ((error as NodeJS.ErrnoException).code === 'ENOENT') continue;
+            throw error;
+          }
           if (sourceLease.canonicalPath !== canonicalDirectory) {
             sourceLease.close();
             throw Object.assign(new Error('Legacy attachment source did not match its pinned namespace'), {
@@ -1540,11 +1716,32 @@ async function buildBinaryArtifactPlan(
           leases.push(sourceLease);
         }
         const source = path.join(sourceLease.accessPath, name);
+        const backup = backupPath(source);
+        const hasAuthority = sourceLease.entryMutationPolicy === 'cwd-helper'
+          ? (() => {
+            const entries = new Set(listWorkspaceCwdEntries(sourceLease!).map((entry) => entry.name));
+            const exactNames = [
+              source,
+              backup,
+              legacyRetirementDirectory(source),
+              legacyRetirementDirectory(backup),
+            ].map((entry) => path.basename(entry));
+            const taggedPrefixes = [path.basename(source), path.basename(backup)]
+              .map((entry) => migrationWorkspaceCwdRetirementPrefix(entry));
+            return exactNames.some((entry) => entries.has(entry))
+              || [...entries].some((entry) => taggedPrefixes.some((prefix) => entry.startsWith(prefix)));
+          })()
+          : (await lstatOrNull(source)) !== null
+            || (await lstatOrNull(backup)) !== null
+            || (await lstatOrNull(legacyRetirementDirectory(source))) !== null
+            || (await lstatOrNull(legacyRetirementDirectory(backup))) !== null;
+        if (!hasAuthority) continue;
         existingSources.push({
           canonical: candidate.canonical,
           source,
           sourceRoot: sourceLease.accessPath,
-          backup: backupPath(source),
+          backup,
+          lease: sourceLease,
           verifySourceDirectory: sourceLease.verify,
         });
       }
@@ -1555,7 +1752,7 @@ async function buildBinaryArtifactPlan(
       // candidate authorities before any of them is hashed or copied, then
       // account the largest candidate exactly once for this name.
       let logicalBytes = 0;
-      const targetStat = await lstatOrNull(target);
+      const targetStat = await leaseAwareFileStatOrNull(target, attachmentLease!, 'unsafe_target');
       if (targetStat) {
         logicalBytes = Math.max(logicalBytes, boundedMigrationFileBytes(
           targetStat,
@@ -1572,6 +1769,8 @@ async function buildBinaryArtifactPlan(
           sourceRoot: existing.sourceRoot,
           target,
           canonicalTarget,
+          targetLease: attachmentLease!,
+          sourceLease: existing.lease,
           backup: existing.backup,
           verifySourceDirectory: existing.verifySourceDirectory,
           required: true,
@@ -1582,9 +1781,17 @@ async function buildBinaryArtifactPlan(
         // pinned authority before quota accounting so it cannot count as zero.
         await recoverLegacyRetirement(retirementDefinition, existing.source, hooks);
         await recoverLegacyRetirement(retirementDefinition, existing.backup, hooks);
-        const sourceStat = await lstatOrNull(existing.source);
+        const sourceStat = await leaseAwareFileStatOrNull(
+          existing.source,
+          existing.lease,
+          'unsafe_source',
+        );
         const authorityPath = sourceStat ? existing.source : existing.backup;
-        const authorityStat = sourceStat ?? await lstatOrNull(authorityPath);
+        const authorityStat = sourceStat ?? await leaseAwareFileStatOrNull(
+          authorityPath,
+          existing.lease,
+          'unsafe_source',
+        );
         if (!authorityStat) continue;
         logicalBytes = Math.max(logicalBytes, boundedMigrationFileBytes(
           authorityStat,
@@ -1600,7 +1807,7 @@ async function buildBinaryArtifactPlan(
       attachmentSessionBytes += logicalBytes;
 
       if (existingSources.length === 0) {
-        if (await lstatOrNull(target)) {
+        if (await leaseAwareFileStatOrNull(target, attachmentLease!, 'unsafe_target')) {
           definitions.push({
             artifact: 'attachment_file',
             key: dynamicArtifactKey('attachment_file', canonicalTarget),
@@ -1608,6 +1815,8 @@ async function buildBinaryArtifactPlan(
             sourceRoot: canonicalRoot,
             target,
             canonicalTarget,
+            targetLease: attachmentLease!,
+            sourceLease: attachmentLease!,
             backup: backupPath(canonicalTarget),
             sourceIsTarget: true,
             required: true,
@@ -1622,6 +1831,7 @@ async function buildBinaryArtifactPlan(
             sourceRoot: canonicalRoot,
             target,
             canonicalTarget,
+            targetLease: attachmentLease!,
             backup: backupPath(source),
             required: true,
             maximumBytes: DEFAULT_MAX_ATTACHMENT_BYTES,
@@ -1637,6 +1847,8 @@ async function buildBinaryArtifactPlan(
           sourceRoot: existing.sourceRoot,
           target,
           canonicalTarget,
+          targetLease: attachmentLease!,
+          sourceLease: existing.lease,
           backup: existing.backup,
           verifySourceDirectory: existing.verifySourceDirectory,
           required: true,
@@ -1648,13 +1860,21 @@ async function buildBinaryArtifactPlan(
     const pasteManifestDefinition = fixed.find((definition) => definition.artifact === 'paste_manifest')!;
     const manifestSource = await sourceOrBackup(pasteManifestDefinition);
     const manifestReadPath = manifestSource
-      ?? (await lstatOrNull(pasteManifestDefinition.target) ? pasteManifestDefinition.target : null);
+      ?? (await leaseAwareFileStatOrNull(
+        pasteManifestDefinition.target,
+        pasteManifestDefinition.targetLease,
+        'unsafe_target',
+      ) ? pasteManifestDefinition.target : null);
     if (manifestReadPath) {
+      const manifestIsTarget = manifestReadPath === pasteManifestDefinition.target;
       const manifestBuffer = await readBoundedStableFile(
         manifestReadPath,
         MAX_PASTE_MANIFEST_BYTES,
-        manifestReadPath === pasteManifestDefinition.target ? 'unsafe_target' : 'unsafe_source',
+        manifestIsTarget ? 'unsafe_target' : 'unsafe_source',
         hooks,
+        manifestIsTarget
+          ? pasteManifestDefinition.targetLease
+          : pasteManifestDefinition.sourceLease,
       );
       const manifest = parsePasteManifest(manifestBuffer!);
       let pasteLease: WorkspaceStorageDirectoryLease | null = null;
@@ -1689,6 +1909,8 @@ async function buildBinaryArtifactPlan(
             sourceRoot: canonicalRoot,
             target,
             canonicalTarget,
+            targetLease: pasteLease!,
+            sourceLease: pasteLease!,
             backup: backupPath(canonicalTarget),
             sourceIsTarget: true,
             required: true,
@@ -1738,8 +1960,10 @@ async function buildBinaryArtifactPlan(
           sourceRoot: safeSourceRoot,
           target,
           canonicalTarget,
+          targetLease: pasteLease!,
           backup,
           ...(sourceAvailability === 'available' ? {
+            sourceLease: sourcePasteLeases.get(sourceRoot)!,
             verifySourceDirectory: sourcePasteLeases.get(sourceRoot)!.verify,
           } : {}),
           required: true,
@@ -1828,19 +2052,14 @@ async function validateLegacyRoot(legacyRoot: string): Promise<'available' | 'ab
       migrationReason: 'unsafe_legacy_storage',
     });
   }
-  const stat = await lstatOrNull(legacyRoot);
-  if (!stat) return 'absent';
-  if (stat.isSymbolicLink() || !stat.isDirectory()) {
-    throw Object.assign(new Error('Legacy storage is not a safe directory'), {
-      migrationReason: 'unsafe_legacy_storage',
-    });
+  let lease: WorkspaceStorageDirectoryLease;
+  try {
+    lease = openCanonicalDirectoryLeaseSync(legacyRoot);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return 'absent';
+    throw Object.assign(error as object, { migrationReason: 'unsafe_legacy_storage' });
   }
-  if (await fs.promises.realpath(legacyRoot) !== legacyRoot) {
-    throw Object.assign(new Error('Legacy storage is reached through a symlink'), {
-      migrationReason: 'unsafe_legacy_storage',
-    });
-  }
-  return 'available';
+  try { lease.verify(); return 'available'; } finally { lease.close(); }
 }
 
 async function prepareArtifact(
@@ -1852,9 +2071,18 @@ async function prepareArtifact(
     const markerArtifact = previousMarker?.artifacts.find(
       (artifact) => (artifact.key ?? artifact.artifact) === definition.key,
     );
+    const targetHelperLease = definition.targetLease
+      ?? workspaceSessionFileParentLease(definition.target);
+    if (targetHelperLease?.entryMutationPolicy === 'cwd-helper') {
+      recoverWorkspaceCwdPublication(targetHelperLease, path.basename(definition.target));
+    }
 
     if (definition.sourceIsTarget) {
-      const targetStat = await lstatOrNull(definition.target);
+      const targetStat = await leaseAwareFileStatOrNull(
+        definition.target,
+        definition.targetLease,
+        'unsafe_target',
+      );
       if (!targetStat) {
         return { definition, entry: blockedArtifact(definition, 'source_changed') };
       }
@@ -1872,6 +2100,7 @@ async function prepareArtifact(
         'unsafe_target',
         hooks,
         definition.maximumBytes,
+        definition.targetLease,
       );
       if (
         definition.targetContents
@@ -1907,8 +2136,16 @@ async function prepareArtifact(
     }
     const sourceStat = definition.sourceDirectoryMissing
       ? null
-      : await lstatOrNull(definition.source);
-    const targetStat = await lstatOrNull(definition.target);
+      : await leaseAwareFileStatOrNull(
+        definition.source,
+        definition.sourceLease,
+        'unsafe_source',
+      );
+    const targetStat = await leaseAwareFileStatOrNull(
+      definition.target,
+      definition.targetLease,
+      'unsafe_target',
+    );
 
     if (targetStat && (targetStat.isSymbolicLink() || !targetStat.isFile())) {
       return { definition, entry: blockedArtifact(definition, 'unsafe_target') };
@@ -1935,6 +2172,7 @@ async function prepareArtifact(
         'unsafe_target',
         hooks,
         definition.maximumBytes,
+        definition.targetLease,
       );
       if (
         definition.targetContents
@@ -1976,11 +2214,13 @@ async function prepareArtifact(
       return { definition, entry: blockedArtifact(definition, 'unsafe_source') };
     }
 
-    const sourceHandle = await fs.promises.open(definition.source, READ_FLAGS).catch(
-      (error: NodeJS.ErrnoException) => {
-        throw Object.assign(error, { migrationReason: 'unsafe_source' });
-      },
-    );
+    const sourceHandle = definition.sourceLease?.entryMutationPolicy === 'cwd-helper'
+      ? openWorkspaceCwdFileForRead(definition.sourceLease, path.basename(definition.source))
+      : await fs.promises.open(definition.source, READ_FLAGS).catch(
+        (error: NodeJS.ErrnoException) => {
+          throw Object.assign(error, { migrationReason: 'unsafe_source' });
+        },
+      );
     try {
       const sourceBefore = await sourceHandle.stat({ bigint: true });
       definition.verifySourceDirectory?.();
@@ -2017,6 +2257,7 @@ async function prepareArtifact(
           'unsafe_target',
           hooks,
           definition.maximumBytes,
+          definition.targetLease,
         );
         if (!sameFingerprint(desiredTarget, targetFingerprint)) {
           return { definition, entry: blockedArtifact(definition, 'target_conflict') };
@@ -2029,6 +2270,7 @@ async function prepareArtifact(
               definition.target,
               'unsafe_target',
               hooks,
+              definition.targetLease,
             );
           } else {
             await copyAndPublish(
@@ -2038,6 +2280,9 @@ async function prepareArtifact(
               'unsafe_target',
               hooks,
               definition.maximumBytes,
+              definition.targetLease,
+              definition.sourceLease,
+              path.basename(definition.source),
             );
           }
         } catch (error) {
@@ -2053,6 +2298,7 @@ async function prepareArtifact(
             'unsafe_target',
             hooks,
             definition.maximumBytes,
+            definition.targetLease,
           );
           if (!sameFingerprint(desiredTarget, targetFingerprint)) {
             return { definition, entry: blockedArtifact(definition, 'target_conflict') };
@@ -2065,6 +2311,7 @@ async function prepareArtifact(
         'unsafe_target',
         hooks,
         definition.maximumBytes,
+        definition.targetLease,
       );
       const sourceAfterPublish = await sourceHandle.stat({ bigint: true });
       definition.verifySourceDirectory?.();
@@ -2225,6 +2472,12 @@ async function writeMarker(
         migrationReason: 'unsafe_target',
       });
     }
+    const helperLease = workspaceSessionFileParentLease(target);
+    if (helperLease?.entryMutationPolicy === 'cwd-helper') {
+      publishLargeWorkspaceCwdFile(helperLease, path.basename(target), serialized);
+      await syncDirectory(targetDir, hooks, 'marker_publish');
+      return;
+    }
     handle = await fs.promises.open(temporary, WRITE_FLAGS, 0o600);
     await handle.writeFile(serialized);
     await handle.sync();
@@ -2299,8 +2552,21 @@ async function copyVerifiedFile(
   target: string,
   hooks?: WorkspaceSessionArtifactMigratorHooks,
   maximumBytes?: number,
+  targetLease?: WorkspaceStorageDirectoryLease,
 ): Promise<Fingerprint> {
-  const sourceStat = await lstatOrNull(source);
+  const helperSourceLease = targetLease?.entryMutationPolicy === 'cwd-helper'
+    && (path.dirname(source) === targetLease.accessPath
+      || path.dirname(source) === targetLease.canonicalPath)
+    ? targetLease
+    : undefined;
+  const handle = helperSourceLease
+    ? openWorkspaceCwdFileForRead(helperSourceLease, path.basename(source))
+    : await fs.promises.open(source, READ_FLAGS).catch((error: NodeJS.ErrnoException) => {
+      throw Object.assign(error, { migrationReason: 'unsafe_source' });
+    });
+  const sourceStat = helperSourceLease
+    ? await handle.stat({ bigint: true })
+    : await lstatOrNull(source);
   if (
     !sourceStat
     || sourceStat.isSymbolicLink()
@@ -2308,13 +2574,11 @@ async function copyVerifiedFile(
     || sourceStat.nlink !== 1n
     || (maximumBytes !== undefined && sourceStat.size > BigInt(maximumBytes))
   ) {
+    await handle.close().catch(() => undefined);
     throw Object.assign(new Error('Expected a safe source file'), {
       migrationReason: 'unsafe_source',
     });
   }
-  const handle = await fs.promises.open(source, READ_FLAGS).catch((error: NodeJS.ErrnoException) => {
-    throw Object.assign(error, { migrationReason: 'unsafe_source' });
-  });
   try {
     const before = await handle.stat({ bigint: true });
     if (
@@ -2334,6 +2598,9 @@ async function copyVerifiedFile(
         'unsafe_source',
         hooks,
         maximumBytes,
+        targetLease,
+        helperSourceLease,
+        path.basename(source),
       );
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
@@ -2349,6 +2616,7 @@ async function copyVerifiedFile(
         'unsafe_source',
         hooks,
         maximumBytes,
+        targetLease,
       );
       if (!sameFingerprint(sourceFingerprint, targetFingerprint)) {
         throw Object.assign(new Error('Migration backup conflicts with source'), {
@@ -2372,7 +2640,11 @@ async function recoverBackup(
   await assertSafeDirectoryTree(definition.sourceRoot, path.dirname(definition.source));
   await recoverLegacyRetirement(definition, definition.source, hooks);
   await recoverLegacyRetirement(definition, definition.backup, hooks);
-  const backupStat = await lstatOrNull(definition.backup);
+  const backupStat = await leaseAwareFileStatOrNull(
+    definition.backup,
+    definition.sourceLease,
+    'unsafe_source',
+  );
   if (!backupStat) return;
   if (backupStat.isSymbolicLink() || !backupStat.isFile()) {
     throw Object.assign(new Error('Unsafe legacy migration backup'), {
@@ -2392,14 +2664,20 @@ async function recoverBackup(
     'unsafe_source',
     hooks,
     definition.maximumBytes,
+    definition.sourceLease,
   );
-  const sourceStat = await lstatOrNull(definition.source);
+  const sourceStat = await leaseAwareFileStatOrNull(
+    definition.source,
+    definition.sourceLease,
+    'unsafe_source',
+  );
   if (!sourceStat) {
     const restored = await copyVerifiedFile(
       definition.backup,
       definition.source,
       hooks,
       definition.maximumBytes,
+      definition.sourceLease,
     );
     if (!sameFingerprint(backupFingerprint, restored)) {
       throw Object.assign(new Error('Restored source differs from migration backup'), {
@@ -2421,11 +2699,12 @@ async function recoverBackup(
       migrationReason: 'unsafe_source',
     });
   }
-  const sourceFingerprint = await fingerprintFile(
+  const sourceFingerprint = await fingerprintPublishedFile(
     definition.source,
     'unsafe_source',
-    1n,
+    hooks,
     definition.maximumBytes,
+    definition.sourceLease,
   );
   if (!sameFingerprint(sourceFingerprint, backupFingerprint)) {
     throw Object.assign(new Error('Source conflicts with migration backup'), {
@@ -2444,7 +2723,11 @@ async function ensureBackup(
   await assertSafeDirectoryTree(definition.sourceRoot, path.dirname(definition.source));
   await recoverLegacyRetirement(definition, definition.source, hooks);
   await recoverLegacyRetirement(definition, definition.backup, hooks);
-  const source = await lstatOrNull(definition.source);
+  const source = await leaseAwareFileStatOrNull(
+    definition.source,
+    definition.sourceLease,
+    'unsafe_source',
+  );
   if (!source) return null;
   if (source.isSymbolicLink() || !source.isFile() || source.nlink !== 1n) {
     throw Object.assign(new Error('Unsafe legacy source before cutover'), {
@@ -2464,6 +2747,7 @@ async function ensureBackup(
     definition.backup,
     hooks,
     definition.maximumBytes,
+    definition.sourceLease,
   );
 }
 
@@ -2497,6 +2781,11 @@ async function recoverLegacyRetirement(
   const directory = legacyRetirementDirectory(legacyPath);
   const visibleDirectory = await lstatOrNull(directory);
   if (!visibleDirectory) return;
+  if (definition.sourceLease?.entryMutationPolicy === 'cwd-helper') {
+    throw Object.assign(new Error('Portable legacy retirement state requires manual recovery'), {
+      migrationReason: 'unsafe_source',
+    });
+  }
   if (visibleDirectory.isSymbolicLink() || !visibleDirectory.isDirectory()) {
     throw Object.assign(new Error('Legacy retirement path is not a private directory'), {
       migrationReason: 'unsafe_source',
@@ -2607,20 +2896,30 @@ async function unlinkVerifiedLegacyFile(
 ): Promise<void> {
   definition.verifySourceDirectory?.();
   await recoverLegacyRetirement(definition, legacyPath, hooks);
-  const visible = await lstatOrNull(legacyPath);
+  const helperSourceLease = definition.sourceLease?.entryMutationPolicy === 'cwd-helper'
+    && (path.dirname(legacyPath) === definition.sourceLease.accessPath
+      || path.dirname(legacyPath) === definition.sourceLease.canonicalPath)
+    ? definition.sourceLease
+    : undefined;
+  const handle = helperSourceLease
+    ? openWorkspaceCwdFileForRead(helperSourceLease, path.basename(legacyPath))
+    : await fs.promises.open(legacyPath, READ_FLAGS).catch((error: NodeJS.ErrnoException) => {
+      throw Object.assign(error, { migrationReason: 'source_changed' });
+    });
+  const visible = helperSourceLease
+    ? await handle.stat({ bigint: true })
+    : await lstatOrNull(legacyPath);
   if (
     !visible
     || visible.isSymbolicLink()
     || !visible.isFile()
     || visible.nlink !== 1n
   ) {
+    await handle.close().catch(() => undefined);
     throw Object.assign(new Error('Legacy artifact is not an isolated regular file'), {
       migrationReason: 'source_changed',
     });
   }
-  const handle = await fs.promises.open(legacyPath, READ_FLAGS).catch((error: NodeJS.ErrnoException) => {
-    throw Object.assign(error, { migrationReason: 'source_changed' });
-  });
   try {
     const opened = await handle.stat({ bigint: true });
     if (
@@ -2651,15 +2950,17 @@ async function unlinkVerifiedLegacyFile(
     });
     definition.verifySourceDirectory?.();
 
-    const finalVisible = await lstatOrNull(legacyPath);
+    const finalVisible = helperSourceLease ? null : await lstatOrNull(legacyPath);
     const finalOpened = await handle.stat({ bigint: true });
     if (
-      !finalVisible
-      || finalVisible.isSymbolicLink()
-      || !finalVisible.isFile()
-      || finalVisible.nlink !== 1n
-      || finalOpened.nlink !== 1n
-      || !sameFileIdentity(finalVisible, finalOpened)
+      finalOpened.nlink !== 1n
+      || (!helperSourceLease && (
+        !finalVisible
+        || finalVisible.isSymbolicLink()
+        || !finalVisible.isFile()
+        || finalVisible.nlink !== 1n
+        || !sameFileIdentity(finalVisible, finalOpened)
+      ))
       || !stableFile(afterFingerprint, finalOpened)
     ) {
       throw Object.assign(new Error('Legacy artifact name changed before unlink'), {
@@ -2676,6 +2977,24 @@ async function unlinkVerifiedLegacyFile(
       throw Object.assign(new Error('Legacy artifact bytes changed before unlink'), {
         migrationReason: 'source_changed',
       });
+    }
+
+    if (helperSourceLease) {
+      const expectedParent = helperSourceLease;
+      const basename = path.basename(legacyPath);
+      if (path.dirname(legacyPath) !== expectedParent.accessPath
+        && path.dirname(legacyPath) !== expectedParent.canonicalPath) {
+        throw Object.assign(new Error('Portable legacy source is outside its pinned namespace'), {
+          migrationReason: 'unsafe_source',
+        });
+      }
+      retireMigrationWorkspaceCwdEntry(
+        expectedParent,
+        basename,
+        { dev: immediatelyBeforeUnlink.dev, ino: immediatelyBeforeUnlink.ino },
+      );
+      await syncDirectory(path.dirname(legacyPath), hooks, 'temporary_cleanup');
+      return;
     }
 
     // Node does not expose an unlink-by-file-descriptor primitive. Never
@@ -2845,6 +3164,7 @@ async function commitPreparedSources(
       'unsafe_source',
       hooks,
       item.definition.maximumBytes,
+      item.definition.sourceLease,
     );
     const target = expectedTarget
       ? await fingerprintPublishedFile(
@@ -2852,6 +3172,7 @@ async function commitPreparedSources(
         'unsafe_target',
         hooks,
         item.definition.maximumBytes,
+        item.definition.targetLease,
       )
       : null;
     if (
@@ -2882,6 +3203,7 @@ async function commitPreparedSources(
         'unsafe_target',
         hooks,
         item.definition.maximumBytes,
+        item.definition.targetLease,
       );
       if (!sameFingerprint(committedTarget, expectedTarget)) {
         throw Object.assign(new Error('Workspace target changed during session cutover'), {
@@ -2969,19 +3291,19 @@ export class WorkspaceSessionArtifactMigrator {
         migrationReason: 'unsafe_workspace_storage',
       });
     }
-    // The overwhelming majority of sessions were created workspace-local and
-    // have no import marker. Avoid opening/caching a directory descriptor for
-    // every one of them during discovery.
-    if (!await lstatOrNull(markerPath(canonicalTarget))) return;
     const targetDir = workspaceSessionAccessDirectory(ref);
     let binaryPlan: BinaryArtifactPlan | null = null;
     let fixedPlan: PinnedFixedArtifactPlan | null = null;
     try {
-      if (!targetDir || await fs.promises.realpath(targetDir) !== canonicalTarget) {
+      const targetLease = targetDir
+        ? workspaceSessionFileParentLease(path.join(targetDir, MARKER_FILE))
+        : null;
+      if (!targetDir || !targetLease || targetLease.canonicalPath !== canonicalTarget) {
         throw Object.assign(new Error('Workspace target is unavailable while confirming migration'), {
           migrationReason: 'unsafe_workspace_storage',
         });
       }
+      targetLease.verify();
       const markerEnvelope = await readMarker(targetDir, ownerKey, id, ref.ownerUserId);
       if (!markerEnvelope || markerEnvelope.phase !== 'complete') return;
 
@@ -3049,6 +3371,7 @@ export class WorkspaceSessionArtifactMigrator {
           'unsafe_target',
           this.hooks,
           definition.maximumBytes,
+          definition.targetLease,
         );
         if (!sameFingerprint(target, expectedTarget)) {
           throw Object.assign(new Error('Workspace artifact changed before migration confirmation'), {
@@ -3067,15 +3390,27 @@ export class WorkspaceSessionArtifactMigrator {
           [definition.source, false, 'source'],
           [definition.backup, true, 'backup'],
         ] as const) {
+          if (definition.sourceLease?.entryMutationPolicy === 'cwd-helper') {
+            recoverMigrationWorkspaceCwdRetirement(
+              definition.sourceLease,
+              path.basename(legacyPath),
+              expectedSource,
+            );
+          }
           await recoverLegacyRetirement(definition, legacyPath, this.hooks);
-          const stat = await lstatOrNull(legacyPath);
+          const stat = await leaseAwareFileStatOrNull(
+            legacyPath,
+            definition.sourceLease,
+            'unsafe_source',
+          );
           if (!stat) continue;
-          const fingerprint = published
+          const fingerprint = published || definition.sourceLease?.entryMutationPolicy === 'cwd-helper'
             ? await fingerprintPublishedFile(
               legacyPath,
               'unsafe_source',
               this.hooks,
               definition.maximumBytes,
+              definition.sourceLease,
             )
             : await fingerprintFile(
               legacyPath,
@@ -3129,17 +3464,12 @@ export class WorkspaceSessionArtifactMigrator {
       return true;
     }
     if (!canonicalTarget) return true;
-    const canonicalMarker = markerPath(canonicalTarget);
-    let visible: BigFileStat | null;
-    try {
-      visible = await lstatOrNull(canonicalMarker);
-    } catch {
-      return true;
-    }
-    if (!visible) return false;
     try {
       const targetDir = workspaceSessionAccessDirectory(ref);
-      if (!targetDir || await fs.promises.realpath(targetDir) !== canonicalTarget) return true;
+      if (!targetDir) return true;
+      const markerLease = workspaceSessionFileParentLease(markerPath(targetDir));
+      if (!markerLease || markerLease.canonicalPath !== canonicalTarget) return true;
+      markerLease.verify();
       if (!Number.isSafeInteger(ref.ownerUserId) || ref.ownerUserId < 0) return true;
       const marker = await readMarker(targetDir, ownerKey, id, ref.ownerUserId);
       if (!marker) return false;
@@ -3152,6 +3482,8 @@ export class WorkspaceSessionArtifactMigrator {
       // A malformed or temporarily unreadable marker is not evidence that the
       // secondary checkout is disposable. Replacement retries after repair.
       return true;
+    } finally {
+      closeWorkspaceSessionDirectoryLease(ref);
     }
   }
 

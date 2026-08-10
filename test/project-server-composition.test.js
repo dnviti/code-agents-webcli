@@ -487,4 +487,38 @@ describe('project server composition', function () {
       await fs.promises.rm(dataDir, { recursive: true, force: true });
     }
   });
+
+  it('retries retained storage finalizers without replaying runtime teardown', async function () {
+    const dataDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'project-shutdown-close-retry-'));
+    const appServer = new ClaudeCodeWebServer({
+      dataDir,
+      baseFolder: dataDir,
+      githubClientId: 'composition-client',
+      githubClientSecret: 'composition-secret',
+      allowedGitHubIds: 'composition-user',
+      encryptionKey: ENCRYPTION_KEY,
+    });
+    let projectShutdowns = 0;
+    let workspaceCloses = 0;
+    const closeWorkspaces = appServer.sessionStore.closeWorkspaces.bind(appServer.sessionStore);
+    try {
+      appServer.saveSessionsToDisk = async () => {};
+      appServer.messageProcessor.drainAllRecorders = async () => {};
+      appServer.messageProcessor.drainPendingRuntimeStarts = async () => {};
+      appServer.projects.shutdown = async () => { projectShutdowns += 1; };
+      appServer.sessionStore.closeWorkspaces = () => {
+        workspaceCloses += 1;
+        if (workspaceCloses === 1) throw new Error('injected transient workspace close');
+        closeWorkspaces();
+      };
+
+      await assert.rejects(() => appServer.shutdown(), /injected transient workspace close/);
+      await assert.doesNotReject(() => appServer.shutdown());
+      assert.strictEqual(projectShutdowns, 1, 'runtime/project teardown must not be replayed');
+      assert.strictEqual(workspaceCloses, 2, 'retained workspace finalizer must be retried');
+    } finally {
+      appServer.sessionStore.closeWorkspaces = closeWorkspaces;
+      await fs.promises.rm(dataDir, { recursive: true, force: true });
+    }
+  });
 });

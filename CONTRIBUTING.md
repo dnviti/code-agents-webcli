@@ -2,7 +2,7 @@
 
 ## Stack
 
-- Node.js 22.13+ and TypeScript
+- Node.js 24.16+ and TypeScript
 - Express + `ws` for HTTP and WebSocket
 - xterm.js in the browser, React for the shell UI
 - Pseudo-terminals via `@lydell/node-pty` (prebuilt binaries, never node-gyp)
@@ -36,7 +36,8 @@ npm run dev
 npm run build          # compile server, bundle client, copy assets
 npm run build:watch    # rebuild on change
 npm run dev            # build, then start with extra logging
-npm test               # mocha
+npm test               # tests available on this host; reports capability-gated files
+npm run test:strict    # require every integration capability (used by CI)
 npm run typecheck      # server and client
 npm run test:browser   # headless browser checks against the real bundle
 npm run verify:install # install the working tree into a clean prefix and start it

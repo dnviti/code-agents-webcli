@@ -3,11 +3,13 @@
 CODE AGENTS has two deliberately separate update systems. A normal browser/CLI
 server compares its baked Git commit with `main` and shows a server-owned
 banner. The installed desktop controller compares its semantic application
-version through platform-specific trusted feeds: signed Windows/macOS packages,
-a GPG-signed Flatpak repository, and checksum-verified AppImages from the fixed
-GitHub release feed. It uses the full-window proposal and status-bar reminder
-described in [Desktop updates](desktop.md#updates). A Local embedded server
-never creates the server-owned banner.
+version through platform-specific trusted feeds. Releases made with protected
+identities use signed Windows/macOS packages and a GPG-signed Flatpak
+repository; explicitly unsigned releases require the published checksums and a
+manual platform override. AppImages are checksum-verified from the fixed GitHub
+release feed. The controller uses the full-window proposal and status-bar
+reminder described in [Desktop updates](desktop.md#updates). A Local embedded
+server never creates the server-owned banner.
 
 > This page is about updating **CODE AGENTS itself**. The version row on an
 > agent's launcher card updates a managed Claude Code, Codex CLI, pi, Grok,
@@ -85,7 +87,7 @@ docker build \
 only after the `package.json` version is on `main`; the tagged workflow rejects
 any tag outside that history or with a different version.
 
-- `.github/workflows/ci.yml` — typecheck, tests on Node 22 and 24, a container
+- `.github/workflows/ci.yml` — typecheck and tests on Node 24.16, a container
   build, and a full install verification on a clean runner.
 - `.github/workflows/release-on-main.yml` — tags `v<version>`, cuts a GitHub
   release, pushes the image to GHCR, and stages trusted desktop update feeds.

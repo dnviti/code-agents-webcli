@@ -464,6 +464,63 @@ describe('SessionStore', function() {
   });
 
   describe('workspace-local state', function () {
+    it('keeps a failed workspace close retryable instead of marking the scope suspended', async function () {
+      const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'cc-web-workspace-close-retry-'));
+      const scope = { workspaceRoot, ownerKey: '3'.repeat(64) };
+      const coordinator = new SessionStore({
+        database: sessionStore.database,
+        workspaceCoordinator: true,
+      });
+      const bound = coordinator.openWorkspace(scope);
+      const close = bound.database.close.bind(bound.database);
+      let fail = true;
+      bound.database.close = () => {
+        if (fail) throw new Error('injected workspace close failure');
+        close();
+      };
+      try {
+        assert.throws(() => coordinator.suspendWorkspace(scope), /injected workspace close failure/);
+        assert.strictEqual(coordinator.openWorkspace(scope), bound, 'failed suspend must retain the facade');
+        fail = false;
+        coordinator.suspendWorkspace(scope);
+        assert.throws(() => coordinator.openWorkspace(scope), /temporarily suspended/i);
+      } finally {
+        bound.database.close = close;
+        coordinator.resumeWorkspace(scope);
+        try { coordinator.closeWorkspaces(); } catch { /* Test cleanup. */ }
+        await fs.rm(workspaceRoot, { recursive: true, force: true });
+      }
+    });
+
+    it('closes independent workspaces while retaining failed entries for shutdown retry', async function () {
+      const firstRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'cc-web-workspace-close-a-'));
+      const secondRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'cc-web-workspace-close-b-'));
+      const first = { workspaceRoot: firstRoot, ownerKey: '4'.repeat(64) };
+      const second = { workspaceRoot: secondRoot, ownerKey: '5'.repeat(64) };
+      const coordinator = new SessionStore({ database: sessionStore.database, workspaceCoordinator: true });
+      const firstStore = coordinator.openWorkspace(first);
+      coordinator.openWorkspace(second);
+      const close = firstStore.database.close.bind(firstStore.database);
+      let fail = true;
+      firstStore.database.close = () => {
+        if (fail) throw new Error('injected aggregate close failure');
+        close();
+      };
+      try {
+        assert.throws(() => coordinator.closeWorkspaces(), /injected aggregate close failure/);
+        assert.strictEqual(coordinator.workspaceStores.size, 1, 'only the failed workspace remains');
+        assert.strictEqual(coordinator.openWorkspace(first), firstStore);
+        fail = false;
+        coordinator.closeWorkspaces();
+        assert.strictEqual(coordinator.workspaceStores.size, 0);
+      } finally {
+        firstStore.database.close = close;
+        try { coordinator.closeWorkspaces(); } catch { /* Test cleanup. */ }
+        await fs.rm(firstRoot, { recursive: true, force: true });
+        await fs.rm(secondRoot, { recursive: true, force: true });
+      }
+    });
+
     it('round-trips bounded composer drafts in the workspace database only', async function () {
       const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'cc-web-workspace-draft-'));
       const scope = { workspaceRoot, ownerKey: '4'.repeat(64) };
@@ -547,7 +604,7 @@ describe('SessionStore', function() {
             workspaceStorageOpenOptions: { forcePathFallback: true },
           }),
           (error) => error && error.code === 'UNSAFE_WORKSPACE_STORAGE'
-            && /descriptor-relative|handle-pinned/i.test(error.message),
+            && /descriptor-relative|cwd-bound helper/i.test(error.message),
         );
         assert.strictEqual(fsSync.existsSync(databasePath), false);
         assert.deepStrictEqual(await fs.readdir(path.dirname(databasePath)), []);

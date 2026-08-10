@@ -42,9 +42,17 @@ describe('packaged desktop workspace persistence smoke seam', function () {
           dataDir,
         });
         assert.equal(result.bytes, SMOKE_PAYLOAD_BYTES);
+        assert.equal(result.mode, 'workspace-only');
+        assert.equal(result.workspaceOnly, true);
         assert.ok(result.attachmentPath.startsWith(path.join(workspaceRoot, '.cc-web') + path.sep));
+        assert.ok(result.pastePath.startsWith(path.join(workspaceRoot, '.cc-web') + path.sep));
+        assert.ok(result.chatLogPath.startsWith(path.join(workspaceRoot, '.cc-web') + path.sep));
+        assert.ok(result.chatIndexPath.startsWith(path.join(workspaceRoot, '.cc-web') + path.sep));
         assert.ok(fs.existsSync(result.sessionDatabase));
         assert.ok(fs.existsSync(path.join(result.sessionDirectory, 'transcript.md')));
+        assert.ok(fs.existsSync(result.chatLogPath));
+        assert.ok(fs.existsSync(result.chatIndexPath));
+        assert.ok(fs.readFileSync(result.chatLogPath, 'utf8').includes(result.chatPayload));
       } finally {
         await server.shutdown().catch(() => undefined);
       }

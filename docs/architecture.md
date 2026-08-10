@@ -89,6 +89,11 @@ couple of positioned reads rather than a scan. Stores receive the session's
 immutable workspace scope, while coordinators open and aggregate the authorised
 workspace databases needed by account-wide views.
 
+Workspace persistence is strict on Linux, Windows, and macOS. Linux uses a
+descriptor-relative namespace; Windows and macOS use a verified-cwd helper.
+Their databases are serialized in memory and atomically published through that
+helper, so SQLite sidecars cannot escape the workspace.
+
 The path-only discovery catalog admits a canonical workspace root for exactly
 one immutable account identity. A conflicting or legacy-ambiguous assignment
 fails closed before the local database or any session artifact is opened. The
@@ -118,7 +123,8 @@ The parts that get specific care:
 ## Testing
 
 ```bash
-npm test                # mocha, no network, no real CLIs
+npm test                # available tests; reports capability-gated integration files
+npm run test:strict     # require loopback, local sockets, and child processes
 npm run typecheck       # server and client
 npm run test:browser    # headless browser checks against the real bundle
 npm run verify:install  # install the working tree into a clean prefix and start it

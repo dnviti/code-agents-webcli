@@ -72,6 +72,8 @@ describe('Electron desktop helpers', function () {
       path.join(__dirname, 'electron-attachment', 'run.js'),
       'utf8',
     );
+    const browserRunner = fs.readFileSync(path.join(__dirname, 'browser', 'run.js'), 'utf8');
+    const pkg = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8'));
     assert.strictEqual(
       (ci.match(/bash scripts\/configure-ci-electron-sandbox\.sh/g) || []).length,
       1,
@@ -87,7 +89,7 @@ describe('Electron desktop helpers', function () {
     }
     const ciInstall = ci.indexOf('run: npm ci');
     const ciConfigure = ci.indexOf('run: bash scripts/configure-ci-electron-sandbox.sh');
-    const ciTest = ci.indexOf('run: npm test');
+    const ciTest = ci.indexOf('run: npm run test:strict');
     assert.ok(ciInstall >= 0 && ciInstall < ciConfigure && ciConfigure < ciTest,
       'ordinary CI configures the helper after install and before tests');
 
@@ -95,15 +97,31 @@ describe('Electron desktop helpers', function () {
     assert.ok(
       releaseVerify.indexOf('run: npm ci') < releaseVerify.indexOf('run: bash scripts/configure-ci-electron-sandbox.sh')
         && releaseVerify.indexOf('run: bash scripts/configure-ci-electron-sandbox.sh')
-          < releaseVerify.indexOf('run: npm test'),
+          < releaseVerify.indexOf('run: npm run test:strict'),
       'tag verification configures the helper after install and before tests',
+    );
+    for (const workflow of [ci, release]) {
+      assert.doesNotMatch(workflow, /run:\s+npm test(?:\s|$)/, 'CI must use the strict capability-aware runner');
+      assert.match(workflow, /run:\s+npm run test:strict/);
+    }
+    assert.match(ci, /run:\s+npm run test:browser:strict/);
+    assert.strictEqual(pkg.scripts['test:browser:strict'], 'npm run build && node test/browser/run.js --strict');
+    assert.match(browserRunner, /process\.argv\.slice\(2\)\.includes\('--strict'\)/);
+    assert.match(browserRunner, /Strict browser checks cannot run/);
+    assert.match(browserRunner, /Browser checks failed after the loopback preflight/);
+    assert.match(browserRunner, /findCommand\(\['google-chrome'/);
+    assert.doesNotMatch(browserRunner, /spawnSync\(['"]which['"]/);
+    assert.match(browserRunner, /setTimeout\(\(\) => \{[\s\S]*code: 'ETIMEDOUT'/);
+    assert.ok(
+      browserRunner.indexOf('await probeLoopback()') < browserRunner.indexOf('prepareBrowserFixtures();'),
+      'the bounded loopback preflight must run before generated browser fixtures are written',
     );
     const releaseDesktop = release.slice(
       release.indexOf('\n  desktop:'),
       release.indexOf('\n  desktop-upgrade-qualification:'),
     );
     assert.ok(
-      releaseDesktop.indexOf('name: Build signed desktop packages')
+      releaseDesktop.indexOf('name: Build desktop packages')
         < releaseDesktop.indexOf('name: Configure Electron sandbox helper')
         && releaseDesktop.indexOf('name: Configure Electron sandbox helper')
           < releaseDesktop.indexOf('name: Verify native attachment gestures and controller routing'),
@@ -133,7 +151,7 @@ describe('Electron desktop helpers', function () {
     assert.match(ciSandbox, /sandbox_mode" != '0:0:4755'/);
     assert.match(ciSandbox, /Electron sandbox helper has insecure identity or mode/);
     assert.match(attachmentRunner, /Electron attachment renderer is required in CI/);
-    assert.match(attachmentRunner, /if \(!requestedEnvironment\.CI\) return selected/);
+    assert.match(attachmentRunner, /CCWEB_TEST_STRICT/);
     assert.match(release, /push:\s*\n\s*tags:\s*\n\s*- ['"]v\*\.\*\.\*['"]/);
     assert.match(release, /- ['"]!v\*\.\*\.\*-staging['"]/);
     assert.doesNotMatch(release, /push:\s*\n\s*branches:/);
@@ -145,6 +163,14 @@ describe('Electron desktop helpers', function () {
     assert.match(release, /flatpak install --user --noninteractive --no-deps --bundle/);
     assert.match(release, /flatpak uninstall --user --noninteractive --delete-data/);
     assert.match(release, /DESKTOP_WORKSPACE_ATTACHMENT_SMOKE_OK/);
+    assert.match(release, /WORKSPACE_ENTRY_HELPER_OK app\.asar/);
+    assert.match(release, /--config\.win\.signExecutable=false/);
+    assert.match(release, /--config\.mac\.identity=null/);
+    assert.match(release, /CODE_AGENTS_WEBCLI_SKIP_NOTARIZATION=1/);
+    assert.match(ci, /native-packaged-smoke:/);
+    assert.match(ci, /os: windows-latest/);
+    assert.match(ci, /os: macos-15-intel/);
+    assert.match(ci, /os: macos-15/);
     assert.match(release, /DESKTOP_PACKAGED_RENDERER_SMOKE_OK/);
     assert.match(release, /apt-get install --yes[^\n]*libfuse2t64/);
     assert.match(release, /find release -maxdepth 1 -type f -name ['"]\*\.AppImage['"]/);
@@ -246,8 +272,16 @@ describe('Electron desktop helpers', function () {
     );
     assert.match(smoke, /\/api\/sessions\/create/);
     assert.match(smoke, /chat-attachments\?name=packaged-smoke\.bin/);
+    assert.match(smoke, /chatStore\.append\(session/);
+    assert.match(smoke, /chatStore\.flush\(session/);
+    assert.match(smoke, /chat\.jsonl/);
+    assert.match(smoke, /chat\.idx/);
+    assert.match(smoke, /Buffer\.from\(chatPayload, 'utf8'\)/);
     assert.match(smoke, /downloadResponse\.arrayBuffer\(\)/);
     assert.match(smoke, /session-state\.sqlite/);
+    assert.match(smoke, /new Set\(\['linux', 'win32', 'darwin'\]\)/);
+    assert.match(smoke, /Windows[\s\S]*verified cwd helper/i);
+    assert.doesNotMatch(smoke, /installation-fallback/);
     assert.match(smoke, /runtime_sessions.*usage_jobs.*usage_job_models.*usage_job_tools/s);
     assert.match(smoke, /cache-control.*no-store/s);
     assert.doesNotMatch(smoke, /clearAuthCache|fromPartition/);

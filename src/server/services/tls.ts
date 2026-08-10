@@ -57,7 +57,9 @@ export function tlsDir(dataDir: string | null): string {
  * it fails in a way that looks like the server is broken. This list is compared
  * against the certificate on every start, so a changed address reissues.
  */
-export function localHosts(): { dns: string[]; ip: string[] } {
+export function localHosts(
+  { networkInterfaces = os.networkInterfaces }: { networkInterfaces?: typeof os.networkInterfaces } = {},
+): { dns: string[]; ip: string[] } {
   const dns = new Set<string>(['localhost']);
   const ip = new Set<string>(['127.0.0.1', '::1']);
 
@@ -68,7 +70,24 @@ export function localHosts(): { dns: string[]; ip: string[] } {
     if (!hostname.includes('.')) dns.add(`${hostname}.local`);
   }
 
-  for (const addrs of Object.values(os.networkInterfaces())) {
+  let interfaces: ReturnType<typeof os.networkInterfaces>;
+  try {
+    interfaces = networkInterfaces();
+  } catch (error: unknown) {
+    // In a managed or sandboxed runtime Node can deny this optional capability.
+    // localhost stays covered, while unavailable LAN names are deliberately not
+    // guessed into a certificate.
+    const detail = error as NodeJS.ErrnoException | undefined;
+    if (detail?.code === 'ERR_ACCESS_DENIED'
+      || (detail?.code === 'ERR_SYSTEM_ERROR'
+        && detail.syscall === 'uv_interface_addresses'
+        && Number(detail.errno) === 1)) {
+      interfaces = {};
+    } else {
+      throw error;
+    }
+  }
+  for (const addrs of Object.values(interfaces)) {
     for (const addr of addrs || []) {
       if (addr.internal) continue;
       // Link-local IPv6 carries a zone index that no certificate can express.

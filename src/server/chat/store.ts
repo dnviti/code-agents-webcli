@@ -4,6 +4,7 @@ import { SessionRecord } from '../types.js';
 import {
   ensureWorkspaceSessionDirectory,
   workspaceSessionAccessDirectory,
+  workspaceSessionFileParentLease,
   WorkspaceSessionStorageRef,
 } from '../services/workspace-session-storage.js';
 import {
@@ -981,7 +982,9 @@ export class ChatStore implements ChatStoreLike {
       logRebased: boolean;
     },
   ): Promise<void> {
-    await fs.promises.mkdir(path.dirname(base), { recursive: true });
+    if (!workspaceSessionFileParentLease(`${base}.jsonl`)) {
+      await fs.promises.mkdir(path.dirname(base), { recursive: true });
+    }
 
     const state = await this.loadState(base);
 
@@ -1536,7 +1539,9 @@ export class ChatStore implements ChatStoreLike {
   async setOpeningContext(session: ChatSessionRef, context: string): Promise<void> {
     const base = this.basePath(session);
     await ensureWorkspaceSessionDirectory(session);
-    await fs.promises.mkdir(path.dirname(base), { recursive: true });
+    if (!workspaceSessionFileParentLease(`${base}${CONTEXT_SUFFIX}`)) {
+      await fs.promises.mkdir(path.dirname(base), { recursive: true });
+    }
     await replaceSessionFile(`${base}${CONTEXT_SUFFIX}`, context, 'utf8');
   }
 
@@ -1570,7 +1575,9 @@ export class ChatStore implements ChatStoreLike {
     await this.enqueue(base, async () => {
       await ensureWorkspaceSessionDirectory(session);
       const target = `${base}${PLAN_SUFFIX}`;
-      await fs.promises.mkdir(path.dirname(base), { recursive: true });
+      if (!workspaceSessionFileParentLease(target)) {
+        await fs.promises.mkdir(path.dirname(base), { recursive: true });
+      }
       await replaceSessionFile(target, JSON.stringify(plan), 'utf8');
     });
   }

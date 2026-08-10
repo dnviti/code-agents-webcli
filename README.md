@@ -85,7 +85,8 @@ The same conversation, built for the phone it will actually be used on.
 
 You need two things:
 
-1. **Node 22.13 or newer** — `node --version`.
+1. **Node 24.16 or newer** — `node --version`. The workspace database uses
+   Node's built-in SQLite serialization APIs.
 2. **A GitHub OAuth App** — sign-in is GitHub-only, so the app cannot serve a
    login page without one. It takes a minute:
    [how to create it](docs/github-oauth.md).
@@ -170,7 +171,8 @@ npm run dev
 ```
 
 ```bash
-npm test              # unit tests
+npm test              # tests available on this host, with explicit skip reporting
+npm run test:strict   # require every integration capability (used by CI)
 npm run typecheck     # server + client
 npm run verify:install # install the working tree into a clean prefix and start it
 ```

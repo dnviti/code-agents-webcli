@@ -40,17 +40,20 @@ your own accounts. The desktop app finds commands on your normal login-shell
 ## Download and install
 
 Get the package for your operating system and CPU from the project's GitHub
-release, then compare it with `SHA256SUMS` before opening it. Windows and macOS
-release packages are code signed; do not bypass a publisher or Gatekeeper
-warning that names an unexpected identity. Checksums remain useful for the
-portable Linux artifacts and for independently verifying a download.
+release, then compare it with `SHA256SUMS` before opening it. A release built
+with the protected signing identities is code signed; do not bypass a publisher
+or Gatekeeper warning that names an unexpected identity. A clearly-labelled
+unsigned release has no Windows Authenticode or Apple Developer ID signature:
+verify its checksum and install it manually only when you intentionally accept
+that warning.
 
 Maintainers publish these packages by pushing a version tag such as `v6.1.0`
 from `main`. The tag must match the version in `package.json`; GitHub Actions
 then verifies the source, builds each package on its native operating system,
 runs the packaged smoke checks, installs and launches the produced Flatpak under
-Xvfb/X11, and attaches all seven installers (AppImage, Debian, RPM, Flatpak,
-Windows installer, and both macOS DMGs) plus `SHA256SUMS` to the GitHub
+Xvfb/X11, and attaches the AppImage, Debian, RPM, Flatpak, Windows installer,
+both macOS DMGs, both macOS updater ZIPs, their architecture-specific update
+manifests, and `SHA256SUMS` to the GitHub
 Release for that exact tag. The installed Flatpak check exercises its sandboxed
 renderer, workspace-local persistence, and binary attachment round trip, then
 uninstalls the test package with its generated data. It does not automate a
@@ -66,9 +69,9 @@ version, never a silent replacement of the same release.
 | Linux x64 | `*.deb` | Debian/Ubuntu package: `sudo apt install ./Code-Agents-Web-CLI-<version>-linux-x64.deb`. |
 | Linux x64 | `*.rpm` | Red Hat/Fedora package: `sudo dnf install ./Code-Agents-Web-CLI-<version>-linux-x64.rpm`. |
 | Linux x64 | `*.flatpakref` (preferred) or `*.flatpak` | Open the ref with your software center or run `flatpak install --user <file>.flatpakref`. The bundled `.flatpak` also records the signed project remote, so it can update after installation. |
-| Windows x64 | `*.exe` | Open the signed NSIS installer and follow its prompts. Confirm the publisher shown by Windows matches the project release documentation. |
-| macOS Intel | `*-x64.dmg` | Open the DMG and drag the app to Applications. |
-| macOS Apple Silicon | `*-arm64.dmg` | Open the signed/notarized DMG and drag the app to Applications. |
+| Windows x64 | `*.exe` | Open the NSIS installer and follow its prompts. Confirm the publisher when the release is signed; for an unsigned release, verify `SHA256SUMS` first. |
+| macOS Intel | `*-x64.dmg` | Open the DMG and drag the app to Applications. Signed releases are notarized; unsigned releases require a checksum-verified manual override. |
+| macOS Apple Silicon | `*-arm64.dmg` | Open the DMG and drag the app to Applications. Signed releases are notarized; unsigned releases require a checksum-verified manual override. |
 
 The Flatpak keeps the Electron UI sandboxed, but launches every Local-computer
 terminal, coding agent, version probe, and agent installer through
@@ -412,6 +415,6 @@ several saved servers.
 | Repository URL is disabled on Windows | Create the project without a repository, or use a Linux server for repository-backed managed projects. Ordinary work in local folders remains available. |
 | A Flatpak cannot reach an agent, credential, or project | Restart the app after installing the tool so it can recover the host login-shell `PATH`, then check that the same command works in a normal host terminal. Flatpak Local-computer processes run through `flatpak-spawn --host`. |
 | AppImage does not open | Ensure it is executable. On distributions without FUSE2, install the compatible FUSE package or use `--appimage-extract-and-run`. The app refuses `--no-sandbox`; enable unprivileged user namespaces or use Flatpak rather than disabling Chromium's sandbox. |
-| SmartScreen or Gatekeeper stops the installer | Do not override an unexpected publisher/signature warning. Download the matching signed package from the release and verify `SHA256SUMS`; contact the maintainer if the identity remains unexpected. |
+| SmartScreen or Gatekeeper stops the installer | For a signed release, do not override an unexpected publisher/signature warning; download it again, verify `SHA256SUMS`, and contact the maintainer if the identity remains wrong. For a release explicitly labelled unsigned, verify `SHA256SUMS` before using the documented manual override. |
 | Another device cannot connect to Local computer | The embedded server always binds to `127.0.0.1`. For temporary access, choose **Open on phone** on the Local computer row and follow the [LAN or Tailscale guide](phone-access.md). For an always-on shared service, run a normal server installation instead. |
 | An update notice appeared | Check whether it names the desktop package or a particular server. The desktop proposal/reminder updates this package after you confirm; server updates affect only the named server. |

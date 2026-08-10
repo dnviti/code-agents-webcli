@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+- Workspace conversation persistence is now verified under each project's
+  `.cc-web/` on Linux, Windows, and macOS. Native unsigned Windows and Intel /
+  Apple-silicon macOS packages are built and smoke-tested when release signing
+  credentials are unavailable; signed and notarized release paths remain
+  available when their protected identities are configured.
+
 ## [6.1.1] - 2026-08-08
 
 ### Fixed
