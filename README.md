@@ -85,8 +85,8 @@ The same conversation, built for the phone it will actually be used on.
 
 You need two things:
 
-1. **Node 24.16 or newer** — `node --version`. The workspace database uses
-   Node's built-in SQLite serialization APIs.
+1. **Node 24.16 or newer** — `node --version`. The shared per-user database uses
+   Node's built-in SQLite APIs.
 2. **A GitHub OAuth App** — sign-in is GitHub-only, so the app cannot serve a
    login page without one. It takes a minute:
    [how to create it](docs/github-oauth.md).

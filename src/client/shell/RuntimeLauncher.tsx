@@ -293,7 +293,7 @@ function ConversationCard({
         <span>{formatWhen(conversation.lastActivity)}</span>
         {conversation.running ? <Badge variant="success">running</Badge> : null}
         {conversation.persistenceUnavailable ? (
-          <Badge variant="destructive">migration blocked</Badge>
+          <Badge variant="destructive">storage unavailable</Badge>
         ) : null}
         {conversation.rollbackRecoveryPending ? (
           <Badge variant="destructive">rollback cleanup pending</Badge>

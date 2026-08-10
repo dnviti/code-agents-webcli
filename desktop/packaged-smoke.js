@@ -104,29 +104,23 @@ function fileContains(filename, needle, filesystem = fs) {
   }
 }
 
-/**
- * A workspace-local conversation must never gain an installation-global row,
- * whatever storage its attachments ended up in. This half of the check stays
- * valid when attachments alone fall back, because it never reads `dataDir`.
- */
-function assertNoInstallationSessionRows(server) {
-  for (const table of ['runtime_sessions', 'usage_jobs', 'usage_job_models', 'usage_job_tools']) {
-    const row = server.database.raw.prepare(`SELECT COUNT(*) AS count FROM ${table}`).get();
-    assert.equal(row.count, 0, `${table} received a new installation-global row`);
-  }
+function assertSharedInstallationSessionRow(server, sessionId, workspaceRoot) {
+  const row = server.database.raw.prepare(`
+    SELECT storage_workspace_root AS root, storage_owner_key AS ownerKey
+      FROM runtime_sessions WHERE id = ?
+  `).get(sessionId);
+  assert.ok(row, 'shared app.sqlite omitted the session metadata row');
+  assert.equal(path.resolve(row.root), path.resolve(workspaceRoot));
+  assert.match(row.ownerKey, /^[A-Za-z0-9._-]+$/);
 }
 
 function assertNoInstallationSessionCopy(server, dataDir, sessionId, payloads, filesystem = fs) {
-  assertNoInstallationSessionRows(server);
+  assertSharedInstallationSessionRow(server, sessionId, server.claudeSessions.get(sessionId).storageScope.workspaceRoot);
 
-  const idNeedle = Buffer.from(sessionId, 'utf8');
   const payloadNeedles = (Array.isArray(payloads) ? payloads : [payloads])
     .map((payload) => payload.subarray(0, 64));
   for (const entry of walk(dataDir, filesystem)) {
-    assert.ok(!entry.name.includes(sessionId), `session id leaked into ${entry.absolute}`);
     if (!entry.file) continue;
-    assert.equal(fileContains(entry.absolute, idNeedle, filesystem), false,
-      `session id leaked into installation file ${entry.absolute}`);
     for (const payloadNeedle of payloadNeedles) {
       assert.equal(fileContains(entry.absolute, payloadNeedle, filesystem), false,
         `workspace payload leaked into installation file ${entry.absolute}`);
@@ -212,7 +206,6 @@ async function runPackagedWorkspacePersistenceSmoke(options) {
   const ccWeb = path.join(canonicalWorkspace, '.cc-web');
   const sessionDatabase = path.join(ccWeb, 'session-state.sqlite');
   const findWorkspaceSessionDirectory = () => {
-    if (!filesystem.existsSync(sessionDatabase)) return null;
     const sessionsRoot = path.join(ccWeb, 'sessions');
     const matches = walk(sessionsRoot, filesystem)
       .filter((entry) => entry.directory && entry.name === sessionId)
@@ -221,13 +214,14 @@ async function runPackagedWorkspacePersistenceSmoke(options) {
       ? matches[0]
       : null;
   };
-  // The session was accepted against this workspace root, so its database,
-  // history and transcript must all be here.
+  // Metadata is global, while history and transcript bodies stay in-project.
   const sessionDirectory = await waitFor(
     findWorkspaceSessionDirectory,
-    'workspace-local session database and transcript',
+    'workspace-local transcript directory',
   );
   assert.ok(resolvedInside(ccWeb, sessionDirectory));
+  assert.equal(filesystem.existsSync(sessionDatabase), false,
+    'project storage unexpectedly contains session-state.sqlite');
 
   const sessions = started.server.claudeSessions;
   const historyStore = started.server.historyStore;
@@ -339,10 +333,11 @@ async function runPackagedWorkspacePersistenceSmoke(options) {
   return {
     sessionId,
     bytes: payload.length,
-    mode: 'workspace-only',
-    workspaceOnly: true,
+    mode: 'shared-sqlite-project-artifacts',
+    workspaceOnly: false,
     sessionName,
     sessionDatabase,
+    globalDatabase: started.server.database.dbPath,
     sessionDirectory,
     attachmentPath: storedPath,
     pastePath,
@@ -355,6 +350,6 @@ async function runPackagedWorkspacePersistenceSmoke(options) {
 module.exports = {
   SMOKE_PAYLOAD_BYTES,
   assertNoInstallationSessionCopy,
-  assertNoInstallationSessionRows,
+  assertSharedInstallationSessionRow,
   runPackagedWorkspacePersistenceSmoke,
 };

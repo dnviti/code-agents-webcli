@@ -61,13 +61,14 @@ import {
 } from './services/data-dir-lease.js';
 import { SessionStore } from './services/session-store.js';
 import { canonicalExistingRoot, WorkspaceCatalog } from './services/workspace-catalog.js';
-import { WorkspaceSessionArtifactMigrator } from './services/workspace-session-migrator.js';
 import {
   closeWorkspaceSessionDirectoryLease,
   closeWorkspaceSessionDirectoryLeases,
   closeWorkspaceSessionDirectoryLeasesForScope,
+  openWorkspaceStorageDirectorySync,
 } from './services/workspace-session-storage.js';
-import { WorkspaceUsageCoordinator } from './services/workspace-usage-coordinator.js';
+import { closeWorkspaceCwdHelpers } from './services/workspace-cwd-helper.js';
+import { UsageStore } from './services/usage-store.js';
 import { CodexPricing } from './services/codex-pricing.js';
 import { TranscriptStore } from './services/transcript-store.js';
 import { HistoryStore } from './services/history-store.js';
@@ -298,11 +299,10 @@ export class ClaudeCodeWebServer {
     resolve: () => void;
     reject: (error: unknown) => void;
   } | null;
-  private usageStore: WorkspaceUsageCoordinator;
+  private usageStore: UsageStore;
   private codexPricing: CodexPricing;
   private sessionStore: SessionStore;
   private workspaceCatalog: WorkspaceCatalog;
-  private workspaceArtifactMigrator: WorkspaceSessionArtifactMigrator;
   private transcriptStore: TranscriptStore;
   private chatStore: ChatStore;
   private chatManager: ChatSessionManager;
@@ -350,14 +350,13 @@ export class ClaudeCodeWebServer {
   private projects: ProjectManager;
   private projectPaths: ProjectEnvironmentManager;
   private loadedWorkspaceScopes: Set<string>;
-  /** One targeted legacy retry per owner/workspace; concurrent opens share it. */
-  private legacyWorkspaceMigrationRetries: Map<string, Promise<void>>;
   private workspacePersistenceErrors: Map<string, string>;
+  /** Exact `.cc-web` inode admitted for each live global metadata scope. */
+  private workspaceArtifactIdentities: Map<string, WorkspaceSessionStorageIdentity>;
   private suspendedProjectScopes: Map<string, SessionStorageScope>;
   /** Project archives whose crash-staging slot could not be restored safely. */
   private unrestoredProjectScopes: Set<string>;
   /** Cold-start intents awaiting a database open bound to their exact inode. */
-  private pendingProjectRecoveryAuthorities: Map<string, WorkspaceSessionStorageIdentity>;
   private storageUsage: StorageUsageManager;
   private connectedHostValidator: ConnectedHostValidator;
   /** The startup-flag configuration: the 'legacy' entry in the target maps. */
@@ -454,11 +453,10 @@ export class ClaudeCodeWebServer {
     this.webSocketConnections = new Map();
     this.tabCoordinator = new AccountTabCoordinator();
     this.loadedWorkspaceScopes = new Set();
-    this.legacyWorkspaceMigrationRetries = new Map();
     this.workspacePersistenceErrors = new Map();
+    this.workspaceArtifactIdentities = new Map();
     this.suspendedProjectScopes = new Map();
     this.unrestoredProjectScopes = new Set();
-    this.pendingProjectRecoveryAuthorities = new Map();
 
     this.claudeBridge = new ClaudeBridge();
     this.codexBridge = new CodexBridge();
@@ -473,19 +471,11 @@ export class ClaudeCodeWebServer {
 
     this.dataDir = config.dataDir;
     dataDirWriterConstructionStarted = true;
-    // Legacy session/usage tables are a one-time import source. Historical
-    // schema migrations remain available, but derived metadata is normalised
-    // only in the workspace copy so a blocked migration leaves app.sqlite
-    // byte-for-byte authoritative rather than rewriting it on every boot.
-    this.database = new AppDatabase({
-      dataDir: config.dataDir,
-      legacySessionBackfills: false,
-    });
+    // One per-user database owns global configuration, session metadata and
+    // usage. Project `.cc-web` trees contain only project-scoped file bodies.
+    this.database = new AppDatabase({ dataDir: config.dataDir });
     this.workspaceCatalog = new WorkspaceCatalog(this.database);
-    this.workspaceArtifactMigrator = new WorkspaceSessionArtifactMigrator({
-      legacyStorageDir: this.database.storageDir,
-    });
-    this.usageStore = new WorkspaceUsageCoordinator();
+    this.usageStore = new UsageStore(this.database);
     // The codex list-price catalogue (issue #182). Constructed with the app
     // database so fetched official prices persist across restarts; `start()` is
     // called once the server is up (see setupExpress) and `stop()` on shutdown.
@@ -614,11 +604,7 @@ export class ClaudeCodeWebServer {
     });
     this.sessionStore = new SessionStore({
       database: this.database,
-      workspaceCoordinator: true,
-      archiveTrust: {
-        seal: (value) => this.encryptionKeyRing.encrypt(value),
-        open: (envelope) => this.encryptionKeyRing.decrypt(envelope),
-      },
+      scopedGlobalStore: true,
     });
     this.transcriptStore = new TranscriptStore({ storageDir: this.database.storageDir });
     this.historyStore = new HistoryStore({ storageDir: this.database.storageDir });
@@ -637,16 +623,14 @@ export class ClaudeCodeWebServer {
       // chat subsystem knows what a job cost; it does not know SQLite, and the
       // login it files the work under is not something it can look up.
       usageFor: (record) => {
-        const scope = record.storageScope;
-        if (!scope) throw new Error('Chat usage requires workspace-local session storage');
         return {
-          record: (job) => { this.usageStore.record(scope, job); },
-          consumedFor: (nativeSessionId) => this.usageStore.consumedFor(scope, nativeSessionId),
+          record: (job) => { this.usageStore.record(job); },
+          consumedFor: (nativeSessionId) => this.usageStore.consumedFor(nativeSessionId),
           costBaselineFor: (nativeSessionId) =>
-            this.usageStore.costBaselineFor(scope, nativeSessionId),
+            this.usageStore.costBaselineFor(nativeSessionId),
           loginFor: (userId) => this.database.getUserById(userId)?.githubLogin ?? String(userId),
           spendByTurn: (sessionId, userId) =>
-            this.usageStore.spendByTurn(scope, sessionId, userId),
+            this.usageStore.spendByTurn(sessionId, userId),
         };
       },
       storageDir: this.database.storageDir,
@@ -871,13 +855,8 @@ export class ClaudeCodeWebServer {
         this.rejectProjectWorkspaceRestore(project, reason),
       beforeWorkspaceDeletion: (project) =>
         this.beforeProjectWorkspaceDeletion(project),
-      hasLegacyProjectSessions: (projectId, ownerUserId) => Boolean(
-        this.database.raw.prepare(
-          'SELECT 1 AS present FROM runtime_sessions WHERE project_id = ? AND owner_user_id = ? LIMIT 1',
-        ).get(projectId, ownerUserId),
-      ),
-      hasIncompleteProjectSessionMigration: (project) =>
-        this.projectHasIncompleteBinaryMigration(project),
+      hasUnavailableProjectSessionStorage: (project) =>
+        this.projectSessionStorageIsUnavailable(project),
       // Durable active flags and atomic admission leases live in ProjectStore.
       // This closes the remaining process-local observation gaps.
       hasLiveProjectWork: (projectId: string) => this.hasLiveProjectWork(projectId),
@@ -1010,15 +989,10 @@ export class ClaudeCodeWebServer {
     // Kick off the daily OpenAI list-price refresh (issue #182) once the server
     // is up; the interval is unref'd and torn down on shutdown.
     this.codexPricing.start();
-    // One-time retrospective backfill of historical codex turns. Attaching the
-    // estimator backfills every already-registered workspace now and any
-    // workspace as it opens later (the coordinator keeps per-workspace marks),
-    // so history in a workspace that was not open at boot still gets priced.
-    // All passes are guarded: unpriced rows are retried once a rate exists,
-    // while priced rows are never touched again.
+    // One-time retrospective backfill of historical codex turns in app.sqlite.
+    // Unpriced rows are retried once a rate exists; priced rows are untouched.
     try {
-      this.usageStore.attachCodexEstimator(this.codexPricing);
-      this.usageStore.backfillCodex(this.codexPricing);
+      this.usageStore.backfillCodexEstimates(this.codexPricing);
     } catch (error) {
       console.warn(`codex cost backfill failed: ${error instanceof Error ? error.message : String(error)}`);
     }
@@ -1466,6 +1440,7 @@ export class ClaudeCodeWebServer {
       || (project
         ? this.projectSessionStorageScope(project)
         : this.sessionStorageScope(params.ownerUserId, params.storageRoot || params.workingDir));
+    this.assertWorkspaceScopeWritable(storageScope);
     return {
       id: params.id,
       storageScope,
@@ -1515,6 +1490,66 @@ export class ClaudeCodeWebServer {
       ),
       ownerKey,
     };
+  }
+
+  private workspaceScopeKey(scope: SessionStorageScope): string {
+    return `${scope.ownerKey}\u0000${scope.workspaceRoot}`;
+  }
+
+  private sameWorkspaceScope(left: SessionStorageScope, right: SessionStorageScope): boolean {
+    return left.ownerKey === right.ownerKey && left.workspaceRoot === right.workspaceRoot;
+  }
+
+  /** A staged/rejected project archive is a scope-level gate, not a row hint. */
+  private workspaceScopeGateReason(scope: SessionStorageScope): string | null {
+    const key = this.workspaceScopeKey(scope);
+    if (this.unrestoredProjectScopes.has(key)) {
+      return this.workspacePersistenceErrors.get(key)
+        || 'Project session artifacts are crash-staged and have not been restored';
+    }
+    for (const suspended of this.suspendedProjectScopes.values()) {
+      if (this.sameWorkspaceScope(suspended, scope)) {
+        return this.workspacePersistenceErrors.get(key)
+          || 'Project session artifacts are temporarily unavailable';
+      }
+    }
+    return null;
+  }
+
+  private assertWorkspaceScopeWritable(scope: SessionStorageScope): void {
+    const reason = this.workspaceScopeGateReason(scope);
+    if (reason) throw new ProjectWorkspaceSessionStorageError(reason);
+  }
+
+  /**
+   * Admit one exact artifact archive and remember its inode for the lifetime of
+   * this process. A later same-name directory is never silently substituted.
+   */
+  private admitWorkspaceArtifactArchive(
+    scope: SessionStorageScope,
+    createIfMissing: boolean,
+  ): WorkspaceSessionStorageIdentity {
+    const key = this.workspaceScopeKey(scope);
+    const expected = this.workspaceArtifactIdentities.get(key);
+    const lease = openWorkspaceStorageDirectorySync(scope.workspaceRoot, {
+      createIfMissing,
+      ...(expected ? { expectedIdentity: expected } : {}),
+    });
+    try {
+      lease.verify();
+      const opened = fs.fstatSync(lease.fd, { bigint: true });
+      if (!opened.isDirectory() || opened.ino === 0n) {
+        throw new Error('Workspace artifact directory has no stable identity');
+      }
+      const identity = { dev: opened.dev, ino: opened.ino };
+      if (expected && (identity.dev !== expected.dev || identity.ino !== expected.ino)) {
+        throw new Error('Workspace artifact directory changed after admission');
+      }
+      this.workspaceArtifactIdentities.set(key, identity);
+      return identity;
+    } finally {
+      lease.close();
+    }
   }
 
   /** A catalog entry locates a candidate; current policy still authorises it. */
@@ -1589,181 +1624,53 @@ export class ClaudeCodeWebServer {
     else session.workingDir = validation.path;
   }
 
+  /** Retire one structured project gate only after its exact archive is back. */
+  private clearVerifiedProjectScopeGate(
+    project: Project,
+    scope: SessionStorageScope,
+    identity: WorkspaceSessionStorageIdentity,
+  ): void {
+    const key = this.workspaceScopeKey(scope);
+    this.workspaceArtifactIdentities.set(key, identity);
+    this.suspendedProjectScopes.delete(project.id);
+    this.unrestoredProjectScopes.delete(key);
+    this.loadedWorkspaceScopes.add(key);
+    this.workspacePersistenceErrors.delete(key);
+    for (const session of this.claudeSessions.values()) {
+      if (!session.storageScope || !this.sameWorkspaceScope(session.storageScope, scope)) continue;
+      try {
+        this.revalidateRestoredSession(session, scope, session.ownerUserId);
+        session.persistenceUnavailable = undefined;
+      } catch (error) {
+        const reason = error instanceof Error ? error.message : String(error);
+        session.persistenceUnavailable = reason;
+        this.workspacePersistenceErrors.set(key, reason);
+      }
+    }
+  }
+
   /** Open one authorised archive and merge it without last-wins collisions. */
   private async loadWorkspaceSessions(
     ownerUserId: number,
     storageRoot: string,
-    options: {
-      refresh?: boolean;
-      publishForPruning?: boolean;
-      skipLegacyRetry?: boolean;
-    } = {},
   ): Promise<void> {
-    let scope: SessionStorageScope;
     try {
-      scope = this.sessionStorageScope(ownerUserId, storageRoot);
+      const scope = this.sessionStorageScope(ownerUserId, storageRoot);
+      const key = this.workspaceScopeKey(scope);
+      this.assertWorkspaceScopeWritable(scope);
+      this.admitWorkspaceArtifactArchive(scope, true);
+      this.loadedWorkspaceScopes.add(key);
+      const blocked = [...this.claudeSessions.values()].some((session) =>
+        session.storageScope?.ownerKey === scope.ownerKey
+        && session.storageScope.workspaceRoot === scope.workspaceRoot
+        && Boolean(session.persistenceUnavailable));
+      if (!blocked) this.workspacePersistenceErrors.delete(key);
     } catch (error) {
-      // Scope admission can fail before there is a database to describe (for
-      // example when a plaintext root is already owned by another account).
-      // Keep that failure visible in the persistence diagnostic instead of
-      // reporting it only to the one create/resume request that discovered it.
       const ownerKey = this.sessionOwnerKey(ownerUserId);
       this.workspacePersistenceErrors.set(
         `${ownerKey}\u0000${path.resolve(storageRoot)}`,
         error instanceof Error ? error.message : String(error),
       );
-      throw error;
-    }
-    const key = `${scope.ownerKey}\u0000${scope.workspaceRoot}`;
-    if (options.skipLegacyRetry !== true) {
-      let retry = this.legacyWorkspaceMigrationRetries.get(key);
-      if (!retry) {
-        retry = (async () => {
-          const legacy = await this.sessionStore.loadLegacySessions(ownerUserId);
-          await this.migrateLegacySessions(legacy, {
-            onlyScope: scope,
-            migrateOrphanUsage: false,
-          });
-        })();
-        this.legacyWorkspaceMigrationRetries.set(key, retry);
-      }
-      try {
-        await retry;
-      } finally {
-        if (this.legacyWorkspaceMigrationRetries.get(key) === retry) {
-          this.legacyWorkspaceMigrationRetries.delete(key);
-        }
-      }
-    }
-    const alreadyLoaded = this.loadedWorkspaceScopes.has(key);
-    if (options.publishForPruning === false) {
-      this.sessionStore.holdWorkspacePublication(scope);
-    }
-    if (alreadyLoaded && options.refresh !== true) {
-      // Only the migration coordinator may deliberately release a partial
-      // archive. Ordinary create/join calls must not turn a prior prefix load
-      // into permission to prune it.
-      if (options.publishForPruning === true) {
-        this.sessionStore.markWorkspacePublished(scope);
-      }
-      return;
-    }
-    const publishForPruning = options.publishForPruning === true
-      || (
-        options.publishForPruning !== false
-        && !this.sessionStore.isWorkspacePublicationHeld(scope)
-      );
-
-    try {
-      const store = this.sessionStore.openWorkspace(scope);
-      const owner = this.database.getUserById(ownerUserId);
-      if (!owner) throw new Error('Workspace owner account is unavailable');
-      store.rebindWorkspaceOwner(ownerUserId, owner.githubLogin);
-      this.usageStore.register(scope, store.database);
-      if (!alreadyLoaded) await store.resetActiveFlags();
-      const loaded = await store.loadSessions();
-      const accepted: SessionRecord[] = [];
-      for (const [id, session] of loaded) {
-        this.revalidateRestoredSession(session, scope, ownerUserId);
-        const existing = this.claudeSessions.get(id);
-        const sameScope = existing
-          && existing.storageScope?.ownerKey === scope.ownerKey
-          && existing.storageScope?.workspaceRoot === scope.workspaceRoot;
-        const replaceableUnscopedLegacy = existing?.persistenceUnavailable
-          && existing.ownerUserId === ownerUserId
-          && !existing.storageScope;
-        if (existing && !sameScope && !replaceableUnscopedLegacy && (
-          existing.storageScope?.ownerKey !== scope.ownerKey
-          || existing.storageScope?.workspaceRoot !== scope.workspaceRoot
-        )) {
-          throw new Error(`Session id collision for ${id} across workspace archives`);
-        }
-        accepted.push(session);
-      }
-      // Validate the complete archive before publishing any of it. A late id
-      // collision must not leave an earlier prefix partially loaded.
-      const confirmationErrors: string[] = [];
-      const legacyDuplicates: string[] = [];
-      const published: SessionRecord[] = [];
-      for (const session of accepted) {
-        // The opaque owner key survives a re-created installation database;
-        // the local numeric id does not and is refreshed on an authorised load.
-        session.ownerUserId = ownerUserId;
-        const legacyStillAuthoritative = this.database.raw.prepare(`
-          SELECT 1 AS present
-          FROM runtime_sessions
-          WHERE owner_user_id = ? AND id = ?
-          LIMIT 1
-        `).get(ownerUserId, session.id);
-        // A destination transaction can commit before the legacy transaction
-        // fails. In that recoverable duplicate state the source row and file
-        // rollback copies remain authoritative, so discovery must not confirm
-        // (and delete) those files merely because it can see the local row.
-        if (legacyStillAuthoritative) {
-          legacyDuplicates.push(session.id);
-          // Keep the read-only legacy placeholder (if already published) and
-          // do not let an unconfirmed duplicate destination row replace it.
-          continue;
-        } else {
-          try {
-            await this.workspaceArtifactMigrator.confirm(session);
-          } catch (error) {
-            confirmationErrors.push(
-              `${session.id}: ${error instanceof Error ? error.message : String(error)}`,
-            );
-          }
-        }
-        // Child shells are durable sessions too. Their process cannot survive
-        // a server restart, but their record, transcript, history and paste
-        // artefacts must: reopening the conversation starts a terminal again in
-        // the same child record and retains its prior scrollback.
-        const existing = this.claudeSessions.get(session.id);
-        if (alreadyLoaded && existing && !existing.persistenceUnavailable) {
-          // A retry may add another completed unit while an already restored
-          // sibling is running. Keep that sibling's live runtime state and
-          // merge only newly authoritative rows/read-only placeholders.
-          continue;
-        }
-        published.push(session);
-      }
-      // No await is allowed between publishing the complete archive and
-      // admitting it for pruning.  Autosave can therefore see either the old
-      // non-authoritative state or the complete restored state, never a prefix.
-      for (const session of published) this.claudeSessions.set(session.id, session);
-      const archiveCanPrune = publishForPruning && legacyDuplicates.length === 0;
-      if (archiveCanPrune) {
-        this.sessionStore.markWorkspacePublished(scope);
-      } else {
-        this.sessionStore.holdWorkspacePublication(scope);
-      }
-      this.loadedWorkspaceScopes.add(key);
-      const diagnostics: string[] = [];
-      if (!archiveCanPrune) {
-        const existingDiagnostic = this.workspacePersistenceErrors.get(key);
-        if (existingDiagnostic) diagnostics.push(existingDiagnostic);
-      }
-      if (legacyDuplicates.length > 0) {
-        diagnostics.push(
-          `Legacy authority remains for local duplicate rows: ${legacyDuplicates.join(', ')}`,
-        );
-      }
-      if (confirmationErrors.length > 0) {
-        diagnostics.push(
-          `Legacy artifact cleanup is incomplete (${confirmationErrors.join(', ')})`,
-        );
-      }
-      if (diagnostics.length > 0) {
-        this.workspacePersistenceErrors.set(key, diagnostics.join('; '));
-      } else if (archiveCanPrune) {
-        this.workspacePersistenceErrors.delete(key);
-      }
-    } catch (error) {
-      if (!alreadyLoaded) {
-        this.usageStore.unregister(scope);
-        this.sessionStore.closeWorkspace(scope);
-      }
-      const message = error instanceof Error ? error.message : String(error);
-      this.workspacePersistenceErrors.set(key, message);
       throw error;
     }
   }
@@ -1833,15 +1740,20 @@ export class ClaudeCodeWebServer {
             owner,
           );
           if (recoveryIdentity) {
-            this.sessionStore.resumeWorkspace(scope, recoveryIdentity);
-            this.pendingProjectRecoveryAuthorities.set(project.id, recoveryIdentity);
+            const reopened = await this.projectPaths.workspaceSessionStorageIdentity(project, owner);
+            if (!reopened || reopened.dev !== recoveryIdentity.dev || reopened.ino !== recoveryIdentity.ino) {
+              throw new ProjectWorkspaceSessionStorageError(
+                'Cold-restored project artifacts did not retain their archive inode',
+              );
+            }
+            await this.projectPaths.completeWorkspaceSessionStorageRestore(project, owner, reopened);
+            this.clearVerifiedProjectScopeGate(project, scope, reopened);
           } else {
-            this.pendingProjectRecoveryAuthorities.delete(project.id);
-          }
-          this.unrestoredProjectScopes.delete(key);
-          const diagnostic = this.workspacePersistenceErrors.get(key);
-          if (diagnostic?.startsWith('Project session archive crash recovery failed:')) {
-            this.workspacePersistenceErrors.delete(key);
+            this.unrestoredProjectScopes.delete(key);
+            const diagnostic = this.workspacePersistenceErrors.get(key);
+            if (diagnostic?.startsWith('Project session archive crash recovery failed:')) {
+              this.workspacePersistenceErrors.delete(key);
+            }
           }
         } catch (error) {
           const message = error instanceof Error ? error.message : String(error);
@@ -1855,135 +1767,72 @@ export class ClaudeCodeWebServer {
     }
   }
 
-  /** Finalise cold recovery only after discovery opened SQLite on the expected inode. */
-  private async completeRestoredProjectSessionArchives(): Promise<void> {
-    for (const [projectId, expected] of [...this.pendingProjectRecoveryAuthorities]) {
-      const project = this.projectStore.getProject(projectId);
-      const owner = project ? this.getEnvironmentOwner(project.ownerUserId) : null;
-      if (!project || !owner) continue;
-      const scope = this.projectSessionStorageScope(project);
-      const key = `${scope.ownerKey}\u0000${scope.workspaceRoot}`;
-      if (!this.loadedWorkspaceScopes.has(key)) continue;
-      try {
-        const reopened = this.sessionStore.workspaceStorageIdentity(scope);
-        if (!reopened || reopened.dev !== expected.dev || reopened.ino !== expected.ino) {
-          throw new ProjectWorkspaceSessionStorageError(
-            'Cold-restored project database did not open the retained archive inode',
-          );
-        }
-        await this.projectPaths.completeWorkspaceSessionStorageRestore(project, owner, reopened);
-        this.sessionStore.completeWorkspaceResume(scope, expected);
-        this.pendingProjectRecoveryAuthorities.delete(projectId);
-      } catch (error) {
-        await this.projectPaths.recordWorkspaceSessionStorageIntent(
-          project,
-          owner,
-          expected,
-        ).catch(() => undefined);
-        this.rejectProjectWorkspaceRestore(
-          project,
-          error instanceof Error ? error.message : String(error),
-        );
-        this.unrestoredProjectScopes.add(key);
-      }
-    }
-  }
-
-  private async projectHasIncompleteBinaryMigration(project: Project): Promise<boolean> {
+  private async projectSessionStorageIsUnavailable(project: Project): Promise<boolean> {
     const scope = this.projectSessionStorageScope(project);
-    const key = `${scope.ownerKey}\u0000${scope.workspaceRoot}`;
-    const databasePath = path.join(scope.workspaceRoot, '.cc-web', 'session-state.sqlite');
-
-    // A project may reach a lifecycle operation before startup discovery has
-    // opened its archive (or after a process died while the archive occupied
-    // the crash-recovery staging slot).  Recover and inspect an existing DB
-    // before deciding that there is no migration state to protect.  Never call
-    // the loader for an absent DB: opening it would create an empty archive and
-    // hide the unavailable authoritative one.
-    if (!this.loadedWorkspaceScopes.has(key)) {
-      const owner = this.getEnvironmentOwner(project.ownerUserId);
-      if (!owner) throw new Error('Project workspace owner is unavailable');
+    const key = this.workspaceScopeKey(scope);
+    const owner = this.getEnvironmentOwner(project.ownerUserId);
+    if (!owner) throw new Error('Project workspace owner is unavailable');
+    try {
       await this.projectPaths.restoreWorkspaceSessionStorage(project, owner);
       const recoveryIdentity = await this.projectPaths.workspaceSessionStorageRecoveryIdentity(
         project,
         owner,
       );
-      if (recoveryIdentity) this.sessionStore.resumeWorkspace(scope, recoveryIdentity);
-      this.unrestoredProjectScopes.delete(key);
-      const recoveryDiagnostic = this.workspacePersistenceErrors.get(key);
-      if (recoveryDiagnostic?.startsWith('Project session archive crash recovery failed:')) {
-        this.workspacePersistenceErrors.delete(key);
-      }
-      if (fs.existsSync(databasePath)) {
-        try {
-          if (this.suspendedProjectScopes.has(project.id)) {
-            const reopened = await this.afterProjectWorkspaceRestored(project, recoveryIdentity || undefined);
-            if (recoveryIdentity) {
-              if (!reopened) {
-                throw new ProjectWorkspaceSessionStorageError(
-                  'Restored project database did not prove the retained archive inode',
-                );
-              }
-              await this.projectPaths.completeWorkspaceSessionStorageRestore(project, owner, reopened);
-              this.confirmProjectWorkspaceRestored(project, recoveryIdentity);
-            }
-          } else {
-            await this.loadWorkspaceSessions(project.ownerUserId, scope.workspaceRoot);
-            if (recoveryIdentity) {
-              const reopened = this.sessionStore.workspaceStorageIdentity(scope);
-              if (!reopened) {
-                throw new ProjectWorkspaceSessionStorageError(
-                  'Restored project database did not retain its storage lease',
-                );
-              }
-              await this.projectPaths.completeWorkspaceSessionStorageRestore(project, owner, reopened);
-              this.sessionStore.completeWorkspaceResume(scope, recoveryIdentity);
-            }
-          }
-        } catch (error) {
-          if (recoveryIdentity) {
-            await this.projectPaths.recordWorkspaceSessionStorageIntent(
-              project,
-              owner,
-              recoveryIdentity,
-            ).catch(() => undefined);
-          }
-          this.rejectProjectWorkspaceRestore(
-            project,
-            error instanceof Error ? error.message : String(error),
+      if (recoveryIdentity) {
+        const reopened = await this.projectPaths.workspaceSessionStorageIdentity(project, owner);
+        if (!reopened || reopened.dev !== recoveryIdentity.dev || reopened.ino !== recoveryIdentity.ino) {
+          throw new ProjectWorkspaceSessionStorageError(
+            'Restored project artifacts did not prove the retained archive inode',
           );
-          throw error;
         }
+        await this.projectPaths.completeWorkspaceSessionStorageRestore(project, owner, reopened);
+        this.clearVerifiedProjectScopeGate(project, scope, reopened);
+      } else if (this.workspaceScopeGateReason(scope)) {
+        return true;
       }
+      await this.loadWorkspaceSessions(project.ownerUserId, scope.workspaceRoot);
+    } catch (error) {
+      this.rejectProjectWorkspaceRestore(
+        project,
+        error instanceof Error ? error.message : String(error),
+      );
+      throw error;
     }
-
-    // Persistence diagnostics are deliberately fail-closed. Trust failures,
-    // owner collisions and unavailable/corrupt archives are just as unsafe to
-    // rebuild over as a recognised legacy-cleanup marker.
-    if (this.workspacePersistenceErrors.has(key)) return true;
-    if (fs.existsSync(databasePath) && !this.loadedWorkspaceScopes.has(key)) return true;
-    for (const session of this.claudeSessions.values()) {
-      if (
-        session.ownerUserId !== project.ownerUserId
-        || session.storageScope?.ownerKey !== scope.ownerKey
-        || session.storageScope?.workspaceRoot !== scope.workspaceRoot
-      ) continue;
-      if (await this.workspaceArtifactMigrator.hasPendingBinaryCleanup(session)) return true;
-    }
-    return false;
+    return this.workspacePersistenceErrors.has(key)
+      || this.unrestoredProjectScopes.has(key)
+      || this.suspendedProjectScopes.has(project.id);
   }
 
   private async beforeProjectWorkspaceReplacement(
     project: Project,
   ): Promise<boolean | ProjectWorkspaceReplacementAuthority> {
-    if (await this.projectHasIncompleteBinaryMigration(project)) {
+    if (await this.projectSessionStorageIsUnavailable(project)) {
       throw new ProjectWorkspaceSessionStorageError(
-        'Project session binary migration is incomplete; retry migration before replacing the workspace',
+        'Project session storage is unavailable; restore the archive before replacing the workspace',
       );
     }
     const scope = this.projectSessionStorageScope(project);
     const key = `${scope.ownerKey}\u0000${scope.workspaceRoot}`;
-    if (!this.loadedWorkspaceScopes.has(key)) return false;
+    const owner = this.getEnvironmentOwner(project.ownerUserId);
+    if (!owner) throw new Error('Project workspace owner is unavailable');
+    // Capture the artifact archive before lifecycle admission is closed and
+    // before any asynchronous flush. The same inode is required again below;
+    // a same-name replacement must never become preservation authority merely
+    // because it appeared while the already-admitted writers were draining.
+    const admittedIdentity = await this.projectPaths.workspaceSessionStorageIdentity(project, owner);
+    if (!admittedIdentity) return false;
+    const retainedIdentity = this.workspaceArtifactIdentities.get(key);
+    if (retainedIdentity && (
+      retainedIdentity.dev !== admittedIdentity.dev
+      || retainedIdentity.ino !== admittedIdentity.ino
+    )) {
+      throw new Error('Project artifact directory changed after workspace admission');
+    }
+    this.workspaceArtifactIdentities.set(key, admittedIdentity);
+    // Close scope-wide admission before the first await below. A concurrent
+    // standalone create targeting this managed root must not recreate
+    // `.cc-web` while its authoritative inode is being staged.
+    this.suspendedProjectScopes.set(project.id, scope);
     // From this point until the exact archive has been restored and reloaded,
     // the in-memory records are only read-only signposts.  A lifecycle failure
     // can leave the authoritative `.cc-web` inode in its deterministic sibling
@@ -2024,7 +1873,7 @@ export class ClaudeCodeWebServer {
       // Keep the live records gated, but persist their current state as it was
       // immediately before this lifecycle suspension. This is deliberately an
       // explicit snapshot: the general coordinator must continue to ignore
-      // migration-blocked/read-only records during unrelated autosaves.
+      // storage-blocked/read-only records during unrelated autosaves.
       const persistenceSnapshot = new Map(this.claudeSessions);
       for (const { session, previous } of affected) {
         persistenceSnapshot.set(session.id, {
@@ -2035,27 +1884,27 @@ export class ClaudeCodeWebServer {
       if (!(await this.saveSessionsToDisk(persistenceSnapshot))) {
         throw new Error('Workspace storage authority could not be flushed before project replacement');
       }
-      const identity = this.sessionStore.workspaceStorageIdentity(scope);
-      if (!identity) {
-        throw new ProjectWorkspaceSessionStorageError(
-          'Loaded project workspace has no open session storage authority',
-        );
+      // Cached direct-child handles must be gone before the project manager can
+      // move the complete `.cc-web` tree into its deterministic staging slot.
+      closeWorkspaceSessionDirectoryLeasesForScope(scope);
+      const identity = await this.projectPaths.workspaceSessionStorageIdentity(project, owner);
+      if (
+        !identity
+        || identity.dev !== admittedIdentity.dev
+        || identity.ino !== admittedIdentity.ino
+      ) {
+        throw new Error('Project artifact directory changed while lifecycle writers were draining');
       }
-      const owner = this.getEnvironmentOwner(project.ownerUserId);
-      if (!owner) throw new Error('Project workspace owner is unavailable');
-      // The sibling intent is durable before the live database handle closes.
+      // The sibling intent is durable before the artifact tree is moved.
       // A crash in the following suspension gap therefore cannot make a
       // same-name replacement look like the authoritative archive at boot.
       await this.projectPaths.recordWorkspaceSessionStorageIntent(project, owner, identity);
       intentCommitted = true;
-      this.usageStore.unregister(scope);
-      this.sessionStore.suspendWorkspace(scope);
-      closeWorkspaceSessionDirectoryLeasesForScope(scope);
       this.loadedWorkspaceScopes.delete(key);
-      this.suspendedProjectScopes.set(project.id, scope);
       return { required: true, identity };
     } catch (error) {
       if (!intentCommitted) {
+        this.suspendedProjectScopes.delete(project.id);
         for (const { session, previous } of affected) {
           session.persistenceUnavailable = previous;
         }
@@ -2072,17 +1921,16 @@ export class ClaudeCodeWebServer {
   ): Promise<WorkspaceSessionStorageIdentity | void> {
     const scope = this.suspendedProjectScopes.get(project.id);
     if (!scope) return;
-    this.sessionStore.resumeWorkspace(scope, expected);
     try {
-      await this.loadWorkspaceSessions(project.ownerUserId, scope.workspaceRoot);
-      const reopened = this.sessionStore.workspaceStorageIdentity(scope);
-      if (!reopened) throw new Error('Restored project workspace database did not retain a storage lease');
+      const owner = this.getEnvironmentOwner(project.ownerUserId);
+      if (!owner) throw new Error('Project workspace owner is unavailable');
+      const reopened = await this.projectPaths.workspaceSessionStorageIdentity(project, owner);
+      if (!reopened) throw new Error('Restored project artifact directory is unavailable');
+      if (expected && (reopened.dev !== expected.dev || reopened.ino !== expected.ino)) {
+        throw new Error('Restored project artifact directory changed identity');
+      }
       return reopened;
     } catch (error) {
-      // A failed load must not leave the scope writable. Otherwise the next
-      // autosave could recreate an empty DB at the canonical path and publish
-      // partial in-memory rows without their retained binary artefacts.
-      this.sessionStore.suspendWorkspace(scope);
       this.workspacePersistenceErrors.set(
         `${scope.ownerKey}\u0000${scope.workspaceRoot}`,
         error instanceof Error ? error.message : String(error),
@@ -2091,14 +1939,19 @@ export class ClaudeCodeWebServer {
     }
   }
 
-  private confirmProjectWorkspaceRestored(
+  private async confirmProjectWorkspaceRestored(
     project: Project,
     expected: WorkspaceSessionStorageIdentity,
-  ): WorkspaceSessionStorageIdentity {
+  ): Promise<WorkspaceSessionStorageIdentity> {
     const scope = this.suspendedProjectScopes.get(project.id);
     if (!scope) throw new Error('Project workspace restore is not awaiting confirmation');
-    const confirmed = this.sessionStore.completeWorkspaceResume(scope, expected);
-    this.suspendedProjectScopes.delete(project.id);
+    const owner = this.getEnvironmentOwner(project.ownerUserId);
+    if (!owner) throw new Error('Project workspace owner is unavailable');
+    const confirmed = await this.projectPaths.workspaceSessionStorageIdentity(project, owner);
+    if (!confirmed || confirmed.dev !== expected.dev || confirmed.ino !== expected.ino) {
+      throw new Error('Restored project artifact directory changed after confirmation');
+    }
+    this.clearVerifiedProjectScopeGate(project, scope, confirmed);
     return confirmed;
   }
 
@@ -2116,8 +1969,6 @@ export class ClaudeCodeWebServer {
         session.persistenceUnavailable = suspendedReason;
       }
     }
-    this.usageStore.unregister(scope);
-    this.sessionStore.suspendWorkspace(scope);
     this.loadedWorkspaceScopes.delete(key);
     this.suspendedProjectScopes.set(project.id, scope);
     this.workspacePersistenceErrors.set(key, suspendedReason);
@@ -2125,30 +1976,39 @@ export class ClaudeCodeWebServer {
 
   private async beforeProjectWorkspaceDeletion(project: Project): Promise<void> {
     const scope = this.projectSessionStorageScope(project);
-    const key = `${scope.ownerKey}\u0000${scope.workspaceRoot}`;
-    this.usageStore.unregister(scope);
-    this.sessionStore.resumeWorkspace(scope);
-    this.sessionStore.closeWorkspace(scope);
+    const key = this.workspaceScopeKey(scope);
     closeWorkspaceSessionDirectoryLeasesForScope(scope);
     this.loadedWorkspaceScopes.delete(key);
+    this.workspaceArtifactIdentities.delete(key);
     this.suspendedProjectScopes.delete(project.id);
     this.workspaceCatalog.unregister(scope.ownerKey, scope.workspaceRoot);
   }
 
   private async workspaceSessionMetadata(ownerUserId?: number): Promise<Record<string, unknown>> {
     const ownerKey = ownerUserId === undefined ? null : this.sessionOwnerKey(ownerUserId);
-    const opened = await this.sessionStore.getOpenedSessionMetadata();
-    const visibleScopes = opened.scopes
-      .filter(({ scope }) => !ownerKey || scope.ownerKey === ownerKey);
-    const workspaces = visibleScopes
-      .map(({ scope, metadata }) => ({
+    const metadata = await this.sessionStore.getSessionMetadata();
+    const counts = new Map<string, { ownerKey: string; root: string; sessionCount: number }>();
+    for (const session of this.claudeSessions.values()) {
+      const scope = session.storageScope;
+      if (!scope || (ownerKey && scope.ownerKey !== ownerKey)) continue;
+      const key = `${scope.ownerKey}\u0000${scope.workspaceRoot}`;
+      const entry = counts.get(key) ?? {
+        ownerKey: scope.ownerKey,
         root: scope.workspaceRoot,
-        available: metadata.exists && !metadata.error,
-        sessionCount: metadata.sessionCount ?? 0,
-        savedAt: metadata.savedAt,
-        version: metadata.version,
-        error: metadata.error,
-      }));
+        sessionCount: 0,
+      };
+      entry.sessionCount += 1;
+      counts.set(key, entry);
+    }
+    const workspaces = [...counts.values()].map(({ ownerKey: scopeOwner, root, sessionCount }) => {
+      const error = this.workspacePersistenceErrors.get(`${scopeOwner}\u0000${root}`);
+      return {
+        root,
+        available: !error,
+        sessionCount,
+        ...(error ? { error } : {}),
+      };
+    });
     const unavailableByScope = new Map<string, { ownerKey: string; root: string; error: string }>();
     for (const [key, error] of this.workspacePersistenceErrors) {
       const separator = key.indexOf('\u0000');
@@ -2158,28 +2018,21 @@ export class ClaudeCodeWebServer {
         error,
       });
     }
-    for (const { scope, metadata } of opened.scopes) {
-      if (!metadata.error) continue;
-      const key = `${scope.ownerKey}\u0000${scope.workspaceRoot}`;
-      if (!unavailableByScope.has(key)) {
-        unavailableByScope.set(key, {
-          ownerKey: scope.ownerKey,
-          root: scope.workspaceRoot,
-          error: metadata.error,
-        });
-      }
-    }
     const unavailable = Array.from(unavailableByScope.values())
       .filter((entry) => !ownerKey || entry.ownerKey === ownerKey)
       .map(({ root, error }) => ({ root, error }));
     return {
-      exists: workspaces.some((workspace) => workspace.available),
-      storage: 'workspace-local',
-      layoutVersion: 1,
-      sessionCount: workspaces.reduce((sum, workspace) => sum + workspace.sessionCount, 0),
+      exists: metadata.exists,
+      storage: 'shared-app-sqlite',
+      layoutVersion: 2,
+      sessionCount: ownerUserId === undefined
+        ? metadata.sessionCount ?? 0
+        : [...this.claudeSessions.values()].filter((session) => session.ownerUserId === ownerUserId).length,
+      savedAt: metadata.savedAt,
+      version: metadata.version,
       workspaces,
       unavailable,
-      migrationComplete: unavailable.length === 0,
+      allAvailable: unavailable.length === 0,
     };
   }
 
@@ -2365,408 +2218,47 @@ export class ClaudeCodeWebServer {
   private async loadPersistedSessions(): Promise<void> {
     this.claudeSessions.clear();
     try {
-      // Read the legacy authority before opening any workspace. Once a scoped
-      // store exists the coordinator deliberately refuses to blur the two.
-      const legacy = await this.sessionStore.loadSessions();
-      await this.migrateLegacySessions(legacy);
-      await this.discoverWorkspaceSessions();
+      await this.sessionStore.resetActiveFlags();
+      const loaded = await this.sessionStore.loadSessions();
+      for (const session of loaded.values()) {
+        const scope = session.storageScope;
+        // Rows written before the global-scope layout are not imported. They
+        // remain untouched in app.sqlite and cannot select a filesystem path.
+        if (!scope) continue;
+        try {
+          if (scope.ownerKey !== this.sessionOwnerKey(session.ownerUserId)) {
+            throw new Error('Stored workspace owner does not match the global account identity');
+          }
+          const admitted = this.sessionStorageScope(session.ownerUserId, scope.workspaceRoot);
+          if (admitted.ownerKey !== scope.ownerKey || admitted.workspaceRoot !== scope.workspaceRoot) {
+            throw new Error('Stored workspace scope is no longer canonical');
+          }
+          this.assertWorkspaceScopeWritable(admitted);
+          this.revalidateRestoredSession(session, admitted, session.ownerUserId);
+          this.admitWorkspaceArtifactArchive(admitted, false);
+          const key = this.workspaceScopeKey(admitted);
+          this.loadedWorkspaceScopes.add(key);
+          const earlierBlocked = [...this.claudeSessions.values()].some((entry) =>
+            entry.storageScope && this.sameWorkspaceScope(entry.storageScope, admitted)
+            && Boolean(entry.persistenceUnavailable));
+          if (!earlierBlocked) this.workspacePersistenceErrors.delete(key);
+        } catch (error) {
+          const reason = error instanceof Error ? error.message : String(error);
+          session.persistenceUnavailable = reason;
+          this.workspacePersistenceErrors.set(
+            `${scope.ownerKey}\u0000${scope.workspaceRoot}`,
+            reason,
+          );
+        }
+        this.claudeSessions.set(session.id, session);
+      }
       if (this.claudeSessions.size > 0) {
-        console.log(`Loaded ${this.claudeSessions.size} persisted sessions`);
+        console.log(`Loaded ${this.claudeSessions.size} sessions from shared app SQLite`);
       }
     } catch (error) {
       console.error('Failed to load persisted sessions:', error);
-    }
-  }
-
-  /** Resolve every old record to one trusted immutable scope before moving it. */
-  private async migrateLegacySessions(
-    legacy: Map<string, SessionRecord>,
-    options: {
-      onlyScope?: SessionStorageScope;
-      migrateOrphanUsage?: boolean;
-    } = {},
-  ): Promise<void> {
-    const requestedScopeKey = options.onlyScope
-      ? `${options.onlyScope.ownerKey}\u0000${options.onlyScope.workspaceRoot}`
-      : null;
-    const resolved = new Map<string, SessionStorageScope>();
-    const resolving = new Set<string>();
-    const publishBlocked = (
-      session: SessionRecord,
-      reason: unknown,
-      scope?: SessionStorageScope,
-    ): void => {
-      const message = reason instanceof Error ? reason.message : String(reason);
-      // This is a read-only view over the still-authoritative legacy row. It is
-      // deliberately not handed to SessionStore on autosave (see
-      // persistenceUnavailable there), and runtime admission rejects it.
-      const placeholder: SessionRecord = {
-        ...session,
-        ...(scope ? { storageScope: scope } : {}),
-        active: false,
-        agent: null,
-        stopRequested: false,
-        connections: new Set(),
-        outputBuffer: [...(session.outputBuffer || [])],
-        persistenceUnavailable: message,
-      };
-      this.claudeSessions.set(session.id, placeholder);
-    };
-
-    const resolve = (session: SessionRecord): SessionStorageScope => {
-      const cached = resolved.get(session.id);
-      if (cached) return cached;
-      if (resolving.has(session.id)) throw new Error('Legacy session ownership contains a cycle');
-      resolving.add(session.id);
-      try {
-        let scope: SessionStorageScope;
-        if (session.ownerSessionId) {
-          const parent = legacy.get(session.ownerSessionId);
-          if (!parent || parent.ownerUserId !== session.ownerUserId) {
-            throw new Error('Legacy child session has no authorised owner conversation');
-          }
-          scope = resolve(parent);
-          if (session.projectWorkingDirKind !== 'container') {
-            const validation = this.validatePath(session.workingDir, session.ownerUserId);
-            if (!validation.valid || !validation.path) {
-              throw new Error('Legacy child session folder is outside the current authorised base');
-            }
-            const childRoot = canonicalExistingRoot(validation.path);
-            const relative = path.relative(scope.workspaceRoot, childRoot);
-            if (
-              path.isAbsolute(relative)
-              || relative === '..'
-              || relative.startsWith(`..${path.sep}`)
-            ) {
-              throw new Error('Legacy child session folder leaves its owner conversation workspace');
-            }
-          }
-        } else if (session.projectId) {
-          const project = this.projectStore.getProjectForUser(session.projectId, session.ownerUserId);
-          const owner = this.getEnvironmentOwner(session.ownerUserId);
-          if (!project || !owner) throw new Error('Legacy project workspace is unavailable');
-          scope = this.sessionStorageScope(
-            session.ownerUserId,
-            this.projectPaths.worktreePath(project, owner),
-          );
-        } else {
-          const validation = this.validatePath(session.workingDir, session.ownerUserId);
-          if (!validation.valid || !validation.path) {
-            throw new Error('Legacy session folder is outside the current authorised base');
-          }
-          scope = this.sessionStorageScope(session.ownerUserId, validation.path);
-        }
-        resolved.set(session.id, scope);
-        return scope;
-      } finally {
-        resolving.delete(session.id);
-      }
-    };
-
-    const groups = new Map<string, {
-      scope: SessionStorageScope;
-      ownerUserId: number;
-      sessions: SessionRecord[];
-    }>();
-    for (const session of legacy.values()) {
-      try {
-        const scope = resolve(session);
-        const key = `${scope.ownerKey}\u0000${scope.workspaceRoot}`;
-        if (requestedScopeKey && key !== requestedScopeKey) continue;
-        this.workspacePersistenceErrors.delete(`${scope.ownerKey}\u0000legacy:${session.id}`);
-        const group = groups.get(key) ?? { scope, ownerUserId: session.ownerUserId, sessions: [] };
-        if (group.ownerUserId !== session.ownerUserId) {
-          throw new Error('Workspace migration mixed two local account identities');
-        }
-        group.sessions.push(session);
-        groups.set(key, group);
-      } catch (error) {
-        if (requestedScopeKey) continue;
-        const ownerKey = (() => {
-          try { return this.sessionOwnerKey(session.ownerUserId); } catch { return 'legacy-unowned'; }
-        })();
-        this.workspacePersistenceErrors.set(
-          `${ownerKey}\u0000legacy:${session.id}`,
-          error instanceof Error ? error.message : String(error),
-        );
-        publishBlocked(session, error);
-      }
-    }
-
-    for (const [key, group] of groups) {
-      const sessionsById = new Map(group.sessions.map((session) => [session.id, session]));
-      const depthById = new Map<string, number>();
-      const unitRoot = (session: SessionRecord): string => {
-        let current = session;
-        let depth = 0;
-        const seen = new Set<string>();
-        while (current.ownerSessionId) {
-          if (seen.has(current.id)) throw new Error('Legacy session ownership contains a cycle');
-          seen.add(current.id);
-          const parent = sessionsById.get(current.ownerSessionId);
-          if (!parent) {
-            throw new Error('Legacy child session escaped its resolved workspace unit');
-          }
-          current = parent;
-          depth += 1;
-        }
-        depthById.set(session.id, depth);
-        return current.id;
-      };
-      const units = new Map<string, SessionRecord[]>();
-      for (const session of group.sessions) {
-        const rootId = unitRoot(session);
-        const members = units.get(rootId) ?? [];
-        members.push(session);
-        units.set(rootId, members);
-      }
-      for (const members of units.values()) {
-        members.sort((left, right) => (
-          (depthById.get(left.id) ?? 0) - (depthById.get(right.id) ?? 0)
-          || left.id.localeCompare(right.id)
-        ));
-      }
-
-      // The first successful unit creates only a prefix of this archive while
-      // another unit may remain in app.sqlite. Hold pruning before touching
-      // either filesystem so an autosave can never interpret that prefix as a
-      // complete deletion-authoritative snapshot.
-      this.sessionStore.holdWorkspacePublication(group.scope);
-      const failures: string[] = [];
-      const cleanupErrors: string[] = [];
-
-      for (const [rootId, members] of units) {
-        let failure: string | null = null;
-        for (const session of members) {
-          try {
-            const result = await this.workspaceArtifactMigrator.migrate({
-              id: session.id,
-              ownerUserId: session.ownerUserId,
-              workingDir: session.workingDir,
-              projectId: session.projectId,
-              projectWorkingDirKind: session.projectWorkingDirKind,
-              chatDraft: session.chatDraft,
-              storageScope: group.scope,
-            });
-            if (result.status !== 'complete') {
-              const blocked = result.artifacts
-                .filter((artifact) => artifact.state === 'blocked')
-                .map((artifact) => `${artifact.artifact}:${artifact.reason}`)
-                .join(', ');
-              failure = `artifact ${session.id} is incomplete${blocked ? ` (${blocked})` : ''}`;
-              break;
-            }
-          } catch (error) {
-            failure = `artifact ${session.id} failed: ${
-              error instanceof Error ? error.message : String(error)
-            }`;
-            break;
-          }
-        }
-
-        if (!failure) {
-          try {
-            const migrated = this.sessionStore.migrateLegacySessions(
-              group.scope,
-              this.database,
-              group.ownerUserId,
-              members.map((session) => session.id),
-            );
-            if (!migrated) failure = 'SQLite cutover could not be verified';
-          } catch (error) {
-            failure = `SQLite cutover failed: ${
-              error instanceof Error ? error.message : String(error)
-            }`;
-          }
-        }
-
-        if (failure) {
-          const detail = `Legacy migration unit ${rootId} is incomplete: ${failure}`;
-          failures.push(detail);
-          // Parent and descendants share one authority boundary. Even members
-          // whose files were prepared successfully stay read-only legacy views
-          // until every member can cross the SQLite boundary together.
-          for (const session of members) publishBlocked(session, detail, group.scope);
-          continue;
-        }
-
-        // A legacy process cannot still be attached to a read-only migration
-        // placeholder. On live retry, unlike cold startup, the archive may
-        // already contain active sibling sessions and cannot be reset in bulk.
-        // Clear only the rows which just crossed the authority boundary.
-        for (const session of members) {
-          await this.sessionStore.setActive(session.id, false, group.scope);
-        }
-
-        // SQLite deletion is the authority cutover. Confirm file rollback
-        // copies only after every row in this parent/descendant unit crossed it.
-        for (const session of members) {
-          try {
-            await this.workspaceArtifactMigrator.confirm({
-              id: session.id,
-              ownerUserId: session.ownerUserId,
-              workingDir: session.workingDir,
-              projectId: session.projectId,
-              projectWorkingDirKind: session.projectWorkingDirKind,
-              chatDraft: session.chatDraft,
-              storageScope: group.scope,
-            });
-          } catch (error) {
-            cleanupErrors.push(
-              `${session.id}: ${error instanceof Error ? error.message : String(error)}`,
-            );
-          }
-        }
-      }
-
-      if (failures.length > 0) {
-        this.workspacePersistenceErrors.set(key, failures.join('; '));
-      } else if (cleanupErrors.length > 0) {
-        this.workspacePersistenceErrors.set(
-          key,
-          `Legacy artifact cleanup is incomplete (${cleanupErrors.join(', ')})`,
-        );
-      }
-
-      try {
-        // Merge the archive once per workspace, after every independent unit
-        // has had its chance to complete. A failed unit leaves a legacy
-        // placeholder and keeps this archive non-authoritative for pruning.
-        await this.loadWorkspaceSessions(group.ownerUserId, group.scope.workspaceRoot, {
-          refresh: true,
-          publishForPruning: failures.length === 0,
-          skipLegacyRetry: true,
-        });
-      } catch {
-        // Verified unit rows are already authoritative after SQLite cutover.
-        // Discovery retries the archive; failed units retain their legacy rows.
-      }
-    }
-
-    if (options.migrateOrphanUsage === false) return;
-
-    // Older releases intentionally retained usage after conversation deletion.
-    // Such a row has no workspace path left to recover; move it to one current,
-    // authorised owner archive so dashboards remain complete without reading or
-    // writing the installation database at runtime.
-    for (const user of this.database.listUsers()) {
-      const destinationSetting = 'legacyUsageWorkspaceRoot.v1';
-      const orphan = this.database.raw.prepare(`
-        SELECT 1 AS present
-        FROM usage_jobs
-        LEFT JOIN runtime_sessions
-          ON runtime_sessions.id = usage_jobs.session_id
-         AND runtime_sessions.owner_user_id = usage_jobs.user_id
-        WHERE usage_jobs.user_id = ? AND runtime_sessions.id IS NULL
-        LIMIT 1
-      `).get(user.id) as { present: number } | undefined;
-      if (!orphan) {
-        // A crash after source deletion can leave the locator behind. It is a
-        // folder reference only, never session metadata, and is no longer
-        // needed once the legacy source is empty.
-        this.database.deleteUserSetting(user.id, destinationSetting);
-        continue;
-      }
-
-      // Pin the destination before the first cross-database copy. Candidate
-      // order can change between restarts (for example when the selected
-      // folder changes); silently choosing a second archive after a crash
-      // would duplicate one usage ledger across two workspaces.
-      const pinned = this.database.getUserSetting(user.id, destinationSetting);
-      const candidates = [
-          this.getSelectedWorkingDir(user.id),
-          ...this.workspaceCatalog.roots(this.sessionOwnerKey(user.id)).sort(),
-          this.getUserBaseFolder(user.id),
-        ].filter((candidate): candidate is string => Boolean(candidate));
-      let destination = pinned;
-      if (!destination) {
-        for (const candidate of candidates) {
-          try {
-            destination = this.authorizeWorkspaceRoot(user.id, candidate);
-            // This write is the migration's durable prepare marker. Do not
-            // begin copying until it has succeeded.
-            this.database.setUserSetting(user.id, destinationSetting, destination);
-            break;
-          } catch {
-            // Try the next currently-authorised candidate before any copy.
-          }
-        }
-      }
-      let scope: SessionStorageScope | null = null;
-      if (destination) {
-        try {
-          scope = this.sessionStorageScope(user.id, destination);
-        } catch {
-          // A pinned target is immutable: if it is unavailable, expose a
-          // blocked migration instead of selecting a different destination.
-        }
-      }
-      if (!scope) {
-        this.workspacePersistenceErrors.set(
-          `${this.sessionOwnerKey(user.id)}\u0000legacy-usage`,
-          'Legacy usage has no currently authorised workspace archive',
-        );
-        continue;
-      }
-      const migrated = this.sessionStore.migrateLegacyOrphanUsage(
-        scope,
-        this.database,
-        user.id,
-      );
-      if (!migrated) {
-        this.workspacePersistenceErrors.set(
-          `${scope.ownerKey}\u0000${scope.workspaceRoot}`,
-          'Legacy usage migration could not be verified',
-        );
-        continue;
-      }
-      await this.loadWorkspaceSessions(user.id, scope.workspaceRoot, {
-        skipLegacyRetry: true,
-      });
-      this.database.deleteUserSetting(user.id, destinationSetting);
-    }
-  }
-
-  /** Open only roots present in the global folder/project catalog; never scan. */
-  private async discoverWorkspaceSessions(): Promise<void> {
-    for (const user of this.database.listUsers()) {
-      const ownerKey = this.sessionOwnerKey(user.id);
-      const catalogRoots = new Set(this.workspaceCatalog.roots(ownerKey));
-      const candidates = new Set(catalogRoots);
-      const selected = this.getSelectedWorkingDir(user.id);
-      if (selected) candidates.add(path.resolve(selected));
-      const owner = this.getEnvironmentOwner(user.id);
-      if (owner) {
-        for (const project of this.projectStore.listProjectsForUser(user.id)) {
-          candidates.add(this.projectPaths.worktreePath(project, owner));
-        }
-      }
-
-      for (const root of candidates) {
-        const scopeKey = `${ownerKey}\u0000${root}`;
-        if (this.unrestoredProjectScopes.has(scopeKey)) continue;
-        // Avoid creating an empty state database merely because a folder or a
-        // stopped project appears in the discovery catalog.
-        if (!fs.existsSync(path.join(root, '.cc-web', 'session-state.sqlite'))) {
-          if (catalogRoots.has(root)) {
-            this.workspacePersistenceErrors.set(
-              `${ownerKey}\u0000${root}`,
-              'The catalogued workspace archive is unavailable or incomplete',
-            );
-          }
-          continue;
-        }
-        try {
-          await this.loadWorkspaceSessions(user.id, root, {
-            skipLegacyRetry: true,
-          });
-        } catch (error) {
-          this.workspacePersistenceErrors.set(
-            `${ownerKey}\u0000${root}`,
-            error instanceof Error ? error.message : String(error),
-          );
-        }
-      }
+      this.claudeSessions.clear();
+      throw error;
     }
   }
 
@@ -3113,9 +2605,8 @@ export class ClaudeCodeWebServer {
     this.listener = null;
     this.server = null;
     this.listenerSockets.clear();
-    // Usage stores borrow the workspace SessionStore handles. Drop their
-    // references before closing those SQLite databases, then close the
-    // installation database last.
+    // Artifact directory leases are independent from the shared app.sqlite
+    // handle, which remains the final storage object closed below.
     this.shutdownTerminalError = finalPersistenceError;
     this.shutdownFinalizationPending = true;
     this.finishShutdownStorage();
@@ -3126,9 +2617,9 @@ export class ClaudeCodeWebServer {
     const finish = (operation: () => void): void => {
       try { operation(); } catch (error) { shutdownFailure ??= error; }
     };
-    finish(() => this.usageStore.close());
     finish(() => this.sessionStore.closeWorkspaces());
     finish(() => closeWorkspaceSessionDirectoryLeases());
+    finish(() => closeWorkspaceCwdHelpers());
     try {
       this.database.close();
       this.dataDirWritersClosed = true;
@@ -3429,9 +2920,8 @@ export class ClaudeCodeWebServer {
     // No process-local session survives a restart. Load only after staged
     // project archives are either restored exactly or marked unavailable.
     await this.loadPersistedSessions();
-    await this.completeRestoredProjectSessionArchives();
     this.throwIfStartupWasCancelled();
-    // Startup restoration and migration must finish before any timer is able
+    // Startup restoration and workspace discovery must finish before any timer is able
     // to interpret an archive missing from the live map as a deletion.
     this.setupAutoSave();
 

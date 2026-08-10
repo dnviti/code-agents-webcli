@@ -25,6 +25,8 @@ export interface SessionStoreOptions extends DatabaseOptions {
   database?: SessionPersistenceDatabase;
   /** Production coordinator: the installation database is import-only. */
   workspaceCoordinator?: boolean;
+  /** Shared app.sqlite authority; only rows with immutable artifact scopes are live. */
+  scopedGlobalStore?: boolean;
   /** Opt in to `.cc-web/session-state.sqlite` below this checkout. */
   workspaceRoot?: string;
   /** Stable opaque account namespace for workspace-local state. */
@@ -69,6 +71,8 @@ interface RuntimeSessionRow extends RuntimeSessionOperationalState {
   tab_order: number | null;
   project_id: string | null;
   project_working_dir_kind: string | null;
+  storage_workspace_root: string | null;
+  storage_owner_key: string | null;
   operational_envelope: string | null;
 }
 
@@ -87,24 +91,25 @@ export class SessionStore {
   /**
    * Archives whose complete restored state has been published to the live map.
    *
-   * `SessionStore.loadSessions()` necessarily marks the bound store readable,
-   * but the composition root still has asynchronous migration confirmation to
-   * perform before those rows are authoritative in memory.  Keeping that
-   * distinction here prevents an autosave in that interval from interpreting
-   * an absent row as a deletion and pruning the archive it is still loading.
+    * `SessionStore.loadSessions()` necessarily marks the bound store readable,
+    * but the composition root must validate and publish the complete archive
+    * before those rows are authoritative in memory. Keeping that distinction
+    * prevents an autosave in that interval from interpreting an absent row as
+    * a deletion and pruning the archive it is still loading.
    */
   private readonly publishedWorkspaceScopes = new Set<string>();
   /**
-   * Workspaces whose local archive is only a verified prefix of a legacy
-   * migration. Saves may update rows in these archives, but must never infer
-   * deletions from the necessarily incomplete live map.
+   * Workspaces temporarily held from deletion-authoritative publication.
+   * Saves may update rows in these archives, but must never infer deletions
+   * from an intentionally incomplete live map.
    */
   private readonly workspacePublicationHolds = new Set<string>();
   /** Last failed live write per opened scope, cleared by the next successful save. */
   private readonly workspaceSaveErrors = new Map<string, string>();
-  /** A workspace may be upserted immediately, but only a restored/migrated one may be pruned. */
+  /** A workspace may be upserted immediately, but only a fully restored one may be pruned. */
   private hasLoaded = false;
   private readonly workspaceCoordinator: boolean;
+  private readonly scopedGlobalStore: boolean;
   private readonly archiveTrust: WorkspaceArchiveTrust | undefined;
   private workspaceMutationTail: Promise<void> = Promise.resolve();
 
@@ -112,6 +117,7 @@ export class SessionStore {
     this.workspaceRoot = options.workspaceRoot ? requireAbsoluteWorkspace(options.workspaceRoot) : null;
     this.ownerKey = options.ownerKey ?? null;
     this.workspaceCoordinator = options.workspaceCoordinator === true;
+    this.scopedGlobalStore = options.scopedGlobalStore === true;
     this.archiveTrust = options.archiveTrust;
     this.database = options.database || (this.workspaceRoot
       ? new WorkspaceSessionDatabase({
@@ -266,7 +272,7 @@ export class SessionStore {
     this.publishedWorkspaceScopes.add(key);
   }
 
-  /** Keep a partially migrated archive readable without making it prune-authoritative. */
+  /** Keep a partially published archive readable without making it prune-authoritative. */
   holdWorkspacePublication(scope: SessionStorageScope): void {
     if (this.ownerKey) throw new Error('Only the workspace coordinator can hold a scope');
     const key = scopeKey(scope);
@@ -311,10 +317,9 @@ export class SessionStore {
   }
 
   /**
-   * Read only the installation database even after workspace stores are open.
-   * Live migration retry must not call the coordinator-wide loader: that would
-   * merge the same destination rows it is about to reconcile with their legacy
-   * source and report a false cross-archive collision.
+   * Compatibility-only read of installation-global session rows. Production
+   * startup and workspace loading never call this method; it remains available
+   * only to isolated tooling that explicitly handles the old layout.
    */
   async loadLegacySessions(ownerUserId?: number): Promise<Map<string, SessionRecord>> {
     if (this.ownerKey) {
@@ -364,7 +369,7 @@ export class SessionStore {
     // delete followed by a set of unrelated writes.
     if (
       !this.ownerKey
-      && (this.workspaceCoordinator || Array.from(sessions.values()).some((session) => session.storageScope))
+      && this.workspaceCoordinator
     ) {
       const input = this.workspaceCoordinator ? cloneSessionMap(sessions) : sessions;
       const persist = async (): Promise<boolean> => {
@@ -373,7 +378,7 @@ export class SessionStore {
       // Unavailable workspace rows are intentionally omitted from the upsert,
       // but their omission is not a deletion signal. Remember every affected
       // scope so neither a mixed save nor the "scope disappeared" pass can
-      // prune the authoritative row while a lifecycle/migration gate is live.
+      // prune the authoritative row while a lifecycle/storage gate is live.
       const withheldScopeKeys = new Set<string>();
       for (const [id, session] of input) {
         // A blocked row remains visible read-only while its source stays
@@ -497,18 +502,24 @@ export class SessionStore {
         : persist();
     }
     try {
+      if (!this.ownerKey && this.scopedGlobalStore
+        && Array.from(sessions.values()).some((session) => !session.storageScope)) {
+        console.error('Refusing to persist a session without an immutable workspace scope');
+        return false;
+      }
       const db = this.database.raw;
       const ownerColumn = this.ownerKey ? 'owner_key,' : '';
       const ownerValue = this.ownerKey ? '@owner_key,' : '';
       const envelopeColumn = this.ownerKey ? 'operational_envelope,' : '';
       const envelopeValue = this.ownerKey ? '@operational_envelope,' : '';
-      const draftColumn = this.ownerKey ? 'chat_draft_json,' : '';
-      const draftValue = this.ownerKey ? '@chat_draft_json,' : '';
+      const scopeColumns = this.ownerKey ? '' : 'storage_workspace_root, storage_owner_key,';
+      const scopeValues = this.ownerKey ? '' : '@storage_workspace_root, @storage_owner_key,';
       const insert = db.prepare(`
         INSERT OR REPLACE INTO runtime_sessions (
           ${ownerColumn}
           ${envelopeColumn}
-          ${draftColumn}
+          ${scopeColumns}
+          chat_draft_json,
           id,
           owner_user_id,
           name,
@@ -543,7 +554,8 @@ export class SessionStore {
         VALUES (
           ${ownerValue}
           ${envelopeValue}
-          ${draftValue}
+          ${scopeValues}
+          @chat_draft_json,
           @id,
           @owner_user_id,
           @name,
@@ -583,7 +595,19 @@ export class SessionStore {
       // session.
       const deleteMissing = db.prepare(this.ownerKey
         ? 'DELETE FROM runtime_sessions WHERE owner_key = ? AND id NOT IN (SELECT value FROM json_each(?))'
-        : 'DELETE FROM runtime_sessions WHERE id NOT IN (SELECT value FROM json_each(?))');
+        : this.scopedGlobalStore
+          ? `DELETE FROM runtime_sessions
+               WHERE storage_workspace_root IS NOT NULL
+                 AND storage_owner_key IS NOT NULL
+                 AND id NOT IN (SELECT value FROM json_each(?))`
+          : 'DELETE FROM runtime_sessions WHERE id NOT IN (SELECT value FROM json_each(?))');
+
+      // A scoped global store is the sole metadata authority. Until one full
+      // read has succeeded, an empty or partial caller map cannot prove that a
+      // missing row was deleted rather than simply never restored. Upserts are
+      // still safe before that point; inferred deletion is not.
+      const mayPruneGlobal = !this.scopedGlobalStore
+        || (this.hasLoaded && options.pruneMissing !== false);
 
       const replaceAll = db.transaction((sessionRows: Array<Record<string, unknown>>) => {
         for (const row of sessionRows) {
@@ -591,20 +615,19 @@ export class SessionStore {
         }
         if (this.ownerKey && this.hasLoaded && options.pruneMissing !== false) {
           deleteMissing.run(this.ownerKey, JSON.stringify(sessionRows.map((row) => row.id)));
-        } else {
-          if (!this.ownerKey) deleteMissing.run(JSON.stringify(sessionRows.map((row) => row.id)));
+        } else if (!this.ownerKey && mayPruneGlobal) {
+          deleteMissing.run(JSON.stringify(sessionRows.map((row) => row.id)));
         }
       });
 
       const rows = Array.from(sessions.values()).map((session) => {
         const row = {
         ...(this.ownerKey ? { owner_key: this.ownerKey } : {}),
-        ...(this.ownerKey ? {
-          // Composer contents are session data.  Keep them beside the session
-          // instead of in Electron/Chromium Web Storage, which lives in the
-          // installation profile rather than in the opened workspace.
-          chat_draft_json: session.chatDraft ? JSON.stringify(session.chatDraft) : null,
+        ...(!this.ownerKey ? {
+          storage_workspace_root: session.storageScope?.workspaceRoot ?? null,
+          storage_owner_key: session.storageScope?.ownerKey ?? null,
         } : {}),
+        chat_draft_json: session.chatDraft ? JSON.stringify(session.chatDraft) : null,
         id: session.id,
         owner_user_id: session.ownerUserId,
         name: session.name || 'Unnamed Session',
@@ -621,7 +644,12 @@ export class SessionStore {
           ? JSON.stringify(session.terminalOptions)
           : null,
         working_dir: session.workingDir,
-        output_buffer_json: JSON.stringify((session.outputBuffer || []).slice(-1000)),
+        // Terminal history is project-local in the transcript store. A bound
+        // compatibility store retains its historic buffer field; app.sqlite
+        // keeps no duplicate project output payload.
+        output_buffer_json: this.scopedGlobalStore
+          ? '[]'
+          : JSON.stringify((session.outputBuffer || []).slice(-1000)),
         session_start_time: session.sessionStartTime
           ? toIsoString(session.sessionStartTime)
           : null,
@@ -723,7 +751,10 @@ export class SessionStore {
 
       replaceAll(rows);
       this.database.setSetting('runtime_sessions.saved_at', new Date().toISOString());
-      this.database.setSetting('runtime_sessions.version', this.ownerKey ? '3' : '2');
+      this.database.setSetting(
+        'runtime_sessions.version',
+        this.ownerKey ? '3' : this.scopedGlobalStore ? '4' : '2',
+      );
       this.database.markArchiveTrusted?.();
       return true;
     } catch (error) {
@@ -794,16 +825,22 @@ export class SessionStore {
             chat_model_pinned,
             chat_effort_override,
             chat_plan_mode,
-            ${this.ownerKey ? 'chat_draft_json' : 'NULL AS chat_draft_json'},
+            chat_draft_json,
             custom_name,
             tab_open,
             tab_order,
             project_id,
             project_working_dir_kind,
             rollback_recovery_pending,
+            ${this.ownerKey ? 'NULL AS storage_workspace_root' : 'storage_workspace_root'},
+            ${this.ownerKey ? 'NULL AS storage_owner_key' : 'storage_owner_key'},
             ${this.ownerKey ? 'operational_envelope' : 'NULL AS operational_envelope'}
           FROM runtime_sessions
-          ${this.ownerKey ? 'WHERE owner_key = ?' : ''}
+          ${this.ownerKey
+            ? 'WHERE owner_key = ?'
+            : this.scopedGlobalStore
+              ? 'WHERE storage_workspace_root IS NOT NULL AND storage_owner_key IS NOT NULL'
+              : ''}
           ORDER BY created_at ASC
         `)
         .all(...(this.ownerKey ? [this.ownerKey] : [])) as RuntimeSessionRow[];
@@ -812,20 +849,31 @@ export class SessionStore {
       for (const row of rows) {
         // Workspace rows are never admitted by an archive-wide marker alone:
         // a bound/custom backend without the per-record verifier fails closed.
-        // The installation database is not portable input and remains the
-        // trusted legacy import source.
+        // The installation database is not portable input. Unscoped stores
+        // remain trusted only for isolated compatibility utilities; the
+        // production coordinator never restores their runtime-session rows.
         const trustedOperationalState = this.ownerKey
           ? this.database.verifyRuntimeSessionRecord?.(row, row.operational_envelope) === true
           : true;
+        const globalScope = !this.ownerKey
+          && typeof row.storage_workspace_root === 'string'
+          && path.isAbsolute(row.storage_workspace_root)
+          && typeof row.storage_owner_key === 'string'
+          && /^[A-Za-z0-9._-]+$/.test(row.storage_owner_key)
+          ? {
+              workspaceRoot: path.resolve(row.storage_workspace_root),
+              ownerKey: row.storage_owner_key,
+            }
+          : null;
         sessions.set(row.id, {
           id: row.id,
           rollbackRecoveryPending:
             trustedOperationalState && row.rollback_recovery_pending === 1
               ? true
               : undefined,
-          ...(this.workspaceRoot && this.ownerKey ? {
-            storageScope: { workspaceRoot: this.workspaceRoot, ownerKey: this.ownerKey },
-          } : {}),
+          ...(this.workspaceRoot && this.ownerKey
+            ? { storageScope: { workspaceRoot: this.workspaceRoot, ownerKey: this.ownerKey } }
+            : globalScope ? { storageScope: globalScope } : {}),
           ownerUserId: row.owner_user_id,
           name: row.name,
           created: new Date(row.created_at),
@@ -932,7 +980,11 @@ export class SessionStore {
       }
 
       if (sessions.size > 0) {
-        console.log(`Restored ${sessions.size} sessions from SQLite`);
+        console.log(
+          `Restored ${sessions.size} sessions from ${
+            this.ownerKey ? 'workspace SQLite compatibility storage' : 'shared app SQLite'
+          }`,
+        );
       }
 
       this.hasLoaded = true;
@@ -940,11 +992,14 @@ export class SessionStore {
       return sessions;
     } catch (error) {
       console.error('Failed to load sessions:', error);
-      // A workspace database is the sole authority for its sessions. Masking
-      // a read failure as an empty archive could make the next successful
-      // autosave look like permission to prune it. Legacy installation reads
-      // retain their historical best-effort behaviour for migration startup.
-      if (this.ownerKey) throw error;
+      // Bound compatibility stores remain fail-closed. The shared AppDatabase
+      // retains the historical best-effort return contract only for unscoped
+      // compatibility callers. The scoped global database is authoritative: a
+      // read failure must revoke pruning and reach the composition root.
+      if (this.ownerKey || this.scopedGlobalStore) {
+        if (this.scopedGlobalStore) this.hasLoaded = false;
+        throw error;
+      }
       return new Map();
     }
   }
@@ -957,7 +1012,9 @@ export class SessionStore {
     try {
       this.database.raw.prepare(this.ownerKey
         ? 'DELETE FROM runtime_sessions WHERE owner_key = ?'
-        : 'DELETE FROM runtime_sessions').run(...(this.ownerKey ? [this.ownerKey] : []));
+        : this.scopedGlobalStore
+          ? 'DELETE FROM runtime_sessions WHERE storage_workspace_root IS NOT NULL AND storage_owner_key IS NOT NULL'
+          : 'DELETE FROM runtime_sessions').run(...(this.ownerKey ? [this.ownerKey] : []));
       return true;
     } catch (error) {
       console.error('Failed to clear sessions:', error);
@@ -970,11 +1027,14 @@ export class SessionStore {
       const row = this.database.raw
         .prepare(this.ownerKey
           ? 'SELECT COUNT(*) AS count FROM runtime_sessions WHERE owner_key = ?'
-          : 'SELECT COUNT(*) AS count FROM runtime_sessions')
+          : this.scopedGlobalStore
+            ? `SELECT COUNT(*) AS count FROM runtime_sessions
+                 WHERE storage_workspace_root IS NOT NULL AND storage_owner_key IS NOT NULL`
+            : 'SELECT COUNT(*) AS count FROM runtime_sessions')
         .get(...(this.ownerKey ? [this.ownerKey] : [])) as { count: number };
       const savedAt = this.database.getSetting('runtime_sessions.saved_at') || undefined;
       const version = this.database.getSetting('runtime_sessions.version')
-        || (this.ownerKey ? '3' : '2');
+        || (this.ownerKey ? '3' : this.scopedGlobalStore ? '4' : '2');
 
       return {
         exists: true,
@@ -999,7 +1059,7 @@ export class SessionStore {
    * (#168)
    */
   async setActive(id: string, active: boolean, scope?: SessionStorageScope): Promise<void> {
-    if (!this.ownerKey && scope) {
+    if (!this.ownerKey && scope && this.workspaceCoordinator) {
       const writeThrough = () => this.openWorkspace(scope).setActive(id, active);
       if (this.workspaceCoordinator) {
         await this.enqueueWorkspaceMutation(writeThrough);
@@ -1016,7 +1076,12 @@ export class SessionStore {
       this.database.raw
         .prepare(this.ownerKey
           ? 'UPDATE runtime_sessions SET active = @active WHERE id = @id AND owner_key = @owner_key'
-          : 'UPDATE runtime_sessions SET active = @active WHERE id = @id')
+          : this.scopedGlobalStore
+            ? `UPDATE runtime_sessions SET active = @active
+                 WHERE id = @id
+                   AND storage_workspace_root IS NOT NULL
+                   AND storage_owner_key IS NOT NULL`
+            : 'UPDATE runtime_sessions SET active = @active WHERE id = @id')
         .run(this.ownerKey
           ? { active: active ? 1 : 0, id, owner_key: this.ownerKey }
           : { active: active ? 1 : 0, id });
@@ -1040,9 +1105,18 @@ export class SessionStore {
     try {
       this.database.raw.prepare(this.ownerKey
         ? 'UPDATE runtime_sessions SET active = 0 WHERE owner_key = ?'
-        : 'UPDATE runtime_sessions SET active = 0').run(...(this.ownerKey ? [this.ownerKey] : []));
+        : this.scopedGlobalStore
+          ? `UPDATE runtime_sessions SET active = 0
+               WHERE storage_workspace_root IS NOT NULL AND storage_owner_key IS NOT NULL`
+          : 'UPDATE runtime_sessions SET active = 0').run(...(this.ownerKey ? [this.ownerKey] : []));
     } catch (error) {
       console.error('Failed to reset active flags:', error);
+      if (this.scopedGlobalStore) {
+        // Startup must not proceed as though the authoritative session table
+        // was read successfully after its prerequisite reset failed.
+        this.hasLoaded = false;
+        throw error;
+      }
     }
   }
 }

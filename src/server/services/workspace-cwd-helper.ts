@@ -2,13 +2,41 @@ import { spawnSync } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
+import { Worker } from 'node:worker_threads';
 import type { WorkspaceStorageDirectoryLease } from './workspace-session-storage.js';
 
 const MAX_FILE_BYTES = 24 * 1024 * 1024;
 const MAX_RESPONSE_BYTES = 34 * 1024 * 1024;
 const MAX_STAT_DECIMAL_DIGITS = 32;
 const HELPER_TIMEOUT_MS = 15_000;
+const BROKER_WAIT_GRACE_MS = 2_000;
+const BROKER_STARTUP_TIMEOUT_MS = 2_000;
+const BROKER_COOLDOWN_BASE_MS = 1_000;
+const BROKER_COOLDOWN_MAX_MS = 30_000;
+const BROKER_STARTING = 0;
+const BROKER_IDLE = 1;
+const BROKER_PENDING = 2;
+const BROKER_COMPLETE = 3;
+const BROKER_FATAL = 4;
+const BROKER_TRANSPORT_ERROR = 'WORKSPACE_HELPER_TRANSPORT';
 let smokeReported = false;
+
+interface WorkspaceCwdHelperBroker {
+  readonly worker: Worker;
+  readonly control: Int32Array;
+  readonly response: Uint8Array;
+  requestId: number;
+  closed: boolean;
+}
+
+let helperBroker: WorkspaceCwdHelperBroker | null = null;
+let helperBrokerExecutableForTests: string | null = null;
+let helperBrokerFailure: {
+  readonly message: string;
+  readonly cause?: unknown;
+  readonly failures: number;
+  readonly retryAt: number;
+} | null = null;
 
 export interface WorkspaceCwdHelperSpawnResult {
   readonly error?: Error;
@@ -35,7 +63,229 @@ let helperSpawner = productionSpawner;
 export function setWorkspaceCwdHelperSpawnerForTests(
   spawner: WorkspaceCwdHelperSpawner | null,
 ): void {
+  closeWorkspaceCwdHelpers();
+  helperBrokerExecutableForTests = null;
   helperSpawner = spawner ?? productionSpawner;
+}
+
+/** Source-level seam for exercising the real broker's child-start failure path. */
+export function setWorkspaceCwdHelperBrokerExecutableForTests(executable: string | null): void {
+  if (executable !== null && (!path.isAbsolute(executable) || path.resolve(executable) !== executable)) {
+    throw new Error('Workspace cwd helper broker test executable must be an absolute canonical path');
+  }
+  closeWorkspaceCwdHelpers();
+  helperBrokerExecutableForTests = executable;
+}
+
+function helperEnvironment(): NodeJS.ProcessEnv {
+  return process.versions.electron ? { ELECTRON_RUN_AS_NODE: '1' } : {};
+}
+
+function brokerTransportError(message: string, cause?: unknown): NodeJS.ErrnoException {
+  return Object.assign(unsafe(message, cause), { code: BROKER_TRANSPORT_ERROR });
+}
+
+function isBrokerTransportError(error: unknown): error is NodeJS.ErrnoException {
+  return (error as NodeJS.ErrnoException | null)?.code === BROKER_TRANSPORT_ERROR;
+}
+
+function clearBrokerFailure(): void {
+  helperBrokerFailure = null;
+}
+
+function rememberBrokerFailure(error: NodeJS.ErrnoException): void {
+  const priorFailures = helperBrokerFailure?.failures ?? 0;
+  const failures = Math.min(priorFailures + 1, 16);
+  const cooldown = Math.min(
+    BROKER_COOLDOWN_BASE_MS * (2 ** Math.min(failures - 1, 15)),
+    BROKER_COOLDOWN_MAX_MS,
+  );
+  helperBrokerFailure = {
+    message: error.message,
+    cause: (error as Error & { cause?: unknown }).cause,
+    failures,
+    retryAt: Date.now() + cooldown,
+  };
+}
+
+function refuseDuringBrokerCooldown(): void {
+  const failure = helperBrokerFailure;
+  if (!failure || Date.now() >= failure.retryAt) return;
+  const remaining = Math.max(1, failure.retryAt - Date.now());
+  throw brokerTransportError(
+    `Workspace entry helper transport is cooling down for ${remaining}ms after: ${failure.message}`,
+    failure.cause,
+  );
+}
+
+function closeHelperBroker(broker: WorkspaceCwdHelperBroker): void {
+  if (broker.closed) return;
+  broker.closed = true;
+  if (helperBroker === broker) helperBroker = null;
+  void broker.worker.terminate();
+}
+
+/** Process-wide teardown used by tests and orderly server shutdown. */
+export function closeWorkspaceCwdHelpers(): void {
+  if (helperBroker) closeHelperBroker(helperBroker);
+  clearBrokerFailure();
+}
+
+function sharedBrokerError(
+  broker: WorkspaceCwdHelperBroker,
+  fallback: string,
+): NodeJS.ErrnoException {
+  const responseLength = Atomics.load(broker.control, 1);
+  if (responseLength > 0 && responseLength <= MAX_RESPONSE_BYTES) {
+    try {
+      const raw = Buffer.from(broker.response.subarray(0, responseLength)).toString('utf8');
+      const response = JSON.parse(raw) as { code?: unknown; message?: unknown };
+      if (typeof response.message === 'string') {
+        return brokerTransportError(response.message.slice(0, 2_048));
+      }
+    } catch { /* Preserve the explicit broker fallback below. */ }
+  }
+  return brokerTransportError(fallback);
+}
+
+function createHelperBroker(): WorkspaceCwdHelperBroker {
+  const childPath = path.join(__dirname, 'workspace-cwd-helper-child.js');
+  const brokerPath = path.join(__dirname, 'workspace-cwd-helper-broker.js');
+  const controlBuffer = new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT * 3);
+  const responseBuffer = new SharedArrayBuffer(MAX_RESPONSE_BYTES);
+  const control = new Int32Array(controlBuffer);
+  Atomics.store(control, 0, BROKER_STARTING);
+  const worker = new Worker(brokerPath, {
+    workerData: {
+      controlBuffer,
+      responseBuffer,
+      executable: helperBrokerExecutableForTests ?? process.execPath,
+      childPath,
+      env: helperEnvironment(),
+      timeoutMs: HELPER_TIMEOUT_MS,
+      maximumFrameBytes: MAX_RESPONSE_BYTES,
+    },
+  });
+  worker.unref();
+  const broker: WorkspaceCwdHelperBroker = {
+    worker,
+    control,
+    response: new Uint8Array(responseBuffer),
+    requestId: 0,
+    closed: false,
+  };
+  worker.once('error', (error) => {
+    if (broker.closed) return;
+    closeHelperBroker(broker);
+    const detail = error instanceof Error ? error.message : String(error);
+    rememberBrokerFailure(brokerTransportError(
+      `Workspace entry helper broker crashed: ${detail}`,
+      error,
+    ));
+  });
+  worker.once('exit', () => {
+    if (broker.closed) return;
+    closeHelperBroker(broker);
+    rememberBrokerFailure(brokerTransportError('Workspace entry helper broker exited unexpectedly'));
+  });
+  helperBroker = broker;
+  const waited = Atomics.wait(
+    broker.control,
+    0,
+    BROKER_STARTING,
+    BROKER_STARTUP_TIMEOUT_MS,
+  );
+  const state = Atomics.load(broker.control, 0);
+  if (state === BROKER_FATAL) {
+    const error = sharedBrokerError(broker, 'Workspace entry helper broker failed during startup');
+    closeHelperBroker(broker);
+    throw error;
+  }
+  if (waited === 'timed-out' || state !== BROKER_IDLE) {
+    closeHelperBroker(broker);
+    throw brokerTransportError(
+      `Workspace entry helper broker did not become ready within ${BROKER_STARTUP_TIMEOUT_MS}ms`,
+    );
+  }
+  return broker;
+}
+
+function exchangePersistentHelper(
+  canonicalPath: string,
+  rawRequest: string,
+): string {
+  refuseDuringBrokerCooldown();
+  const request = Buffer.from(rawRequest, 'utf8');
+  if (request.length > MAX_RESPONSE_BYTES) throw unsafe('Workspace entry helper request is too large');
+  let broker: WorkspaceCwdHelperBroker;
+  try {
+    broker = helperBroker && !helperBroker.closed ? helperBroker : createHelperBroker();
+  } catch (error) {
+    const failure = isBrokerTransportError(error)
+      ? error
+      : brokerTransportError('Workspace entry helper broker could not start', error);
+    rememberBrokerFailure(failure);
+    throw failure;
+  }
+  if (Atomics.compareExchange(broker.control, 0, BROKER_IDLE, BROKER_PENDING) !== BROKER_IDLE) {
+    closeHelperBroker(broker);
+    const failure = brokerTransportError('Workspace entry helper broker received a concurrent request');
+    rememberBrokerFailure(failure);
+    throw failure;
+  }
+  broker.requestId = broker.requestId >= 0x7fff_fffe ? 1 : broker.requestId + 1;
+  const requestId = broker.requestId;
+  Atomics.store(broker.control, 1, 0);
+  Atomics.store(broker.control, 2, requestId);
+  try {
+    broker.worker.postMessage({
+      type: 'request', requestId, canonicalPath, rawRequest,
+    });
+    const waited = Atomics.wait(
+      broker.control,
+      0,
+      BROKER_PENDING,
+      HELPER_TIMEOUT_MS + BROKER_WAIT_GRACE_MS,
+    );
+    const state = Atomics.load(broker.control, 0);
+    if (state === BROKER_FATAL && Atomics.load(broker.control, 2) === requestId) {
+      const error = sharedBrokerError(broker, 'Workspace entry helper broker failed');
+      closeHelperBroker(broker);
+      throw error;
+    }
+    if (waited === 'timed-out' || state !== BROKER_COMPLETE
+      || Atomics.load(broker.control, 2) !== requestId) {
+      closeHelperBroker(broker);
+      throw brokerTransportError('Workspace entry helper broker timed out');
+    }
+    const responseLength = Atomics.load(broker.control, 1);
+    if (responseLength <= 0 || responseLength > MAX_RESPONSE_BYTES) {
+      closeHelperBroker(broker);
+      throw brokerTransportError('Workspace entry helper broker returned an invalid response length');
+    }
+    const response = Buffer.from(broker.response.subarray(0, responseLength)).toString('utf8');
+    Atomics.store(broker.control, 0, BROKER_IDLE);
+    return response;
+  } catch (error) {
+    if (Atomics.load(broker.control, 0) !== BROKER_IDLE) closeHelperBroker(broker);
+    const failure = isBrokerTransportError(error)
+      ? error
+      : brokerTransportError('Workspace entry helper broker failed', error);
+    rememberBrokerFailure(failure);
+    throw failure;
+  }
+}
+
+function invalidHelperResponse(
+  persistentTransport: boolean,
+  message: string,
+  cause?: unknown,
+): NodeJS.ErrnoException {
+  if (!persistentTransport) return unsafe(message, cause);
+  if (helperBroker) closeHelperBroker(helperBroker);
+  const failure = brokerTransportError(message, cause);
+  rememberBrokerFailure(failure);
+  return failure;
 }
 
 export type WorkspaceCwdHelperOperation =
@@ -69,6 +319,7 @@ export interface WorkspaceCwdHelperResult {
   size?: string; nlink?: string; mode?: string; mtimeNs?: string; ctimeNs?: string;
   birthtimeNs?: string;
   entries?: string;
+  helperPid?: number;
 }
 
 function unsafe(message: string, cause?: unknown): NodeJS.ErrnoException {
@@ -135,11 +386,10 @@ export function runWorkspaceCwdHelper(
   lease.verify();
   const parent = fs.fstatSync(lease.fd, { bigint: true });
   if (!parent.isDirectory() || parent.ino === 0n) throw unsafe('Workspace helper parent has no stable identity');
-  const env: NodeJS.ProcessEnv = {};
-  if (process.versions.electron) env.ELECTRON_RUN_AS_NODE = '1';
   const childPath = path.join(__dirname, 'workspace-cwd-helper-child.js');
   const wire = {
     version: 1,
+    cwdPath: lease.canonicalPath,
     expectedDev: parent.dev.toString(),
     expectedIno: parent.ino.toString(),
     ...request,
@@ -153,46 +403,93 @@ export function runWorkspaceCwdHelper(
       ? { data: Buffer.from(request.data).toString('base64') }
       : {}),
   };
-  const result = helperSpawner(process.execPath, [childPath], {
-    cwd: lease.canonicalPath,
-    env,
-    input: JSON.stringify(wire),
-    encoding: 'utf8',
-    timeout: HELPER_TIMEOUT_MS,
-    maxBuffer: MAX_RESPONSE_BYTES,
-    windowsHide: true,
-  });
-  lease.verify();
-  if (result.error || result.status !== 0 || result.signal) {
-    let childCode = 'UNSAFE_WORKSPACE_STORAGE';
+  const rawRequest = JSON.stringify(wire);
+  let rawResponse: string;
+  const persistentTransport = process.platform === 'win32' && helperSpawner === productionSpawner;
+  if (persistentTransport) {
     try {
-      const child = JSON.parse(String(result.stderr).trim()) as { code?: unknown };
-      if (typeof child.code === 'string' && /^[A-Z0-9_]+$/.test(child.code)) childCode = child.code;
-    } catch { /* Preserve the generic fail-closed code. */ }
-    throw Object.assign(unsafe(
-      `Workspace entry helper failed (${result.signal ?? result.status ?? 'spawn'}): ${String(result.stderr).slice(0, 2048)}`,
-      result.error,
-    ), { code: childCode });
+      rawResponse = exchangePersistentHelper(lease.canonicalPath, rawRequest);
+    } finally {
+      lease.verify();
+    }
+  } else {
+    const result = helperSpawner(process.execPath, [childPath], {
+      cwd: lease.canonicalPath,
+      env: helperEnvironment(),
+      input: rawRequest,
+      encoding: 'utf8',
+      timeout: HELPER_TIMEOUT_MS,
+      maxBuffer: MAX_RESPONSE_BYTES,
+      windowsHide: true,
+    });
+    lease.verify();
+    if (result.error || result.status !== 0 || result.signal) {
+      let childCode = 'UNSAFE_WORKSPACE_STORAGE';
+      try {
+        const child = JSON.parse(String(result.stderr).trim()) as { code?: unknown };
+        if (typeof child.code === 'string' && /^[A-Z0-9_]+$/.test(child.code)) childCode = child.code;
+      } catch { /* Preserve the generic fail-closed code. */ }
+      throw Object.assign(unsafe(
+        `Workspace entry helper failed (${result.signal ?? result.status ?? 'spawn'}): ${String(result.stderr).slice(0, 2048)}`,
+        result.error,
+      ), { code: childCode });
+    }
+    rawResponse = result.stdout.trim();
   }
   let response: {
     ok?: unknown; origin?: unknown; dev?: unknown; ino?: unknown;
     bytes?: unknown; sha256?: unknown; data?: unknown; size?: unknown; nlink?: unknown;
     mode?: unknown; mtimeNs?: unknown; ctimeNs?: unknown; birthtimeNs?: unknown; entries?: unknown;
+    code?: unknown; message?: unknown; helperPid?: unknown;
   };
-  try { response = JSON.parse(result.stdout.trim()) as typeof response; } catch (error) {
-    throw unsafe('Workspace entry helper returned an invalid response', error);
+  try { response = JSON.parse(rawResponse.trim()) as typeof response; } catch (error) {
+    throw invalidHelperResponse(
+      persistentTransport,
+      'Workspace entry helper returned an invalid response',
+      error,
+    );
+  }
+  if (response.ok === false) {
+    const childCode = typeof response.code === 'string' && /^[A-Z0-9_]+$/.test(response.code)
+      ? response.code
+      : 'UNSAFE_WORKSPACE_STORAGE';
+    const message = typeof response.message === 'string'
+      ? response.message.slice(0, 2048)
+      : 'unknown helper failure';
+    const failure = Object.assign(unsafe(`Workspace entry helper failed: ${message}`), { code: childCode });
+    if (persistentTransport) {
+      if (childCode === BROKER_TRANSPORT_ERROR) rememberBrokerFailure(failure);
+      else clearBrokerFailure();
+    }
+    throw failure;
   }
   if (response.ok !== true || (response.origin !== 'source' && response.origin !== 'app.asar')) {
-    throw unsafe('Workspace entry helper returned an invalid success response');
+    throw invalidHelperResponse(
+      persistentTransport,
+      'Workspace entry helper returned an invalid success response',
+    );
+  }
+  if (persistentTransport
+    && (!Number.isSafeInteger(response.helperPid) || Number(response.helperPid) <= 0)) {
+    throw invalidHelperResponse(
+      persistentTransport,
+      'Workspace entry helper returned an invalid process identity',
+    );
   }
   for (const field of ['size', 'nlink', 'mode'] as const) {
     if (response[field] !== undefined && !unsignedStatDecimal(response[field])) {
-      throw unsafe(`Workspace entry helper returned an invalid ${field}`);
+      throw invalidHelperResponse(
+        persistentTransport,
+        `Workspace entry helper returned an invalid ${field}`,
+      );
     }
   }
   for (const field of ['mtimeNs', 'ctimeNs', 'birthtimeNs'] as const) {
     if (response[field] !== undefined && !signedStatDecimal(response[field])) {
-      throw unsafe(`Workspace entry helper returned an invalid ${field}`);
+      throw invalidHelperResponse(
+        persistentTransport,
+        `Workspace entry helper returned an invalid ${field}`,
+      );
     }
   }
   if (request.operation === 'mkdir' || request.operation === 'ensure-directory'
@@ -205,12 +502,19 @@ export function runWorkspaceCwdHelper(
     || request.operation === 'stat' || request.operation === 'append'
     || request.operation === 'write' || request.operation === 'truncate') {
     if (typeof response.dev !== 'string' || typeof response.ino !== 'string') {
-      throw unsafe('Workspace entry helper omitted the published identity');
+      throw invalidHelperResponse(
+        persistentTransport,
+        'Workspace entry helper omitted the published identity',
+      );
     }
     if (!/^\d+$/.test(response.dev) || !/^\d+$/.test(response.ino)) {
-      throw unsafe('Workspace entry helper returned an invalid published identity');
+      throw invalidHelperResponse(
+        persistentTransport,
+        'Workspace entry helper returned an invalid published identity',
+      );
     }
   }
+  if (persistentTransport) clearBrokerFailure();
   if (!smokeReported && process.env.CODE_AGENTS_WEBCLI_DESKTOP_SMOKE === '1') {
     smokeReported = true;
     console.log(`WORKSPACE_ENTRY_HELPER_OK ${response.origin}`);
@@ -228,6 +532,7 @@ export function runWorkspaceCwdHelper(
     ...(typeof response.ctimeNs === 'string' ? { ctimeNs: response.ctimeNs } : {}),
     ...(typeof response.birthtimeNs === 'string' ? { birthtimeNs: response.birthtimeNs } : {}),
     ...(typeof response.entries === 'string' ? { entries: response.entries } : {}),
+    ...(Number.isSafeInteger(response.helperPid) ? { helperPid: Number(response.helperPid) } : {}),
   };
 }
 

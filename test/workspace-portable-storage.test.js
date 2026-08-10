@@ -4,6 +4,7 @@ const { createHash } = require('crypto');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+const { Worker } = require('worker_threads');
 
 const {
   openSerializedDatabase,
@@ -21,9 +22,11 @@ const {
   workspaceSessionFileParentLease,
 } = require('../dist/server/services/workspace-session-storage.js');
 const {
+  closeWorkspaceCwdHelpers,
   runWorkspaceCwdHelper,
   publishLargeWorkspaceCwdFile,
   publishNewWorkspaceCwdFile,
+  setWorkspaceCwdHelperBrokerExecutableForTests,
   setWorkspaceCwdHelperSpawnerForTests,
   statWorkspaceCwdFile,
 } = require('../dist/server/services/workspace-cwd-helper.js');
@@ -31,6 +34,7 @@ const {
 const OWNER_A = 'portable-owner-key-a';
 const OWNER_B = 'portable-owner-key-b';
 const CHILD = path.join(__dirname, '..', 'dist', 'server', 'services', 'workspace-cwd-helper-child.js');
+const BROKER = path.join(__dirname, '..', 'dist', 'server', 'services', 'workspace-cwd-helper-broker.js');
 
 function childProcessesWork() {
   const probe = childProcess.spawnSync(process.execPath, ['-e', 'process.exit(0)'], {
@@ -244,6 +248,23 @@ describe('portable workspace storage', function () {
 
     afterEach(function () {
       if (dir) fs.rmSync(dir, { recursive: true, force: true });
+    });
+
+    it('hardens an existing directory without losing its pinned identity', function () {
+      const childPath = path.join(dir, 'child-dir');
+      fs.mkdirSync(childPath, { mode: 0o700 });
+      const before = fs.statSync(childPath, { bigint: true });
+      const result = childRequest(dir, {
+        operation: 'ensure-directory', name: 'child-dir', createIfMissing: false, harden: true,
+        expectedEntryDev: before.dev.toString(), expectedEntryIno: before.ino.toString(),
+      });
+      assert.strictEqual(result.status, 0, result.stderr);
+      assert.strictEqual(result.response.ok, true);
+      assert.strictEqual(result.response.dev, before.dev.toString());
+      assert.strictEqual(result.response.ino, before.ino.toString());
+      const after = fs.statSync(childPath, { bigint: true });
+      assert.strictEqual(after.dev, before.dev);
+      assert.strictEqual(after.ino, before.ino);
     });
 
     it('creates, replaces, renames, publishes, unlinks and removes only direct safe entries', function () {
@@ -614,7 +635,116 @@ describe('portable workspace storage', function () {
     });
 
     afterEach(function () {
+      setWorkspaceCwdHelperBrokerExecutableForTests(null);
+      closeWorkspaceCwdHelpers();
       if (root) fs.rmSync(root, { recursive: true, force: true });
+    });
+
+    it('reuses one persistent helper process for repeated Windows artifact operations', function () {
+      if (process.platform !== 'win32') this.skip();
+      let fd = fs.openSync(root, fs.constants.O_RDONLY);
+      const lease = { canonicalPath: fs.realpathSync(root), fd, verify: () => {} };
+      let helperPid;
+      try {
+        const created = runWorkspaceCwdHelper(lease, {
+          operation: 'create', name: 'persistent-probe', data: Buffer.from('probe'), mode: 0o600,
+        });
+        assert.ok(Number.isSafeInteger(created.helperPid));
+        helperPid = created.helperPid;
+        for (let index = 0; index < 50; index += 1) {
+          const stat = statWorkspaceCwdFile(lease, 'persistent-probe');
+          assert.strictEqual(stat.helperPid, created.helperPid);
+        }
+        assert.throws(
+          () => runWorkspaceCwdHelper(lease, {
+            operation: 'ensure-directory', name: 'persistent-probe',
+            createIfMissing: true, harden: true,
+          }),
+          (error) => error.code === 'UNSAFE_WORKSPACE_STORAGE',
+        );
+        assert.strictEqual(
+          statWorkspaceCwdFile(lease, 'persistent-probe').helperPid,
+          created.helperPid,
+          'an operation-level rejection must not poison the healthy transport',
+        );
+      } finally {
+        fs.closeSync(fd);
+        fd = null;
+      }
+
+      const moved = `${root}-moved`;
+      fs.renameSync(root, moved);
+      fs.renameSync(moved, root);
+      fd = fs.openSync(root, fs.constants.O_RDONLY);
+      try {
+        const reopened = { canonicalPath: fs.realpathSync(root), fd, verify: () => {} };
+        assert.strictEqual(statWorkspaceCwdFile(reopened, 'persistent-probe').helperPid, helperPid);
+      } finally {
+        fs.closeSync(fd);
+      }
+    });
+
+    it('fails a broken persistent child precisely and cools down before another spawn', function () {
+      if (process.platform !== 'win32') this.skip();
+      setWorkspaceCwdHelperBrokerExecutableForTests(path.join(root, 'missing-helper.exe'));
+      const fd = fs.openSync(root, fs.constants.O_RDONLY);
+      const lease = { canonicalPath: fs.realpathSync(root), fd, verify: () => {} };
+      try {
+        const firstStarted = Date.now();
+        assert.throws(
+          () => runWorkspaceCwdHelper(lease, {
+            operation: 'create', name: 'must-not-exist', data: Buffer.from('x'), mode: 0o600,
+          }),
+          (error) => error.code === 'WORKSPACE_HELPER_TRANSPORT'
+            && /could not start|enoent/i.test(error.message)
+            && !/^Workspace entry helper broker failed$/i.test(error.message),
+        );
+        assert.ok(Date.now() - firstStarted < 5_000, 'first broker failure should fail fast');
+
+        const secondStarted = Date.now();
+        assert.throws(
+          () => runWorkspaceCwdHelper(lease, {
+            operation: 'create', name: 'must-not-exist', data: Buffer.from('x'), mode: 0o600,
+          }),
+          (error) => error.code === 'WORKSPACE_HELPER_TRANSPORT'
+            && /cooling down/i.test(error.message),
+        );
+        assert.ok(Date.now() - secondStarted < 250, 'cooldown rejection should not start another child');
+        assert.strictEqual(fs.existsSync(path.join(root, 'must-not-exist')), false);
+      } finally {
+        fs.closeSync(fd);
+      }
+    });
+
+    it('publishes a fatal bootstrap state instead of leaving the caller on the operation timeout', function () {
+      const controlBuffer = new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT * 3);
+      const responseBuffer = new SharedArrayBuffer(4096);
+      const control = new Int32Array(controlBuffer);
+      const response = new Uint8Array(responseBuffer);
+      const worker = new Worker(BROKER, {
+        workerData: {
+          controlBuffer,
+          responseBuffer,
+          executable: 7,
+          childPath: CHILD,
+          env: {},
+          timeoutMs: 15_000,
+          maximumFrameBytes: responseBuffer.byteLength,
+        },
+      });
+      worker.on('error', () => undefined);
+      worker.unref();
+      try {
+        const waited = Atomics.wait(control, 0, 0, 2_000);
+        assert.notStrictEqual(waited, 'timed-out');
+        assert.strictEqual(Atomics.load(control, 0), 4, 'broker bootstrap must publish FATAL');
+        const length = Atomics.load(control, 1);
+        const failure = JSON.parse(Buffer.from(response.subarray(0, length)).toString('utf8'));
+        assert.strictEqual(failure.code, 'WORKSPACE_HELPER_TRANSPORT');
+        assert.match(failure.message, /invalid workspace cwd helper broker configuration/i);
+      } finally {
+        void worker.terminate();
+      }
     });
 
     it('fails bad helper components before it can spawn a child', function () {

@@ -8,9 +8,12 @@ const MAX_FINGERPRINT_BYTES = 512 * 1024 * 1024;
 const SAFE_COMPONENT = /^[A-Za-z0-9._-]+$/;
 const NO_FOLLOW = (fs.constants as unknown as Record<string, number>).O_NOFOLLOW ?? 0;
 const NON_BLOCK = (fs.constants as unknown as Record<string, number>).O_NONBLOCK ?? 0;
+const PERSISTENT_NEUTRAL_CWD = process.cwd();
+const NEUTRAL_CWD_LOST = 'WORKSPACE_HELPER_NEUTRAL_CWD_LOST';
 
 type Request = {
   version: 1;
+  cwdPath?: string;
   expectedDev: string;
   expectedIno: string;
   operation: 'mkdir' | 'ensure-directory' | 'inspect-directory' | 'create' | 'rename' | 'publish' | 'claim' | 'retire' | 'isolate'
@@ -270,7 +273,11 @@ function lstatMaybe(name: string): fs.BigIntStats | null {
   }
 }
 
-function main(raw: string): void {
+function neutralCwdFailure(message: string, cause?: unknown): NodeJS.ErrnoException {
+  return Object.assign(new Error(message), { code: NEUTRAL_CWD_LOST, cause });
+}
+
+function main(raw: string, requireCwdPath = false): string {
   if (Buffer.byteLength(raw) > MAX_REQUEST_BYTES) fail('helper request is too large');
   const request = JSON.parse(raw) as Request;
   if (!request || typeof request !== 'object' || Array.isArray(request)
@@ -282,6 +289,26 @@ function main(raw: string): void {
     || (request.expectedEntryDev !== undefined && !/^\d+$/.test(request.expectedEntryDev))
     || (request.expectedEntryIno !== undefined && !/^\d+$/.test(request.expectedEntryIno))) {
     fail('helper identity fields are invalid');
+  }
+  if (requireCwdPath && typeof request.cwdPath !== 'string') {
+    fail('persistent helper request omitted its authorised cwd');
+  }
+  if (request.cwdPath !== undefined && (
+    typeof request.cwdPath !== 'string'
+    || !path.isAbsolute(request.cwdPath)
+    || path.resolve(request.cwdPath) !== request.cwdPath
+    || (process.platform === 'win32' && /^\\\\[?.]\\/.test(request.cwdPath))
+  )) fail('helper cwd path is not a canonical absolute path');
+
+  const neutralCwd = requireCwdPath ? PERSISTENT_NEUTRAL_CWD : process.cwd();
+  if (requireCwdPath && path.resolve(process.cwd()) !== path.resolve(neutralCwd)) {
+    throw neutralCwdFailure('persistent helper is no longer in its neutral cwd');
+  }
+  let changedCwd = false;
+  try {
+  if (request.cwdPath !== undefined && request.cwdPath !== neutralCwd) {
+    process.chdir(request.cwdPath);
+    changedCwd = true;
   }
   const cwd = fs.statSync('.', { bigint: true });
   if (
@@ -337,7 +364,14 @@ function main(raw: string): void {
           fail('helper directory does not match expected identity');
         }
         if (request.harden) {
-          fs.fchmodSync(fd, 0o700);
+          try { fs.fchmodSync(fd, 0o700); } catch (error) {
+            const code = (error as NodeJS.ErrnoException).code;
+            // Win32 does not expose POSIX directory modes and rejects chmod on
+            // an opened directory handle. The identity checks around this
+            // operation still pin the exact directory admitted above.
+            if (process.platform !== 'win32'
+              || !new Set(['EACCES', 'EBADF', 'EINVAL', 'EISDIR', 'ENOTSUP', 'EPERM']).has(String(code))) throw error;
+          }
           try { fs.fsyncSync(fd); } catch (error) {
             const code = (error as NodeJS.ErrnoException).code;
             if (process.platform !== 'win32'
@@ -796,28 +830,84 @@ function main(raw: string): void {
   if (durableAfter.dev.toString() !== request.expectedDev
     || durableAfter.ino.toString() !== request.expectedIno) fail('helper cwd identity changed after sync');
   const origin = __filename.includes('app.asar') ? 'app.asar' : 'source';
-  process.stdout.write(`${JSON.stringify({
+  return JSON.stringify({
     ok: true,
     origin,
+    helperPid: process.pid,
     ...(published ? { dev: String(published.dev), ino: String(published.ino) } : {}),
     ...(fingerprint ?? {}),
     ...(readResult ?? {}),
-  })}\n`);
+  });
+  } finally {
+    if (changedCwd) {
+      try { process.chdir(neutralCwd); } catch (error) {
+        throw neutralCwdFailure('persistent helper could not restore its neutral cwd', error);
+      }
+    }
+  }
 }
 
-let input = '';
-process.stdin.setEncoding('utf8');
-process.stdin.on('data', (chunk: string) => {
-  input += chunk;
-  if (Buffer.byteLength(input) > MAX_REQUEST_BYTES) fail('helper request is too large');
-});
-process.stdin.on('end', () => {
-  try {
-    main(input);
-  } catch (error) {
-    const code = (error as NodeJS.ErrnoException).code ?? 'HELPER_FAILED';
-    const message = error instanceof Error ? error.message : String(error);
-    process.stderr.write(`${JSON.stringify({ ok: false, code, message })}\n`);
-    process.exitCode = 1;
-  }
-});
+function failureResponse(error: unknown): string {
+  const code = (error as NodeJS.ErrnoException).code ?? 'HELPER_FAILED';
+  const message = error instanceof Error ? error.message : String(error);
+  return JSON.stringify({ ok: false, code, message });
+}
+
+function runOneShot(): void {
+  let input = '';
+  process.stdin.setEncoding('utf8');
+  process.stdin.on('data', (chunk: string) => {
+    input += chunk;
+    if (Buffer.byteLength(input) > MAX_REQUEST_BYTES) fail('helper request is too large');
+  });
+  process.stdin.on('end', () => {
+    try {
+      process.stdout.write(`${main(input)}\n`);
+    } catch (error) {
+      process.stderr.write(`${failureResponse(error)}\n`);
+      process.exitCode = 1;
+    }
+  });
+}
+
+function runPersistent(): void {
+  let input = Buffer.alloc(0);
+  process.stdin.on('data', (chunk: Buffer) => {
+    input = Buffer.concat([input, chunk]);
+    if (input.length > MAX_REQUEST_BYTES + 4) {
+      process.stderr.write(`${failureResponse(new Error('helper request frame is too large'))}\n`);
+      process.exit(1);
+    }
+    while (input.length >= 4) {
+      const length = input.readUInt32BE(0);
+      if (length === 0 || length > MAX_REQUEST_BYTES) {
+        process.stderr.write(`${failureResponse(new Error('helper request frame length is invalid'))}\n`);
+        process.exit(1);
+      }
+      if (input.length < 4 + length) return;
+      const raw = input.subarray(4, 4 + length).toString('utf8');
+      input = input.subarray(4 + length);
+      let response: string;
+      try { response = main(raw, true); } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === NEUTRAL_CWD_LOST) {
+          process.stderr.write(`${failureResponse(error)}\n`);
+          process.exit(1);
+        }
+        response = failureResponse(error);
+      }
+      const bytes = Buffer.from(response, 'utf8');
+      if (bytes.length === 0 || bytes.length > MAX_REQUEST_BYTES) {
+        process.stderr.write(`${failureResponse(new Error('helper response frame is too large'))}\n`);
+        process.exit(1);
+      }
+      const frame = Buffer.allocUnsafe(4 + bytes.length);
+      frame.writeUInt32BE(bytes.length, 0);
+      bytes.copy(frame, 4);
+      process.stdout.write(frame);
+    }
+  });
+  process.stdin.on('end', () => process.exit(input.length === 0 ? 0 : 1));
+}
+
+if (process.argv[2] === '--persistent') runPersistent();
+else runOneShot();

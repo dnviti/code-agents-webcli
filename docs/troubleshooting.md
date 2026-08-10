@@ -10,10 +10,9 @@ npm 12 refuses git remotes unless told otherwise. Add `--allow-git=all`, or set
 it once with `npm config set allow-git all`.
 
 **"code-agents-webcli needs Node 24.16 or newer".**
-The app uses Node's built-in SQLite serialization APIs to store workspace
-databases safely on every supported host. Upgrade Node. The check is deliberate
-— without it the first symptom would be a SQLite serialization failure from
-deep inside the server.
+The app uses Node's built-in SQLite APIs for the shared per-user `app.sqlite`.
+Upgrade Node; without it the first symptom would be a SQLite failure from deep
+inside the server.
 
 **"The @lydell/node-pty package could not find the platform-specific package".**
 Either your platform has no prebuilt terminal binary, or the install ran with
@@ -51,8 +50,8 @@ by hand: `systemctl --user status code-agents-webcli.service`.
 Another process owns the same `--data-dir`, or a crashed process's private lease
 has not yet met both recovery checks. Stop the other foreground/service or wait
 for its stale-heartbeat window. If an incomplete ownerless lease remains, first
-prove that no `cc-web` process uses that data directory and that no update or
-migration is running; only then remove `.cc-web-server.lease` and
+prove that no `cc-web` process uses that data directory and that no update,
+startup, or shutdown is running; only then remove `.cc-web-server.lease` and
 `.cc-web-server.lease.guard` manually. Never remove a live lease merely to make
 the error disappear.
 
@@ -221,34 +220,25 @@ handed them, so a message shown in the conversation was genuinely sent.
 Expected. The record, history and transcript persist; the live process does not.
 
 **Conversations are missing after moving or restoring a workspace.**
-Session history now belongs to that workspace's `.cc-web/`, not to
-`--data-dir`. Open the authorised workspace root so the server can lazy-load
-`session-state.sqlite`; do not point it at the filesystem root or through a
-symlink. A restore must include the complete `.cc-web` tree and, for a live
-Linux SQLite snapshot, its `-wal` and `-shm` files. Windows and macOS atomically
-publish a complete database image and create no sidecars. See [backing up
-and restoring](configuration.md#backing-up-and-restoring).
+Conversation metadata, tabs, drafts, usage and workspace-scope references live
+in the per-user `app.sqlite`; chat events, transcripts, terminal history,
+attachments and pasted content live in that workspace's `.cc-web/`. Restore
+both the application data directory and the complete `.cc-web` tree at the same
+canonical project path. Neither half can reconstruct the other, and `.cc-web`
+contains no SQLite database or SQLite sidecars. See [backing up and
+restoring](configuration.md#backing-up-and-restoring).
 
-If the workspace was copied to a different root, or restored without the
-installation data directory that authenticated it, the history is retained but
-the server treats its operational state as unrecognised. Reopen the real
-workspace and choose the runtime/approval settings again; native resume IDs and
-archived project paths are deliberately not trusted across that boundary.
+A fresh installation does not import an older storage layout or a standalone
+`.cc-web` tree. Those files are left untouched. If the matching per-user
+database was not backed up, the project files alone cannot recreate the session
+list.
 
 **The API reports `workspace_persistence_unavailable` on Windows or macOS.**
-Workspace-local storage is supported on Windows and macOS through the app's verified-cwd
-helper. Check that the workspace is a local, canonical directory without
-symlinked `.cc-web` components, that the current user can write it, and that no
-other web or desktop process owns its `.session-state.writer` lease. A packaged
-app must also retain its complete `app.asar`; moving individual JavaScript files
+Project-file storage is supported on Windows and macOS through the app's
+verified-cwd helper. Check that the workspace is a local, canonical directory
+without symlinked `.cc-web` components and that the current user can write it.
+A packaged app must also retain its complete `app.asar`; moving JavaScript files
 out of the application bundle breaks the helper and is unsupported.
-
-An unclean shutdown is reclaimed automatically only when the app can prove the
-recorded process incarnation is gone on this machine. A workspace copied from
-another host deliberately keeps an unprovable writer record fail-closed. If the
-copy is private and the source machine cannot access it, close every app using
-the copy and remove only `.cc-web/.session-state.writer*`; never do this to a
-shared or network-mounted workspace.
 
 Windows has no `openat` namespace either. The helper verifies the exact working
 directory before each relative mutation, while Win32 prevents that process cwd
@@ -256,28 +246,31 @@ from being renamed or removed. Providers which cannot preserve those semantics
 fail closed; keep the workspace on a local filesystem. `GET
 /api/sessions/persistence` reports which roots are loaded and unavailable.
 
-**The API reports `workspace_persistence_unavailable`, or migration is
-incomplete.**
-The destination is missing, read-only, unsafe, or conflicts with an existing
-archive. The legacy copy is deliberately retained and the server will not fall
-back to writing new history under the data directory. Fix ownership and free
-space, restore the real non-symlink workspace path, and open it again or restart
-the server. Until then the conversation remains visible but read-only, and
-mutating actions return a conflict carrying the same persistence reason.
-`GET /api/sessions/persistence` lists unavailable roots and their errors. Do not
-delete the legacy files until the endpoint reports migration complete.
+**The API reports `workspace_persistence_unavailable`.**
+The expected workspace archive is missing, read-only, unsafe, assigned to
+another account, or conflicts with an existing archive. Fix ownership and free
+space, restore the matching `.cc-web` tree at its real non-symlink workspace
+path, and open that folder again or restart the server. The server will not
+create a replacement over an unsafe archive or fall back to writing project
+history under the application data directory. Persistence diagnostics list
+unavailable roots and their errors.
+
+There is no automatic migration. Startup does not import or delete records from
+an older storage layout. Recovery requires the matching per-user `app.sqlite`
+and project `.cc-web` archive from the same backup.
 
 If the error says that the root is already assigned to another account, do not
 copy or merge the two `.cc-web` trees. The canonical root may belong to only one
 immutable GitHub identity because it contains plaintext history. Correct the
-folder selection (or the stale path-only catalog entry) and retry; ambiguous
-legacy assignments remain quarantined rather than choosing an owner silently.
+folder selection or conflicting path-only catalog entry and retry; ambiguous
+assignments remain quarantined rather than choosing an owner silently.
 
 If the error contains `UNSAFE_WORKSPACE_STORAGE`, the current filesystem could
 not prove race-safe directory/file binding. Remove symlinks and check ownership
 first. On network or FUSE filesystems, or unusual Windows volumes, move the
-workspace to a local filesystem that supports the required cwd/descriptor semantics.
-The server intentionally has no global-data fallback.
+workspace to a local filesystem that supports the required cwd/descriptor
+semantics. The server intentionally has no application-data fallback for
+project-specific files; global metadata remains in the per-user database.
 
 **A managed project reports that its session archive is crash-staged.**
 Do not rename, copy or delete the deterministic
@@ -287,7 +280,7 @@ interrupted rebuild/reclaim. Restore access to the deploy target and enable the
 project-environment lifecycle so startup can reconcile and quiesce the old
 runtime before restoring it. A conflict at the canonical `.cc-web` name, an
 unsafe staging slot, or an unquiesced runtime deliberately keeps the project
-unavailable rather than choosing an archive or creating an empty database.
+unavailable rather than choosing an archive or creating an empty archive.
 
 ## Updating
 

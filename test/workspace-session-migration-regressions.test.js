@@ -4,14 +4,11 @@ const fs = fsSync.promises;
 const http = require('http');
 const os = require('os');
 const path = require('path');
+const { createHash } = require('crypto');
 
 const { ClaudeCodeWebServer } = require('../dist/server/index.js');
-const { ChatStore } = require('../dist/server/chat/store.js');
 const { AppDatabase } = require('../dist/server/services/database.js');
-const { HistoryStore } = require('../dist/server/services/history-store.js');
-const { PasteStore } = require('../dist/server/services/paste-store.js');
 const { SessionStore } = require('../dist/server/services/session-store.js');
-const { TranscriptStore } = require('../dist/server/services/transcript-store.js');
 const { UsageStore } = require('../dist/server/services/usage-store.js');
 const {
   WorkspaceSessionArtifactMigrator,
@@ -105,19 +102,17 @@ describe('workspace session migration regressions', function () {
         workingDir: workspaceRoot, storageScope: scope, ownerSessionId: parent.id,
         lastAgent: 'terminal',
       });
-      const bound = server.sessionStore.openWorkspace(scope);
-      assert.strictEqual(await bound.saveSessions(new Map([
-        [parent.id, parent], [child.id, child],
-      ])), true);
+      server.claudeSessions.set(parent.id, parent);
+      server.claudeSessions.set(child.id, child);
+      assert.strictEqual(await server.saveSessionsToDisk(), true);
 
       server.transcriptStore.appendOutput(child, 'transcript survives\n');
       server.historyStore.append(child, ['history survives']);
       assert.match((await server.transcriptStore.readTranscriptChunks(child)).join(''), /survives/);
       assert.strictEqual((await server.historyStore.stat(child)).totalLines, 1);
 
-      server.usageStore.unregister(scope);
-      server.sessionStore.closeWorkspace(scope);
-      await server.loadWorkspaceSessions(owner.id, workspaceRoot);
+      server.claudeSessions.clear();
+      await server.loadPersistedSessions();
 
       assert.strictEqual(server.claudeSessions.has(parent.id), true);
       assert.strictEqual(server.claudeSessions.has(child.id), true);
@@ -151,28 +146,25 @@ describe('workspace session migration regressions', function () {
       const scope = server.projectSessionStorageScope(project);
       const key = `${scope.ownerKey}\u0000${scope.workspaceRoot}`;
       await fs.mkdir(scope.workspaceRoot, { recursive: true });
-      server.sessionStore.suspendWorkspace(scope);
       server.suspendedProjectScopes.set(project.id, scope);
 
-      const originalLoad = server.loadWorkspaceSessions;
-      server.loadWorkspaceSessions = async () => { throw new Error('archive owner binding is invalid'); };
+      const originalIdentity = server.projectPaths.workspaceSessionStorageIdentity;
+      server.projectPaths.workspaceSessionStorageIdentity = async () => {
+        throw new Error('archive owner binding is invalid');
+      };
       try {
         await assert.rejects(
           () => server.afterProjectWorkspaceRestored(project),
           /archive owner binding is invalid/,
         );
       } finally {
-        server.loadWorkspaceSessions = originalLoad;
+        server.projectPaths.workspaceSessionStorageIdentity = originalIdentity;
       }
 
-      assert.throws(
-        () => server.sessionStore.openWorkspace(scope),
-        /temporarily suspended/,
-        'a failed loader may not leave an empty writable archive behind',
-      );
+      assert.strictEqual(server.suspendedProjectScopes.has(project.id), true);
       assert.strictEqual(server.loadedWorkspaceScopes.has(key), false);
       assert.strictEqual(
-        await server.projectHasIncompleteBinaryMigration(project),
+        await server.projectSessionStorageIsUnavailable(project),
         true,
         'every persistence error blocks rebuild even when the scope was never loaded',
       );
@@ -214,9 +206,10 @@ describe('workspace session migration regressions', function () {
         lastAgent: 'claude',
       });
       server.claudeSessions.set(session.id, session);
-      const bound = server.sessionStore.openWorkspace(scope);
-      assert.strictEqual(await bound.saveSessions(new Map([[session.id, session]])), true);
-      server.usageStore.register(scope, bound.database);
+      assert.strictEqual(await server.saveSessionsToDisk(), true);
+      await server.chatStore.append(session, [{
+        t: 'state', seq: 1, ts: 1, state: 'idle',
+      }]);
       server.loadedWorkspaceScopes.add(key);
 
       const canonicalArchive = path.join(workspaceRoot, '.cc-web');
@@ -294,7 +287,7 @@ describe('workspace session migration regressions', function () {
         reopened,
       );
       assert.deepStrictEqual(
-        server.confirmProjectWorkspaceRestored(project, authority.identity),
+        await server.confirmProjectWorkspaceRestored(project, authority.identity),
         authority.identity,
       );
       const restored = server.claudeSessions.get(session.id);
@@ -348,8 +341,7 @@ describe('workspace session migration regressions', function () {
         projectWorkingDirKind: 'host',
       });
       server.claudeSessions.set(session.id, session);
-      const bound = server.sessionStore.openWorkspace(scope);
-      assert.strictEqual(await bound.saveSessions(new Map([[session.id, session]])), true);
+      assert.strictEqual(await server.saveSessionsToDisk(), true);
       server.loadedWorkspaceScopes.add(key);
 
       const base = server.chatStore.basePath(session);
@@ -384,7 +376,11 @@ describe('workspace session migration regressions', function () {
       }
 
       assert.match(session.persistenceUnavailable, /temporarily unavailable/i);
-      assert.strictEqual(server.suspendedProjectScopes.has(project.id), false);
+      assert.strictEqual(
+        server.suspendedProjectScopes.has(project.id),
+        true,
+        'the scope gate closes before already-admitted artifact writes are drained',
+      );
       assert.strictEqual(
         await fileExists(path.join(path.dirname(workspaceRoot), `.${project.id}.ccweb-session-storage-intent`)),
         false,
@@ -396,7 +392,7 @@ describe('workspace session migration regressions', function () {
         'an autosave may run while lifecycle is waiting on the artifact barrier',
       );
       assert.strictEqual(
-        bound.database.raw.prepare(
+        server.database.raw.prepare(
           'SELECT COUNT(*) AS count FROM runtime_sessions WHERE id = ?',
         ).get(session.id).count,
         1,
@@ -440,7 +436,7 @@ describe('workspace session migration regressions', function () {
     }
   });
 
-  it('takes lifecycle authority from the open database lease, never an already-swapped pathname', async function () {
+  it('takes lifecycle authority from the admitted artifact inode, never a swapped pathname', async function () {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), 'cc-web-project-open-lease-authority-'));
     const dataDir = path.join(root, 'data');
     const projectsRoot = path.join(root, 'projects');
@@ -468,39 +464,43 @@ describe('workspace session migration regressions', function () {
         projectId: project.id,
         projectWorkingDirKind: 'host',
       });
+      await server.loadWorkspaceSessions(owner.id, workspaceRoot);
       server.claudeSessions.set(session.id, session);
-      const bound = server.sessionStore.openWorkspace(scope);
-      assert.strictEqual(await bound.saveSessions(new Map([[session.id, session]])), true);
+      assert.strictEqual(await server.saveSessionsToDisk(), true);
       server.loadedWorkspaceScopes.add(key);
 
       const canonical = path.join(workspaceRoot, '.cc-web');
       const authoritative = path.join(workspaceRoot, '.cc-web-opened-original');
       await fs.rename(canonical, authoritative);
       await fs.mkdir(canonical);
-      const replacementDatabase = path.join(canonical, 'session-state.sqlite');
-      await fs.writeFile(replacementDatabase, 'safe-looking replacement must remain untouched');
-      const replacementBefore = await fs.stat(replacementDatabase);
+      const replacementArtifact = path.join(canonical, 'replacement.txt');
+      await fs.writeFile(replacementArtifact, 'safe-looking replacement must remain untouched');
+      const replacementBefore = await fs.stat(replacementArtifact);
 
       await assert.rejects(
         () => server.beforeProjectWorkspaceReplacement(project),
-        /Workspace directory changed|storage authority|authorised inode/,
+        /changed|identity|authorised|binding/i,
       );
 
       assert.strictEqual(
-        await fs.readFile(replacementDatabase, 'utf8'),
+        await fs.readFile(replacementArtifact, 'utf8'),
         'safe-looking replacement must remain untouched',
       );
-      const replacementAfter = await fs.stat(replacementDatabase);
+      const replacementAfter = await fs.stat(replacementArtifact);
       assert.strictEqual(replacementAfter.ino, replacementBefore.ino);
       assert.strictEqual(replacementAfter.size, replacementBefore.size);
-      assert.strictEqual(server.suspendedProjectScopes.has(project.id), false);
-      assert.strictEqual(server.loadedWorkspaceScopes.has(key), true);
+      assert.strictEqual(
+        server.suspendedProjectScopes.has(project.id),
+        true,
+        'an admitted archive identity mismatch keeps the project scope fail-closed',
+      );
+      assert.strictEqual(server.loadedWorkspaceScopes.has(key), false);
       const environmentOwner = server.getEnvironmentOwner(owner.id);
       assert.ok(environmentOwner);
       assert.strictEqual(
         await server.projectPaths.hasStagedWorkspaceSessionStorage(project, environmentOwner),
         false,
-        'a failed pre-suspension lease check does not mint authority for the replacement',
+        'a failed pre-suspension identity check does not mint authority for the replacement',
       );
       assert.strictEqual(await fileExists(authoritative), true);
     } finally {
@@ -531,28 +531,27 @@ describe('workspace session migration regressions', function () {
       await fs.mkdir(workspaceRoot);
       const scope = server.projectSessionStorageScope(project);
       const key = `${scope.ownerKey}\u0000${scope.workspaceRoot}`;
-      const bound = server.sessionStore.openWorkspace(scope);
-      await bound.saveSessions(new Map());
       const environmentOwner = server.getEnvironmentOwner(owner.id);
       assert.ok(environmentOwner);
-      const identity = bound.database.storageIdentity();
-      await server.projectPaths.recordWorkspaceSessionStorageIntent(project, environmentOwner, identity);
-      server.sessionStore.closeWorkspace(scope);
-
       const canonical = path.join(workspaceRoot, '.cc-web');
+      await fs.mkdir(canonical);
+      await fs.writeFile(path.join(canonical, 'artifact.txt'), 'authoritative project history');
+      const identity = await server.projectPaths.workspaceSessionStorageIdentity(project, environmentOwner);
+      assert.ok(identity);
+      await server.projectPaths.recordWorkspaceSessionStorageIntent(project, environmentOwner, identity);
+
       const authoritative = path.join(workspaceRoot, '.cc-web-authoritative-offline');
       await fs.rename(canonical, authoritative);
       await fs.mkdir(canonical);
-      await fs.writeFile(path.join(canonical, 'session-state.sqlite'), 'replacement must stay dark');
+      await fs.writeFile(path.join(canonical, 'replacement.txt'), 'replacement must stay dark');
 
       await server.restoreStagedProjectSessionArchives();
-      await server.discoverWorkspaceSessions();
 
       assert.strictEqual(server.unrestoredProjectScopes.has(key), true);
       assert.match(server.workspacePersistenceErrors.get(key), /crash-staged|enable project environments/i);
       assert.strictEqual(server.loadedWorkspaceScopes.has(key), false);
       assert.strictEqual(
-        await fs.readFile(path.join(canonical, 'session-state.sqlite'), 'utf8'),
+        await fs.readFile(path.join(canonical, 'replacement.txt'), 'utf8'),
         'replacement must stay dark',
       );
       assert.strictEqual(await fileExists(authoritative), true);
@@ -562,365 +561,6 @@ describe('workspace session migration regressions', function () {
     }
   });
 
-  it('cuts over independent units in one workspace while a conflicting sibling remains legacy', async function () {
-    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'cc-web-independent-units-'));
-    const dataDir = path.join(root, 'data');
-    const workspaceRoot = path.join(root, 'workspace');
-    await Promise.all([fs.mkdir(dataDir), fs.mkdir(workspaceRoot)]);
-    const server = new ClaudeCodeWebServer({ dataDir, baseFolder: root, noAuth: true, port: 0 });
-    try {
-      const owner = server.database.upsertGitHubUser({
-        githubId: 'independent-unit-owner', githubLogin: 'independent-unit-owner',
-        githubName: null, email: null,
-      });
-      const scope = server.sessionStorageScope(owner.id, workspaceRoot);
-      const first = sessionRecord('unit-a', owner.id, { workingDir: workspaceRoot, surface: 'chat' });
-      const second = sessionRecord('unit-b', owner.id, { workingDir: workspaceRoot, surface: 'chat' });
-      const legacyStore = new SessionStore({ database: server.database });
-      assert.strictEqual(await legacyStore.saveSessions(new Map([
-        [first.id, first], [second.id, second],
-      ])), true);
-
-      // Model the recoverable duplicate state left by a destination commit
-      // whose source transaction did not commit. The blocked unit must keep
-      // this row as well as its global authority across an autosave.
-      const bound = server.sessionStore.openWorkspace(scope);
-      assert.strictEqual(await bound.saveSessions(new Map([
-        [second.id, { ...second, storageScope: scope }],
-      ])), true);
-
-      const confirmed = [];
-      server.workspaceArtifactMigrator = {
-        migrate: async ({ id }) => id === second.id
-          ? {
-              status: 'partial',
-              artifacts: [{ artifact: 'chat_log', state: 'blocked', reason: 'target_conflict' }],
-            }
-          : { status: 'complete', artifacts: [] },
-        confirm: async ({ id }) => { confirmed.push(id); },
-      };
-
-      await server.migrateLegacySessions(new Map([
-        [first.id, first], [second.id, second],
-      ]));
-
-      const legacyCount = (id) => server.database.raw.prepare(`
-        SELECT COUNT(*) AS count FROM runtime_sessions WHERE owner_user_id = ? AND id = ?
-      `).get(owner.id, id).count;
-      const localCount = (id) => bound.database.raw.prepare(`
-        SELECT COUNT(*) AS count FROM runtime_sessions WHERE owner_key = ? AND id = ?
-      `).get(scope.ownerKey, id).count;
-      assert.strictEqual(legacyCount(first.id), 0, 'independent unit A must cut over');
-      assert.strictEqual(legacyCount(second.id), 1, 'conflicting unit B stays legacy');
-      assert.strictEqual(localCount(first.id), 1);
-      assert.strictEqual(localCount(second.id), 1, 'recoverable duplicate is retained');
-      assert.strictEqual(server.claudeSessions.get(first.id).persistenceUnavailable, undefined);
-      assert.match(server.claudeSessions.get(second.id).persistenceUnavailable, /unit unit-b/i);
-      assert.ok(confirmed.includes(first.id));
-      assert.strictEqual(confirmed.includes(second.id), false, 'legacy B files are not confirmed');
-
-      assert.strictEqual(await server.saveSessionsToDisk(), true);
-      assert.strictEqual(
-        localCount(second.id),
-        1,
-        'a partial live map cannot prune a destination row while B remains legacy',
-      );
-    } finally {
-      await server.shutdown().catch(() => undefined);
-      await fs.rm(root, { recursive: true, force: true });
-    }
-  });
-
-  it('keeps a parent and every descendant shell in one atomic unit and retries idempotently', async function () {
-    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'cc-web-dependent-unit-'));
-    const dataDir = path.join(root, 'data');
-    const workspaceRoot = path.join(root, 'workspace');
-    await Promise.all([fs.mkdir(dataDir), fs.mkdir(workspaceRoot)]);
-    const server = new ClaudeCodeWebServer({ dataDir, baseFolder: root, noAuth: true, port: 0 });
-    try {
-      const owner = server.database.upsertGitHubUser({
-        githubId: 'dependent-unit-owner', githubLogin: 'dependent-unit-owner',
-        githubName: null, email: null,
-      });
-      const parent = sessionRecord('parent-unit', owner.id, {
-        workingDir: workspaceRoot, surface: 'chat',
-      });
-      const child = sessionRecord('child-unit', owner.id, {
-        workingDir: workspaceRoot, ownerSessionId: parent.id,
-      });
-      const grandchild = sessionRecord('grandchild-unit', owner.id, {
-        workingDir: workspaceRoot, ownerSessionId: child.id,
-      });
-      const legacyStore = new SessionStore({ database: server.database });
-      assert.strictEqual(await legacyStore.saveSessions(new Map([
-        [parent.id, parent], [child.id, child], [grandchild.id, grandchild],
-      ])), true);
-
-      let blockChild = true;
-      let artifactOrder = [];
-      const confirmed = [];
-      server.workspaceArtifactMigrator = {
-        migrate: async ({ id }) => {
-          artifactOrder.push(id);
-          if (blockChild && id === child.id) {
-            return {
-              status: 'partial',
-              artifacts: [{ artifact: 'history_log', state: 'blocked', reason: 'target_conflict' }],
-            };
-          }
-          return { status: 'complete', artifacts: [] };
-        },
-        confirm: async ({ id }) => { confirmed.push(id); },
-      };
-      const cutovers = [];
-      const originalCutover = server.sessionStore.migrateLegacySessions.bind(server.sessionStore);
-      server.sessionStore.migrateLegacySessions = (scope, database, ownerUserId, ids) => {
-        const unitIds = [...ids];
-        cutovers.push(unitIds);
-        return originalCutover(scope, database, ownerUserId, unitIds);
-      };
-
-      // Reverse input order to prove dependency order is derived from the
-      // ownership graph rather than SQLite/Map iteration order.
-      await server.migrateLegacySessions(new Map([
-        [grandchild.id, grandchild], [child.id, child], [parent.id, parent],
-      ]));
-      assert.deepStrictEqual(artifactOrder, [parent.id, child.id]);
-      assert.deepStrictEqual(cutovers, [], 'no descendant cuts over without its parent unit');
-      for (const session of [parent, child, grandchild]) {
-        assert.strictEqual(
-          server.database.raw.prepare(`
-            SELECT COUNT(*) AS count FROM runtime_sessions WHERE owner_user_id = ? AND id = ?
-          `).get(owner.id, session.id).count,
-          1,
-        );
-        assert.match(server.claudeSessions.get(session.id).persistenceUnavailable, /parent-unit/i);
-      }
-      assert.deepStrictEqual(confirmed, []);
-
-      blockChild = false;
-      artifactOrder = [];
-      await server.migrateLegacySessions(await legacyStore.loadSessions());
-      assert.deepStrictEqual(artifactOrder, [parent.id, child.id, grandchild.id]);
-      assert.deepStrictEqual(cutovers, [[parent.id, child.id, grandchild.id]]);
-      const scope = server.sessionStorageScope(owner.id, workspaceRoot);
-      const local = await server.sessionStore.openWorkspace(scope).loadSessions();
-      for (const session of [parent, child, grandchild]) {
-        assert.strictEqual(
-          server.database.raw.prepare(`
-            SELECT COUNT(*) AS count FROM runtime_sessions WHERE owner_user_id = ? AND id = ?
-          `).get(owner.id, session.id).count,
-          0,
-        );
-        assert.strictEqual(local.has(session.id), true);
-        assert.strictEqual(server.claudeSessions.get(session.id).persistenceUnavailable, undefined);
-        assert.ok(confirmed.includes(session.id));
-      }
-
-      // A further retry sees no source rows and neither duplicates nor prunes
-      // the already completed unit.
-      await server.migrateLegacySessions(await legacyStore.loadSessions());
-      assert.deepStrictEqual(cutovers, [[parent.id, child.id, grandchild.id]]);
-      assert.strictEqual((await server.sessionStore.openWorkspace(scope).loadSessions()).size, 3);
-    } finally {
-      await server.shutdown().catch(() => undefined);
-      await fs.rm(root, { recursive: true, force: true });
-    }
-  });
-
-  it('rejects an authorised-base child cwd that escapes its owner conversation workspace', async function () {
-    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'cc-web-child-scope-escape-'));
-    const dataDir = path.join(root, 'data');
-    const workspaceRoot = path.join(root, 'workspace');
-    const escapedRoot = path.join(root, 'other-authorised-folder');
-    await Promise.all([fs.mkdir(dataDir), fs.mkdir(workspaceRoot), fs.mkdir(escapedRoot)]);
-    const server = new ClaudeCodeWebServer({ dataDir, baseFolder: root, noAuth: true, port: 0 });
-    try {
-      const owner = server.database.upsertGitHubUser({
-        githubId: 'child-scope-owner', githubLogin: 'child-scope-owner',
-        githubName: null, email: null,
-      });
-      const parent = sessionRecord('scope-parent', owner.id, {
-        workingDir: workspaceRoot,
-        surface: 'chat',
-      });
-      const child = sessionRecord('scope-child', owner.id, {
-        workingDir: escapedRoot,
-        ownerSessionId: parent.id,
-      });
-      const legacyStore = new SessionStore({ database: server.database });
-      assert.strictEqual(await legacyStore.saveSessions(new Map([
-        [parent.id, parent],
-        [child.id, child],
-      ])), true);
-      const migrated = [];
-      server.workspaceArtifactMigrator = {
-        migrate: async ({ id }) => {
-          migrated.push(id);
-          return { status: 'complete', artifacts: [] };
-        },
-        confirm: async () => {},
-      };
-
-      await server.migrateLegacySessions(new Map([
-        [parent.id, parent],
-        [child.id, child],
-      ]));
-
-      assert.deepStrictEqual(migrated, [parent.id]);
-      assert.strictEqual(
-        server.database.raw.prepare(`
-          SELECT COUNT(*) AS count FROM runtime_sessions WHERE owner_user_id = ? AND id = ?
-        `).get(owner.id, child.id).count,
-        1,
-      );
-      assert.match(
-        server.claudeSessions.get(child.id).persistenceUnavailable,
-        /leaves its owner conversation workspace/i,
-      );
-    } finally {
-      await server.shutdown().catch(() => undefined);
-      await fs.rm(root, { recursive: true, force: true });
-    }
-  });
-
-  it('retries a legacy migration when its missing workspace is opened without a restart', async function () {
-    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'cc-web-live-migration-retry-'));
-    const dataDir = path.join(root, 'data');
-    const workspaceRoot = path.join(root, 'restored-workspace');
-    await fs.mkdir(dataDir);
-    const server = new ClaudeCodeWebServer({ dataDir, baseFolder: root, noAuth: true, port: 0 });
-    try {
-      const owner = server.database.upsertGitHubUser({
-        githubId: 'live-retry-owner', githubLogin: 'live-retry-owner',
-        githubName: null, email: null,
-      });
-      const session = sessionRecord('live-retry', owner.id, {
-        workingDir: workspaceRoot,
-        surface: 'chat',
-      });
-      const legacyStore = new SessionStore({ database: server.database });
-      assert.strictEqual(await legacyStore.saveSessions(new Map([[session.id, session]])), true);
-
-      await server.migrateLegacySessions(new Map([[session.id, session]]));
-      assert.strictEqual(
-        server.database.raw.prepare(`
-          SELECT COUNT(*) AS count FROM runtime_sessions WHERE owner_user_id = ? AND id = ?
-        `).get(owner.id, session.id).count,
-        1,
-      );
-      assert.match(server.claudeSessions.get(session.id).persistenceUnavailable, /workspace|folder/i);
-
-      await fs.mkdir(workspaceRoot);
-      let migrationAttempts = 0;
-      server.workspaceArtifactMigrator = {
-        migrate: async () => {
-          migrationAttempts += 1;
-          // Keep the retry in flight for one microtask so the second lazy open
-          // must join the same promise rather than start another cutover.
-          await Promise.resolve();
-          return { status: 'complete', artifacts: [] };
-        },
-        confirm: async () => {},
-      };
-
-      await Promise.all([
-        server.loadWorkspaceSessions(owner.id, workspaceRoot),
-        server.loadWorkspaceSessions(owner.id, workspaceRoot),
-      ]);
-
-      assert.strictEqual(migrationAttempts, 1, 'concurrent opens share one targeted retry');
-      assert.strictEqual(
-        server.database.raw.prepare(`
-          SELECT COUNT(*) AS count FROM runtime_sessions WHERE owner_user_id = ? AND id = ?
-        `).get(owner.id, session.id).count,
-        0,
-      );
-      const restored = server.claudeSessions.get(session.id);
-      assert.strictEqual(restored.persistenceUnavailable, undefined);
-      assert.strictEqual(restored.storageScope.workspaceRoot, workspaceRoot);
-      const scope = server.sessionStorageScope(owner.id, workspaceRoot);
-      assert.strictEqual(
-        (await server.sessionStore.openWorkspace(scope).loadSessions()).has(session.id),
-        true,
-      );
-      assert.strictEqual(
-        Array.from(server.workspacePersistenceErrors.keys())
-          .some((key) => key.endsWith(`legacy:${session.id}`)),
-        false,
-        'the stale unavailable-root diagnostic is retired after live recovery',
-      );
-    } finally {
-      await server.shutdown().catch(() => undefined);
-      await fs.rm(root, { recursive: true, force: true });
-    }
-  });
-
-  it('pins the orphan-usage destination before copying and never switches it on retry', async function () {
-    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'cc-web-orphan-pin-'));
-    const dataDir = path.join(root, 'data');
-    const first = path.join(root, 'first');
-    const second = path.join(root, 'second');
-    await Promise.all([
-      fs.mkdir(dataDir),
-      fs.mkdir(first),
-      fs.mkdir(second),
-    ]);
-    const server = new ClaudeCodeWebServer({
-      dataDir,
-      baseFolder: root,
-      noAuth: true,
-      port: 0,
-    });
-    try {
-      const owner = server.database.upsertGitHubUser({
-        githubId: 'stable-orphan-owner',
-        githubLogin: 'orphan-owner',
-        githubName: null,
-        email: null,
-      });
-      new UsageStore(server.database).record(
-        usageJob('deleted-session', 'turn-1', owner.id, owner.githubLogin),
-      );
-      server.database.setUserSetting(owner.id, 'selectedWorkingDir', first);
-
-      const attempted = [];
-      const prepared = [];
-      server.sessionStore.migrateLegacyOrphanUsage = (scope, legacy, ownerUserId) => {
-        attempted.push(scope.workspaceRoot);
-        prepared.push(
-          legacy.getUserSetting(ownerUserId, 'legacyUsageWorkspaceRoot.v1'),
-        );
-        return false;
-      };
-
-      await server.migrateLegacySessions(new Map());
-      server.database.setUserSetting(owner.id, 'selectedWorkingDir', second);
-      await server.migrateLegacySessions(new Map());
-
-      assert.deepStrictEqual(attempted, [first, first]);
-      assert.deepStrictEqual(
-        prepared,
-        [first, first],
-        'the durable prepare marker must exist before either copy attempt',
-      );
-      assert.strictEqual(
-        server.database.getUserSetting(owner.id, 'legacyUsageWorkspaceRoot.v1'),
-        first,
-      );
-      assert.strictEqual(
-        server.database.raw.prepare(
-          'SELECT COUNT(*) AS count FROM usage_jobs WHERE user_id = ?',
-        ).get(owner.id).count,
-        1,
-        'a failed retry keeps the legacy source',
-      );
-    } finally {
-      await server.shutdown();
-      server.saveSessionsToDisk = async () => {};
-      await fs.rm(root, { recursive: true, force: true });
-    }
-  });
 
   it('does not overwrite a non-equivalent workspace session with the same legacy id', async function () {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), 'cc-web-session-collision-'));
@@ -1255,382 +895,116 @@ describe('workspace session migration regressions', function () {
     }
   });
 
-  it('migrates and cold-restores a complete semantic legacy fixture exactly once', async function () {
-    this.timeout(30_000);
-    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'cc-web-semantic-migration-'));
+  it('cold-loads shared SQLite metadata and leaves legacy artifact decoys untouched', async function () {
+    this.timeout(60_000);
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'cc-web-cataloged-cold-load-'));
     const dataDir = path.join(root, 'data');
     const workspaceRoot = path.join(root, 'workspace');
     await Promise.all([fs.mkdir(dataDir), fs.mkdir(workspaceRoot)]);
 
-    const sessionId = 'semantic-legacy-session';
-    const turnId = 'semantic-turn';
-    const nativeSessionId = 'native-semantic-session';
-    const encryptionKey = Buffer.alloc(32, 29).toString('base64');
-    const serverOptions = {
-      dataDir,
-      baseFolder: root,
-      port: 0,
-      githubClientId: 'semantic-migration-client',
-      githubClientSecret: 'semantic-migration-secret',
-      allowedGitHubIds: 'semantic-migration-owner',
-      encryptionKey,
-    };
-    let legacyDatabase = null;
-    let firstServer = null;
-    let secondServer = null;
-    let listener = null;
+    const sessionId = 'cataloged-workspace-session';
+    let globalArtifactBytes = new Map();
+    let database = null;
+    let server = null;
+    const migratorCalls = [];
+    const originalMigrate = WorkspaceSessionArtifactMigrator.prototype.migrate;
+    const originalConfirm = WorkspaceSessionArtifactMigrator.prototype.confirm;
 
     try {
-      // Produce every source artifact through the same stores used by the
-      // pre-workspace release. Hand-authored stand-ins can miss an index or a
-      // manifest invariant and would not prove that a real installation moves.
-      legacyDatabase = new AppDatabase({ dataDir });
-      const owner = legacyDatabase.upsertGitHubUser({
-        githubId: 'semantic-migration-owner',
-        githubLogin: 'semantic-owner',
-        githubName: 'Semantic Owner',
-        email: 'semantic@example.test',
+      database = new AppDatabase({ dataDir });
+      const owner = database.upsertGitHubUser({
+        githubId: 'cataloged-cold-load-owner',
+        githubLogin: 'cataloged-cold-load-owner',
+        githubName: null,
+        email: null,
       });
-      const legacySession = sessionRecord(sessionId, owner.id, {
-        name: 'Legacy semantic chat',
-        customName: 'Migrated semantic chat',
-        workingDir: workspaceRoot,
-        surface: 'chat',
-        lastAgent: 'claude',
-        runtimeLabel: 'Claude semantic fixture',
-        nativeChatSessionId: nativeSessionId,
-        chatModelOverride: 'claude-sonnet-4',
-        chatModelPinned: 'claude-sonnet-4',
-        chatEffortOverride: 'high',
-        chatPlanMode: true,
-        tabOpen: true,
-        tabOrder: 0,
-      });
-      const legacySessionStore = new SessionStore({ database: legacyDatabase });
+      globalArtifactBytes = new Map([
+        [path.join(dataDir, String(owner.id), `${sessionId}.jsonl`), 'global chat decoy\n'],
+        [path.join(dataDir, 'transcripts', String(owner.id), `${sessionId}.md`), 'global transcript decoy\n'],
+        [path.join(dataDir, 'history', String(owner.id), `${sessionId}.log`), 'global history decoy\n'],
+      ]);
+      const ownerKey = createHash('sha256')
+        .update(`cc-web-session-owner:v1:${owner.githubId}`)
+        .digest('hex');
+      const scope = { workspaceRoot, ownerKey };
+      const globalStore = new SessionStore({ database, scopedGlobalStore: true });
+      await globalStore.loadSessions();
+      assert.strictEqual(await globalStore.saveSessions(new Map([
+        [sessionId, sessionRecord(sessionId, owner.id, {
+          name: 'Shared SQLite authority',
+          workingDir: workspaceRoot,
+          storageScope: scope,
+          surface: 'chat',
+        })],
+      ])), true);
+      const projectSessionDir = path.join(
+        workspaceRoot, '.cc-web', 'sessions', ownerKey, sessionId,
+      );
+      await fs.mkdir(projectSessionDir, { recursive: true });
+      await fs.writeFile(
+        path.join(workspaceRoot, '.cc-web', '.gitignore'),
+        '# Written by code-agents-webcli. Workspace session artefacts are local.\n*\n',
+      );
+      await fs.writeFile(path.join(projectSessionDir, 'transcript.md'), 'project transcript authority\n');
+      for (const [file, bytes] of globalArtifactBytes) {
+        await fs.mkdir(path.dirname(file), { recursive: true });
+        await fs.writeFile(file, bytes);
+      }
+      database.close();
+      database = null;
+
+      // Any automatic legacy orchestration is a regression. Shared app.sqlite
+      // metadata and the already-local project artifact tree are authoritative.
+      WorkspaceSessionArtifactMigrator.prototype.migrate = async function (ref) {
+        migratorCalls.push(`migrate:${ref.id}`);
+        throw new Error('automatic legacy artifact migration must not run');
+      };
+      WorkspaceSessionArtifactMigrator.prototype.confirm = async function (ref) {
+        migratorCalls.push(`confirm:${ref.id}`);
+        throw new Error('automatic legacy artifact confirmation must not run');
+      };
+
+      server = new ClaudeCodeWebServer({ dataDir, baseFolder: root, noAuth: true, port: 0 });
+      await server.loadPersistedSessions();
+
+      assert.deepStrictEqual(migratorCalls, []);
+      const restored = server.claudeSessions.get(sessionId);
+      assert.ok(restored, 'cold startup loads the shared metadata row');
+      assert.strictEqual(restored.name, 'Shared SQLite authority');
+      assert.deepStrictEqual(restored.storageScope, scope);
       assert.strictEqual(
-        await legacySessionStore.saveSessions(new Map([[sessionId, legacySession]])),
-        true,
+        server.database.raw.prepare(`
+          SELECT name FROM runtime_sessions WHERE owner_user_id = ? AND id = ?
+        `).get(owner.id, sessionId).name,
+        'Shared SQLite authority',
+        'the shared global row remains authoritative',
       );
-
-      const legacyRef = { id: sessionId, ownerUserId: owner.id };
-      const chatStore = new ChatStore({ storageDir: dataDir });
-      const fixtureEvents = (await fs.readFile(
-        path.join(__dirname, 'fixtures', 'chat', 'store-events.jsonl'),
-        'utf8',
-      )).trim().split('\n').map((line) => JSON.parse(line));
-      fixtureEvents[0] = {
-        ...fixtureEvents[0],
-        nativeSessionId,
-        cwd: workspaceRoot,
-      };
-      const pendingQuestion = {
-        requestId: 'semantic-question',
-        origin: 'structured_handoff',
-        question: 'Which migration result should be retained?',
-        header: 'Migration choice',
-        multiSelect: false,
-        options: [
-          { optionId: 'complete', label: 'Complete', description: 'Keep every artifact.' },
-          { optionId: 'partial', label: 'Partial', description: 'Keep only the chat log.' },
-        ],
-        ts: 1013,
-      };
-      await chatStore.append(legacyRef, [
-        ...fixtureEvents,
-        { t: 'question', seq: 14, ts: 1013, request: pendingQuestion },
-      ]);
-      const planDocument = {
-        markdown: '# Durable migration plan\n\n- Preserve every semantic store.\n- Reopen cold.',
-        revision: 3,
-        ts: 1014,
-      };
-      await chatStore.setPlanDocument(legacyRef, planDocument);
-
-      const transcriptStore = new TranscriptStore({ storageDir: dataDir });
-      transcriptStore.appendOutput(legacyRef, 'semantic transcript: command output survives\n');
-      assert.match(
-        (await transcriptStore.readTranscriptChunks(legacyRef)).join(''),
-        /command output survives/,
+      assert.strictEqual(
+        await fs.readFile(path.join(projectSessionDir, 'transcript.md'), 'utf8'),
+        'project transcript authority\n',
       );
-
-      const historyStore = new HistoryStore({ storageDir: dataDir });
-      const historyLines = [
-        'semantic history line one',
-        'semantic history line two',
-      ];
-      historyStore.append(legacyRef, historyLines);
-      assert.strictEqual((await historyStore.stat(legacyRef)).totalLines, historyLines.length);
-
-      const firstPng = Buffer.from([
-        0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
-        0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
-      ]);
-      const pasteStore = new PasteStore({
-        storageDir: dataDir,
-        now: () => new Date('2026-08-01T10:02:00.000Z'),
-        randomId: () => 'semanticpaste',
-      });
-      const firstPaste = await pasteStore.save(
-        { ...legacyRef, workingDir: workspaceRoot },
-        firstPng,
-      );
-      assert.deepStrictEqual(await fs.readFile(firstPaste.absolutePath), firstPng);
-
-      const usageStore = new UsageStore(legacyDatabase);
-      const usageId = usageStore.record(usageJob(
-        sessionId,
-        turnId,
-        owner.id,
-        owner.githubLogin,
-        {
-          nativeSessionId,
-          model: 'claude-sonnet-4',
-          modelTurns: 3,
-          toolCalls: 3,
-          inputTokens: 170,
-          outputTokens: 65,
-          cacheReadTokens: 20,
-          cacheWriteTokens: 4,
-          reasoningTokens: 12,
-          totalTokens: 271,
-          costUsd: 0.031,
-          tools: [
-            { tool: 'Read', calls: 2 },
-            { tool: 'Bash', calls: 1 },
-          ],
-          models: [
-            {
-              model: 'claude-sonnet-4', calls: 2,
-              inputTokens: 150, outputTokens: 60,
-              cacheReadTokens: 20, cacheWriteTokens: 4, costUsd: 0.026,
-            },
-            {
-              model: 'claude-haiku-3-5', calls: 1,
-              inputTokens: 20, outputTokens: 5,
-              cacheReadTokens: null, cacheWriteTokens: null, costUsd: 0.005,
-            },
-          ],
-        },
-      ));
-
-      const legacyArtifactPaths = [
-        path.join(dataDir, String(owner.id), `${sessionId}.jsonl`),
-        path.join(dataDir, String(owner.id), `${sessionId}.idx`),
-        path.join(dataDir, String(owner.id), `${sessionId}.plan`),
-        path.join(dataDir, 'transcripts', String(owner.id), `${sessionId}.md`),
-        path.join(dataDir, 'history', String(owner.id), `${sessionId}.log`),
-        path.join(dataDir, 'history', String(owner.id), `${sessionId}.idx`),
-        path.join(dataDir, 'pastes', String(owner.id), `${sessionId}.json`),
-      ];
-      for (const source of legacyArtifactPaths) {
-        assert.strictEqual(await fileExists(source), true, `real legacy fixture missing ${source}`);
-      }
-
-      legacyDatabase.close();
-      legacyDatabase = null;
-
-      firstServer = new ClaudeCodeWebServer(serverOptions);
-      await firstServer.loadPersistedSessions();
-      const migrated = firstServer.claudeSessions.get(sessionId);
-      assert.ok(migrated, 'the migrated chat is published after verified cutover');
-      assert.strictEqual(migrated.persistenceUnavailable, undefined);
-      assert.strictEqual(migrated.nativeChatSessionId, nativeSessionId);
-      assert.strictEqual(migrated.chatPlanMode, true);
-      assert.strictEqual(migrated.chatEffortOverride, 'high');
-      assert.strictEqual(migrated.customName, 'Migrated semantic chat');
-      const scope = migrated.storageScope;
-      assert.ok(scope);
-      assert.strictEqual(scope.workspaceRoot, workspaceRoot);
-
-      const workspaceStore = firstServer.sessionStore.openWorkspace(scope);
-      const localDb = workspaceStore.database.raw;
-      const localCounts = () => ({
-        sessions: localDb.prepare(
-          'SELECT COUNT(*) AS count FROM runtime_sessions WHERE owner_key = ? AND id = ?',
-        ).get(scope.ownerKey, sessionId).count,
-        usage: localDb.prepare(
-          'SELECT COUNT(*) AS count FROM usage_jobs WHERE owner_key = ? AND id = ?',
-        ).get(scope.ownerKey, usageId).count,
-        models: localDb.prepare(
-          'SELECT COUNT(*) AS count FROM usage_job_models WHERE owner_key = ? AND job_id = ?',
-        ).get(scope.ownerKey, usageId).count,
-        tools: localDb.prepare(
-          'SELECT COUNT(*) AS count FROM usage_job_tools WHERE owner_key = ? AND job_id = ?',
-        ).get(scope.ownerKey, usageId).count,
-      });
-      assert.deepStrictEqual(localCounts(), { sessions: 1, usage: 1, models: 2, tools: 2 });
-
-      const sessionDir = path.join(
-        workspaceRoot,
-        '.cc-web',
-        'sessions',
-        scope.ownerKey,
-        sessionId,
-      );
-      for (const target of [
-        'chat.jsonl', 'chat.idx', 'chat.plan', 'transcript.md',
-        'history.log', 'history.idx', 'paste-manifest.json',
-      ]) {
-        assert.strictEqual(await fileExists(path.join(sessionDir, target)), true, `missing ${target}`);
-      }
-
-      // Retrying the real coordinator after the source authority has gone is
-      // a no-op: it neither duplicates child rows nor prunes the completed row.
-      const retrySource = await firstServer.sessionStore.loadLegacySessions(owner.id);
-      assert.strictEqual(retrySource.size, 0);
-      await firstServer.migrateLegacySessions(retrySource);
-      assert.deepStrictEqual(localCounts(), { sessions: 1, usage: 1, models: 2, tools: 2 });
-
-      const assertNoGlobalResidue = async (server) => {
-        assert.strictEqual(server.database.raw.prepare(
-          'SELECT COUNT(*) AS count FROM runtime_sessions WHERE owner_user_id = ? AND id = ?',
-        ).get(owner.id, sessionId).count, 0);
-        assert.strictEqual(server.database.raw.prepare(
-          'SELECT COUNT(*) AS count FROM usage_jobs WHERE user_id = ? AND id = ?',
-        ).get(owner.id, usageId).count, 0);
-        assert.strictEqual(server.database.raw.prepare(
-          'SELECT COUNT(*) AS count FROM usage_job_models WHERE job_id = ?',
-        ).get(usageId).count, 0);
-        assert.strictEqual(server.database.raw.prepare(
-          'SELECT COUNT(*) AS count FROM usage_job_tools WHERE job_id = ?',
-        ).get(usageId).count, 0);
-        for (const source of legacyArtifactPaths) {
-          assert.strictEqual(await fileExists(source), false, `legacy source remains at ${source}`);
-          const backup = path.join(
-            path.dirname(source),
-            `.${path.basename(source)}.ccweb-session-migration.bak`,
-          );
-          assert.strictEqual(await fileExists(backup), false, `rollback backup remains at ${backup}`);
-        }
+      assert.strictEqual(await fileExists(path.join(workspaceRoot, '.cc-web', 'session-state.sqlite')), false);
+      for (const [file, bytes] of globalArtifactBytes) {
+        assert.strictEqual(await fs.readFile(file, 'utf8'), bytes);
         assert.strictEqual(
-          await fileExists(path.join(sessionDir, '.legacy-artifact-migration.v1.json')),
+          await fileExists(path.join(
+            path.dirname(file),
+            `.${path.basename(file)}.ccweb-session-migration.bak`,
+          )),
           false,
-          'the confirmed per-session migration marker is retired',
+          `cold discovery must not prepare a rollback copy for ${file}`,
         );
-      };
-      await assertNoGlobalResidue(firstServer);
-
-      await firstServer.shutdown();
-      firstServer.saveSessionsToDisk = async () => {};
-      firstServer = null;
-
-      // A brand-new process model has only the global owner/root catalog and
-      // the workspace archive. It must rediscover and reopen the whole chat.
-      secondServer = new ClaudeCodeWebServer(serverOptions);
-      await secondServer.loadPersistedSessions();
-      const restored = secondServer.claudeSessions.get(sessionId);
-      assert.ok(restored, 'cold startup rediscovers the workspace-local session');
-      assert.strictEqual(restored.storageScope.ownerKey, scope.ownerKey);
-      assert.strictEqual(restored.tabOpen, true);
-      assert.strictEqual(restored.chatModelOverride, 'claude-sonnet-4');
-
-      const snapshot = await secondServer.chatStore.snapshot(restored, { runtime: 'claude' });
-      assert.match(JSON.stringify(snapshot.messages), /Fix the login bug please/);
-      assert.deepStrictEqual(
-        snapshot.pendingQuestions.map((question) => question.requestId),
-        [pendingQuestion.requestId],
-      );
-      assert.deepStrictEqual(await secondServer.chatStore.planDocument(restored), planDocument);
-      assert.strictEqual(
-        (await secondServer.transcriptStore.readTranscriptChunks(restored)).join(''),
-        'semantic transcript: command output survives\n',
-      );
-      assert.deepStrictEqual(
-        (await secondServer.historyStore.read(restored, 0, 20)).lines,
-        historyLines,
-      );
-
-      const restoredUsage = secondServer.usageStore.job(usageId, {
-        userId: owner.id,
-        scope: 'self',
-      });
-      assert.ok(restoredUsage);
-      assert.strictEqual(restoredUsage.totalTokens, 271);
-      assert.deepStrictEqual(restoredUsage.tools.map((tool) => ({ ...tool })), [
-        { tool: 'Read', calls: 2 },
-        { tool: 'Bash', calls: 1 },
-      ]);
-      assert.deepStrictEqual(restoredUsage.models, [
-        {
-          model: 'claude-sonnet-4', calls: 2,
-          inputTokens: 150, outputTokens: 60,
-          cacheReadTokens: 20, cacheWriteTokens: 4, costUsd: 0.026,
-        },
-        {
-          model: 'claude-haiku-3-5', calls: 1,
-          inputTokens: 20, outputTokens: 5,
-          cacheReadTokens: null, cacheWriteTokens: null, costUsd: 0.005,
-        },
-      ]);
-      assert.deepStrictEqual(
-        secondServer.usageStore.export({ userId: owner.id, scope: 'self' })
-          .jobs.map((job) => job.id),
-        [usageId],
-      );
-
-      const migratedManifest = JSON.parse(await fs.readFile(
-        path.join(sessionDir, 'paste-manifest.json'),
-        'utf8',
-      ));
-      assert.strictEqual(migratedManifest.entries.length, 1);
-      assert.strictEqual(migratedManifest.entries[0].path, firstPaste.absolutePath);
-      assert.deepStrictEqual(await fs.readFile(firstPaste.absolutePath), firstPng);
-      const secondPng = Buffer.from([
-        0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
-        0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01,
-      ]);
-      await secondServer.pasteStore.save(restored, secondPng);
-      assert.strictEqual(
-        JSON.parse(await fs.readFile(path.join(sessionDir, 'paste-manifest.json'), 'utf8'))
-          .entries.length,
-        2,
-        'the cold store reads and extends the migrated manifest',
-      );
-
-      const authSessionId = 'semantic-migration-auth-session';
-      secondServer.database.createAuthSession(
-        authSessionId,
-        owner.id,
-        new Date(Date.now() + 60_000),
-      );
-      listener = http.createServer(secondServer.app);
-      await new Promise((resolve) => listener.listen(0, '127.0.0.1', resolve));
-      const baseUrl = `http://127.0.0.1:${listener.address().port}`;
-      const headers = { Cookie: `code_agents_webcli_session=${authSessionId}` };
-
-      const listResponse = await fetch(`${baseUrl}/api/sessions/list`, { headers });
-      assert.strictEqual(listResponse.status, 200);
-      assert.deepStrictEqual(
-        (await listResponse.json()).sessions.map((session) => session.id),
-        [sessionId],
-      );
-
-      const exportResponse = await fetch(
-        `${baseUrl}/api/sessions/${encodeURIComponent(sessionId)}/export.md`,
-        { headers },
-      );
-      assert.strictEqual(exportResponse.status, 200);
-      const exported = await exportResponse.text();
-      assert.match(exported, /# Migrated semantic chat/);
-      assert.match(exported, /semantic history line one/);
-      assert.match(exported, /semantic history line two/);
-
-      await assertNoGlobalResidue(secondServer);
+      }
     } finally {
-      if (listener) {
-        listener.closeAllConnections?.();
-        await new Promise((resolve) => listener.close(() => resolve()));
+      WorkspaceSessionArtifactMigrator.prototype.migrate = originalMigrate;
+      WorkspaceSessionArtifactMigrator.prototype.confirm = originalConfirm;
+      if (server) {
+        server.saveSessionsToDisk = async () => true;
+        await server.shutdown().catch(() => undefined);
       }
-      if (secondServer) {
-        await secondServer.shutdown().catch(() => undefined);
-        secondServer.saveSessionsToDisk = async () => {};
-      }
-      if (firstServer) {
-        await firstServer.shutdown().catch(() => undefined);
-        firstServer.saveSessionsToDisk = async () => {};
-      }
-      legacyDatabase?.close();
+      try { database?.close(); } catch { /* Already closed. */ }
       await fs.rm(root, { recursive: true, force: true });
     }
   });
+
 });

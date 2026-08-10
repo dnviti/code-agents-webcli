@@ -10,7 +10,7 @@ You do not need a C++ toolchain, and there is no `npm rebuild` step.
 
 | | |
 | --- | --- |
-| **Node** | 24.16 or newer. The app uses `node:sqlite` serialization APIs to publish the workspace database safely on every supported desktop host. Check with `node --version`. |
+| **Node** | 24.16 or newer. The app uses `node:sqlite` for its shared per-user application database. Check with `node --version`. |
 | **A GitHub OAuth App** | Sign-in is GitHub-only, and the app cannot serve a login page without one. [Set it up first](github-oauth.md) — it takes about a minute. |
 | **`openssl`** | On `PATH`. The server shells out to it to generate its own certificate authority on first start. Almost every system already has it; `dnf install openssl` / `apt install openssl` if not. Not needed if you bring [your own certificate](https-and-certificates.md#using-your-own-certificate). |
 | **A browser** | Anything current. The UI installs as a PWA if you want it to. |

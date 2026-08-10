@@ -184,29 +184,29 @@ export interface ProjectManagerDeps {
   deleteProjectSessions?(projectId: string, ownerUserId: number): Promise<void> | void;
   /** Stop attached runtimes and detach their live claims without deleting history. */
   suspendProjectSessions?(projectId: string, ownerUserId: number): Promise<void> | void;
-  /** Flush and close workspace-local SQLite handles before a checkout is removed. */
-  /** Return exact authority when a loaded archive was suspended and is mandatory. */
+  /**
+   * Flush global session metadata and project artifacts before checkout removal,
+   * returning the exact artifact-directory authority when preservation is mandatory.
+   */
   beforeWorkspaceReplacement?(
     project: Project,
   ): Promise<boolean | ProjectWorkspaceReplacementAuthority> | boolean | ProjectWorkspaceReplacementAuthority;
-  /** Reopen workspace-local stores while binding SQLite to retained authority. */
+  /** Reauthorise project-file stores against the retained artifact directory. */
   afterWorkspaceRestored?(
     project: Project,
     expected?: WorkspaceSessionStorageIdentity,
   ): Promise<WorkspaceSessionStorageIdentity | void> | WorkspaceSessionStorageIdentity | void;
-  /** Reverify the reopened live lease after the durable intent is retired. */
+  /** Reverify the restored artifact directory after the durable intent is retired. */
   confirmWorkspaceRestored?(
     project: Project,
     expected: WorkspaceSessionStorageIdentity,
   ): Promise<WorkspaceSessionStorageIdentity> | WorkspaceSessionStorageIdentity;
-  /** Close a reopened store when final authority verification fails. */
+  /** Keep project-file access unavailable when final authority verification fails. */
   rejectWorkspaceRestore?(project: Project, reason: string): Promise<void> | void;
-  /** Close the empty archive immediately before explicit project deletion. */
+  /** Release cached artifact handles immediately before explicit project deletion. */
   beforeWorkspaceDeletion?(project: Project): Promise<void> | void;
-  /** Legacy import rows make physical replacement unsafe until migration succeeds. */
-  hasLegacyProjectSessions?(projectId: string, ownerUserId: number): boolean;
-  /** Binary rollback authority may survive after the legacy SQLite row was cut over. */
-  hasIncompleteProjectSessionMigration?(project: Project): Promise<boolean> | boolean;
+  /** Refuse destructive replacement while the authoritative archive is unavailable. */
+  hasUnavailableProjectSessionStorage?(project: Project): Promise<boolean> | boolean;
   /** Attached clients, commands or agent turns not yet represented by DB active=1. */
   hasLiveProjectWork?(projectId: string): boolean;
   fetch?: FetchLike;
@@ -248,23 +248,20 @@ export class ProjectManager {
     this.now = deps.now || (() => new Date());
   }
 
-  private async projectSessionMigrationIsIncomplete(project: Project): Promise<boolean> {
+  private async projectSessionStorageIsUnavailable(project: Project): Promise<boolean> {
     try {
-      return Boolean(
-        this.deps.hasLegacyProjectSessions?.(project.id, project.ownerUserId)
-        || await this.deps.hasIncompleteProjectSessionMigration?.(project),
-      );
+      return Boolean(await this.deps.hasUnavailableProjectSessionStorage?.(project));
     } catch (error) {
       throw new ProjectWorkspaceSessionStorageError(
-        `Project session migration could not be verified: ${(error as Error).message}`,
+        `Project session storage could not be verified: ${(error as Error).message}`,
       );
     }
   }
 
-  private async assertProjectSessionMigrationComplete(project: Project): Promise<void> {
-    if (await this.projectSessionMigrationIsIncomplete(project)) {
+  private async assertProjectSessionStorageAvailable(project: Project): Promise<void> {
+    if (await this.projectSessionStorageIsUnavailable(project)) {
       throw new ProjectWorkspaceSessionStorageError(
-        'Project session migration is incomplete; restore the workspace and retry before replacing it',
+        'Project session storage is unavailable; restore the archive and retry before replacing it',
       );
     }
   }
@@ -1101,7 +1098,7 @@ export class ProjectManager {
   }
 
   /**
-   * Stable host root for workspace-local session data.
+   * Stable host root for project-specific session artifacts.
    *
    * This deliberately performs no lifecycle admission. Project removal already
    * owns `exclusiveFor(projectId)` when it tears sessions down, so attempting to
@@ -1193,7 +1190,7 @@ export class ProjectManager {
 
     if (input.repoUrl !== undefined && nextRepo !== project.repoUrl && project.repoUrl) {
       try {
-        await this.assertProjectSessionMigrationComplete(project);
+        await this.assertProjectSessionStorageAvailable(project);
       } catch (error) {
         return { ok: false, reason: 'preserve_failed', detail: (error as Error).message };
       }
@@ -2078,7 +2075,7 @@ export class ProjectManager {
       const current = this.deps.store.getProject(project.id) as Project;
       const requiresWorkspaceRebuild = current.rebuildRequired;
       if (requiresWorkspaceRebuild) {
-        await this.assertProjectSessionMigrationComplete(current);
+        await this.assertProjectSessionStorageAvailable(current);
       }
       if (!requiresWorkspaceRebuild) {
         await this.restoreWorkspaceSessionStorage(current, owner);
@@ -2425,12 +2422,12 @@ export class ProjectManager {
     beforeDestroy?: () => Promise<void>,
     alreadyClaimed = false,
   ): Promise<SimpleResult> {
-    if (await this.projectSessionMigrationIsIncomplete(project)) {
-      const detail = 'Project session migration is incomplete; restore the workspace and retry before reclaiming it';
+    if (await this.projectSessionStorageIsUnavailable(project)) {
+      const detail = 'Project session storage is unavailable; restore the archive and retry before reclaiming it';
       // `tryClaimIdleReclaim` may already have moved the durable row into the
       // counted transition state. Put it back exactly where the claim found it
-      // (running/stopped/blocked/reclaiming) and expose the migration reason;
-      // an import guard must not strand an idle project in a fake in-flight
+      // (running/stopped/blocked/reclaiming) and expose the storage reason; the
+      // archive guard must not strand an idle project in a fake in-flight
       // reclaim or make a still-running runtime uncounted.
       this.deps.store.setRebuildRequired(project.id, project.rebuildRequired);
       this.deps.store.setState(project.id, project.state, detail);
@@ -2636,7 +2633,7 @@ export class ProjectManager {
   }
 
   private async clearCheckout(project: Project, owner: EnvironmentOwner): Promise<void> {
-    await this.assertProjectSessionMigrationComplete(project);
+    await this.assertProjectSessionStorageAvailable(project);
     const authority = await this.workspaceReplacementAuthority(project);
     const archiveRequired = authority.required;
     const expectedStorage = authority.identity;
@@ -2646,11 +2643,11 @@ export class ProjectManager {
     } catch (error) {
       replacementError = error;
     }
-    // `.cc-web` now lives beside the disposable checkout, not inside it. Once
-    // the old checkout is gone the retained archive is already back in its
-    // canonical place, so reopen it immediately even if the following clone
-    // later fails. This also prevents repository changes from leaving an
-    // otherwise healthy session database suspended until the next build.
+    // `.cc-web` is staged independently from the disposable checkout bytes.
+    // Once the old checkout is gone the retained artifact tree is already back
+    // in its canonical place, so re-enable access immediately even if the
+    // following clone later fails. This also prevents repository changes from
+    // leaving healthy project-file persistence suspended until the next build.
     try {
       await this.restoreWorkspaceSessionStorage(project, owner, archiveRequired, expectedStorage);
     } catch (restoreError) {
@@ -2725,7 +2722,7 @@ export class ProjectManager {
   }
 
   private async wipe(project: Project): Promise<void> {
-    await this.assertProjectSessionMigrationComplete(project);
+    await this.assertProjectSessionStorageAvailable(project);
     const owner = this.owner(project.ownerUserId);
     const root = this.projects.worktreePath(project, owner);
     // `project.id` is a UUID from our store, nevertheless retain the parent

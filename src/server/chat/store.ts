@@ -358,6 +358,7 @@ export class ChatStore implements ChatStoreLike {
 
   private readonly states = new Map<string, SessionState>();
   private readonly queues = new Map<string, Promise<unknown>>();
+  private readonly writeErrors = new Map<string, unknown>();
   /**
    * Openings already read, so listing every conversation is not a scan per row.
    *
@@ -929,13 +930,18 @@ export class ChatStore implements ChatStoreLike {
         throw new ChatStoreAppendError('not_committed', error);
       }
     });
-    void write.catch(() => undefined);
+    void write.then(
+      () => this.writeErrors.delete(base),
+      (error) => this.writeErrors.set(base, error),
+    );
     return write;
   }
 
   async flush(session: ChatSessionRef): Promise<void> {
     const base = this.basePath(session);
     await this.enqueue(base, async () => undefined);
+    const failed = this.writeErrors.get(base);
+    if (failed) throw failed;
   }
 
   /** Whether the log ends with every byte of the attempted append batch. */
@@ -2161,6 +2167,7 @@ export class ChatStore implements ChatStoreLike {
       );
     });
     this.queues.delete(base);
+    this.writeErrors.delete(base);
   }
 }
 

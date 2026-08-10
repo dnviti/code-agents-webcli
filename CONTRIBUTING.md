@@ -92,9 +92,15 @@ Run `npm run verify:install` before touching anything in `package.json`,
 
 ## Persistence model
 
-- App settings, users, auth sessions and runtime sessions live in SQLite.
-- Bulk data does not. Scrollback, chat events and transcripts are append-only
-  files with fixed-width indexes.
+- One per-user `app.sqlite` owns installation settings, users, auth sessions,
+  runtime/session metadata, composer drafts, usage accounting and immutable
+  references to each session's project storage scope.
+- Projects do not contain SQLite databases. Bulk project data lives in the
+  authorised workspace's `.cc-web/`: scrollback, chat events and transcripts
+  are append-only files with fixed-width indexes, alongside pasted images and
+  attachments.
+- Production has no automatic migration from older storage layouts. Leave
+  unrecognised legacy files untouched.
 - Keep schema changes backward-compatible where possible.
 - If you change persisted structures, update the tests and the docs in the same
   change.

@@ -42,6 +42,7 @@ export class TranscriptStore implements TranscriptStoreLike {
   readonly replayLimitBytes: number;
   readonly maxTranscriptBytes: number;
   private readonly pendingWrites: Map<string, Promise<void>>;
+  private readonly writeErrors = new Map<string, unknown>();
   private readonly appendedSinceCheck: Map<string, number>;
   private readonly pendingBatches = new Map<string, { session: TranscriptSessionRef; chunks: Buffer[]; check: boolean }>();
 
@@ -82,6 +83,7 @@ export class TranscriptStore implements TranscriptStoreLike {
       await fs.promises.mkdir(path.dirname(transcriptPath), { recursive: true });
     }
     await appendSessionFile(transcriptPath, '');
+    this.writeErrors.delete(transcriptPath);
     return visiblePath;
   }
 
@@ -96,7 +98,8 @@ export class TranscriptStore implements TranscriptStoreLike {
 
     const transcriptPath = this.getTranscriptAccessPath(session);
     const buffered = this.pendingBatches.get(transcriptPath);
-    const previous = this.pendingWrites.get(transcriptPath) || Promise.resolve();
+    const previous = this.pendingWrites.get(transcriptPath)?.catch(() => undefined)
+      || Promise.resolve();
 
     // Only stat once per ~1MB appended rather than on every PTY chunk.
     const appended =
@@ -134,11 +137,15 @@ export class TranscriptStore implements TranscriptStoreLike {
       }
     });
 
-    this.pendingWrites.set(transcriptPath, next.catch(() => undefined));
+    this.pendingWrites.set(transcriptPath, next);
 
-    void next.catch((error) => {
-      console.error(`Failed to append transcript for session ${session.id}:`, error);
-    });
+    void next.then(
+      () => this.writeErrors.delete(transcriptPath),
+      (error) => {
+        this.writeErrors.set(transcriptPath, error);
+        console.error(`Failed to append transcript for session ${session.id}:`, error);
+      },
+    );
   }
 
   async readTranscriptChunks(session: TranscriptSessionRef): Promise<string[]> {
@@ -216,6 +223,7 @@ export class TranscriptStore implements TranscriptStoreLike {
       console.error(`Failed to delete transcript for session ${session.id}:`, error);
     } finally {
       this.pendingWrites.delete(transcriptPath);
+      this.writeErrors.delete(transcriptPath);
     }
   }
 
@@ -225,9 +233,9 @@ export class TranscriptStore implements TranscriptStoreLike {
 
   private async flushPath(transcriptPath: string): Promise<void> {
     const pending = this.pendingWrites.get(transcriptPath);
-    if (pending) {
-      await pending.catch(() => undefined);
-    }
+    if (pending) await pending;
+    const failed = this.writeErrors.get(transcriptPath);
+    if (failed) throw failed;
   }
 }
 

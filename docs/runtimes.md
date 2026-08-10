@@ -1155,12 +1155,13 @@ workspace even when it runs in a subfolder or a container-only path; a child
 shell inherits its owning conversation's scope. Changing cwd later therefore
 does not move a conversation between archives.
 
-Session/tab state, conversation events and indexes, Plan and question state,
-terminal transcript and history, paste metadata, and per-turn usage are kept
-under that scope's `.cc-web/`. The server combines authorised workspace
-databases for account-wide tab, conversation and usage views, and lazy-loads an
-authorised folder when it is opened. See [Where state
-lives](configuration.md#where-state-lives) for the layout, migration and backup
+Session/tab metadata, composer drafts, per-turn usage and the immutable scope
+reference are kept in the shared per-user `app.sqlite`. Conversation events and
+indexes, Plan documents and question state, terminal transcript and history,
+paste data and attachment bodies are kept under that scope's `.cc-web/`. The
+server queries the shared database for account-wide tab, conversation and usage
+views, and revalidates an authorised artifact root before using it. See [Where state
+lives](configuration.md#where-state-lives) for the layout, discovery and backup
 requirements.
 
 The file browser is bounded by the working directory chosen during

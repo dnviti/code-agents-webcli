@@ -12,7 +12,7 @@ const { openDatabase } = require('../dist/server/services/sqlite.js');
 describe('packaged desktop workspace persistence smoke seam', function () {
   this.timeout(30_000);
 
-  it('round-trips a binary attachment and leaves the session only in workspace .cc-web', async function () {
+  it('keeps metadata in shared SQLite and binary artifacts in workspace .cc-web', async function () {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cc-web-packaged-smoke-test-'));
     const dataDir = path.join(root, 'data');
     const workspaceRoot = path.join(root, 'workspace');
@@ -42,13 +42,14 @@ describe('packaged desktop workspace persistence smoke seam', function () {
           dataDir,
         });
         assert.equal(result.bytes, SMOKE_PAYLOAD_BYTES);
-        assert.equal(result.mode, 'workspace-only');
-        assert.equal(result.workspaceOnly, true);
+        assert.equal(result.mode, 'shared-sqlite-project-artifacts');
+        assert.equal(result.workspaceOnly, false);
         assert.ok(result.attachmentPath.startsWith(path.join(workspaceRoot, '.cc-web') + path.sep));
         assert.ok(result.pastePath.startsWith(path.join(workspaceRoot, '.cc-web') + path.sep));
         assert.ok(result.chatLogPath.startsWith(path.join(workspaceRoot, '.cc-web') + path.sep));
         assert.ok(result.chatIndexPath.startsWith(path.join(workspaceRoot, '.cc-web') + path.sep));
-        assert.ok(fs.existsSync(result.sessionDatabase));
+        assert.equal(fs.existsSync(result.sessionDatabase), false);
+        assert.ok(fs.existsSync(result.globalDatabase));
         assert.ok(fs.existsSync(path.join(result.sessionDirectory, 'transcript.md')));
         assert.ok(fs.existsSync(result.chatLogPath));
         assert.ok(fs.existsSync(result.chatIndexPath));
@@ -57,21 +58,13 @@ describe('packaged desktop workspace persistence smoke seam', function () {
         await server.shutdown().catch(() => undefined);
       }
 
-      const workspaceDatabase = openDatabase(result.sessionDatabase);
-      try {
-        const row = workspaceDatabase
-          .prepare('SELECT COUNT(*) AS count FROM runtime_sessions WHERE id = ?')
-          .get(result.sessionId);
-        assert.equal(row.count, 1);
-      } finally {
-        workspaceDatabase.close();
-      }
       const globalDatabase = openDatabase(path.join(dataDir, 'app.sqlite'));
       try {
-        assert.equal(
-          globalDatabase.prepare('SELECT COUNT(*) AS count FROM runtime_sessions').get().count,
-          0,
-        );
+        const row = globalDatabase.prepare(`
+          SELECT storage_workspace_root AS root
+            FROM runtime_sessions WHERE id = ?
+        `).get(result.sessionId);
+        assert.equal(path.resolve(row.root), fs.realpathSync(workspaceRoot));
       } finally {
         globalDatabase.close();
       }

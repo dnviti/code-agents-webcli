@@ -91,7 +91,7 @@ export interface AttachmentSessionRef {
   projectId: string | null | undefined;
   /** Project paths use a different namespace and need a container-aware store. */
   projectWorkingDirKind: 'host' | 'container' | undefined;
-  /** Immutable workspace that owns both metadata and attachment bytes. */
+  /** Immutable workspace that owns the attachment bytes named by global metadata. */
   storageScope?: SessionStorageScope;
   persistenceUnavailable?: string;
 }
