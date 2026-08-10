@@ -910,22 +910,29 @@ async function copyAndPublish(
           });
         }
       }
-      const sourceAfter = sourceLease?.entryMutationPolicy === 'cwd-helper'
-        ? statWorkspaceCwdFile(
+      let sourceStayedStable: boolean;
+      let sourceAfterSize: bigint;
+      if (sourceLease?.entryMutationPolicy === 'cwd-helper') {
+        const sourceAfter = statWorkspaceCwdFile(
           sourceLease,
           sourceName!,
           { dev: sourceBefore.dev, ino: sourceBefore.ino },
-        )
-        : fs.fstatSync(sourceHandle.fd, { bigint: true });
-      const sourceStayedStable = sourceLease?.entryMutationPolicy === 'cwd-helper'
-        ? sourceAfter.dev === sourceBefore.dev
+        );
+        sourceAfterSize = BigInt(sourceAfter.size);
+        sourceStayedStable = sourceAfter.mtimeNs !== undefined
+          && sourceAfter.ctimeNs !== undefined
+          && sourceAfter.dev === sourceBefore.dev
           && sourceAfter.ino === sourceBefore.ino
-          && sourceAfter.size === sourceBefore.size
-          && sourceAfter.nlink === sourceBefore.nlink
-          && sourceAfter.mtimeNs === sourceBefore.mtimeNs
-          && sourceAfter.ctimeNs === sourceBefore.ctimeNs
-        : stableFile(sourceBefore, sourceAfter as BigFileStat);
-      if (!sourceStayedStable || BigInt(offset) !== sourceAfter.size) {
+          && sourceAfterSize === sourceBefore.size
+          && BigInt(sourceAfter.nlink) === sourceBefore.nlink
+          && BigInt(sourceAfter.mtimeNs) === sourceBefore.mtimeNs
+          && BigInt(sourceAfter.ctimeNs) === sourceBefore.ctimeNs;
+      } else {
+        const sourceAfter = fs.fstatSync(sourceHandle.fd, { bigint: true });
+        sourceAfterSize = sourceAfter.size;
+        sourceStayedStable = stableFile(sourceBefore, sourceAfter);
+      }
+      if (!sourceStayedStable || BigInt(offset) !== sourceAfterSize) {
         throw Object.assign(new Error('Source changed while it was copied'), {
           migrationReason: 'source_changed',
         });

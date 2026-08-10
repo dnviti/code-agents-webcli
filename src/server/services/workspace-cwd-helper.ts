@@ -6,6 +6,7 @@ import type { WorkspaceStorageDirectoryLease } from './workspace-session-storage
 
 const MAX_FILE_BYTES = 24 * 1024 * 1024;
 const MAX_RESPONSE_BYTES = 34 * 1024 * 1024;
+const MAX_STAT_DECIMAL_DIGITS = 32;
 const HELPER_TIMEOUT_MS = 15_000;
 let smokeReported = false;
 
@@ -72,6 +73,16 @@ export interface WorkspaceCwdHelperResult {
 
 function unsafe(message: string, cause?: unknown): NodeJS.ErrnoException {
   return Object.assign(new Error(message), { code: 'UNSAFE_WORKSPACE_STORAGE', cause });
+}
+
+function unsignedStatDecimal(value: unknown): value is string {
+  return typeof value === 'string' && value.length <= MAX_STAT_DECIMAL_DIGITS
+    && /^(?:0|[1-9]\d*)$/.test(value);
+}
+
+function signedStatDecimal(value: unknown): value is string {
+  return typeof value === 'string' && value.length <= MAX_STAT_DECIMAL_DIGITS + 1
+    && /^(?:0|-?[1-9]\d*)$/.test(value);
 }
 
 function component(value: unknown): string {
@@ -173,6 +184,16 @@ export function runWorkspaceCwdHelper(
   }
   if (response.ok !== true || (response.origin !== 'source' && response.origin !== 'app.asar')) {
     throw unsafe('Workspace entry helper returned an invalid success response');
+  }
+  for (const field of ['size', 'nlink', 'mode'] as const) {
+    if (response[field] !== undefined && !unsignedStatDecimal(response[field])) {
+      throw unsafe(`Workspace entry helper returned an invalid ${field}`);
+    }
+  }
+  for (const field of ['mtimeNs', 'ctimeNs', 'birthtimeNs'] as const) {
+    if (response[field] !== undefined && !signedStatDecimal(response[field])) {
+      throw unsafe(`Workspace entry helper returned an invalid ${field}`);
+    }
   }
   if (request.operation === 'mkdir' || request.operation === 'ensure-directory'
     || request.operation === 'inspect-directory'

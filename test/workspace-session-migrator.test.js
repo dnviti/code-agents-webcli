@@ -33,6 +33,9 @@ function nestedChildProcessProbe() {
 }
 
 function runFreshMigrationProcess({ legacyStorageDir, ref, action, cutpoint }) {
+  if (cutpoint !== undefined && cutpoint !== 'migration-retire-quarantine') {
+    throw new Error(`Unsupported migration test cutpoint: ${cutpoint}`);
+  }
   const program = `
     const childProcess = require('node:child_process');
     const payload = JSON.parse(process.argv[1]);
@@ -44,7 +47,10 @@ function runFreshMigrationProcess({ legacyStorageDir, ref, action, cutpoint }) {
           ...options,
           env: { ...options.env, CODE_AGENTS_WEBCLI_HELPER_TEST_CUTPOINT: payload.cutpoint },
         });
-        if (!result.error && (result.signal || result.status !== 0)) {
+        const marker = 'CODE_AGENTS_WEBCLI_HELPER_TEST_CUTPOINT:' + payload.cutpoint;
+        const crashed = !result.error && (result.signal !== null || result.status !== 0);
+        const reached = String(result.stderr).split(/\\r?\\n/).includes(marker);
+        if (crashed && reached) {
           process.kill(process.pid, 'SIGKILL');
         }
         return result;

@@ -10,6 +10,9 @@ const { HistoryStore } = require('../dist/server/services/history-store.js');
 const { TranscriptStore } = require('../dist/server/services/transcript-store.js');
 const { PasteStore } = require('../dist/server/services/paste-store.js');
 const { AttachmentStore } = require('../dist/server/services/attachment-store.js');
+const {
+  closeWorkspaceSessionDirectoryLeases,
+} = require('../dist/server/services/workspace-session-storage.js');
 
 const PNG = Buffer.from(
   'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==',
@@ -90,6 +93,7 @@ describe('scoped host-session durable artifact locality', function () {
 
   afterEach(function () {
     try { store.closeWorkspaces(); } catch { /* an assertion may have closed it */ }
+    closeWorkspaceSessionDirectoryLeases();
     fs.rmSync(workspace, { recursive: true, force: true });
     fs.rmSync(installationData, { recursive: true, force: true });
   });

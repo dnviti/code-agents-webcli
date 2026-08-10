@@ -504,7 +504,7 @@ describe('workspace routes', function () {
     });
 
     it('says plainly when the folder is not a repository', async function () {
-      const plain = fs.mkdtempSync(path.join(os.tmpdir(), 'workspace-plain-'));
+      const plain = fs.mkdtempSync(path.join(workspaceBase, 'workspace-plain-'));
       sessions.set('plain', sessionRecord({ id: 'plain', workingDir: plain }));
       try {
         const { body } = await get('/api/workspace/plain/git');
@@ -690,7 +690,7 @@ describe('workspace routes', function () {
       // mount are both symlinks in practice, and an unresolved root turns the
       // comparison into a relative path full of `..` that matches nothing —
       // the refusal fails open and a browser can rewrite .git/config.
-      const link = path.join(os.tmpdir(), `workspace-link-${process.pid}`);
+      const link = path.join(workspaceBase, `workspace-link-${process.pid}`);
       fs.rmSync(link, { force: true });
       fs.symlinkSync(repo, link);
       sessions.set('linked', sessionRecord({ id: 'linked', workingDir: link }));

@@ -1,5 +1,6 @@
 const assert = require('assert');
-const fs = require('fs').promises;
+const fsSync = require('fs');
+const fs = fsSync.promises;
 const http = require('http');
 const os = require('os');
 const path = require('path');
@@ -320,6 +321,10 @@ describe('workspace session migration regressions', function () {
     const projectsRoot = path.join(root, 'projects');
     await Promise.all([fs.mkdir(dataDir), fs.mkdir(projectsRoot)]);
     const server = new ClaudeCodeWebServer({ dataDir, baseFolder: root, noAuth: true, port: 0 });
+    let releaseAdmitted = () => {};
+    let originalFlush;
+    let append;
+    let replacement;
     try {
       const owner = server.database.upsertGitHubUser({
         githubId: 'project-artifact-barrier-owner', githubLogin: 'project-artifact-barrier-owner',
@@ -348,23 +353,35 @@ describe('workspace session migration regressions', function () {
       server.loadedWorkspaceScopes.add(key);
 
       const base = server.chatStore.basePath(session);
-      let releaseAdmitted;
       const admittedGate = new Promise((resolve) => { releaseAdmitted = resolve; });
       server.chatStore.queues.set(base, admittedGate);
-      const append = server.chatStore.append(session, [{
+      append = server.chatStore.append(session, [{
         t: 'message', seq: 1, id: 'admitted-message', role: 'user',
         content: 'durable before staging', at: '2026-08-05T12:00:00.000Z',
       }]);
 
-      const originalFlush = server.chatStore.flush.bind(server.chatStore);
+      originalFlush = server.chatStore.flush.bind(server.chatStore);
       let signalFlush;
       const flushStarted = new Promise((resolve) => { signalFlush = resolve; });
       server.chatStore.flush = async (ref) => {
         signalFlush();
         return originalFlush(ref);
       };
-      const replacement = server.beforeProjectWorkspaceReplacement(project);
-      await flushStarted;
+      replacement = server.beforeProjectWorkspaceReplacement(project);
+      let flushDeadline;
+      try {
+        await Promise.race([
+          flushStarted,
+          new Promise((_, reject) => {
+            flushDeadline = setTimeout(
+              () => reject(new Error('Project replacement did not enter the artifact flush barrier')),
+              5_000,
+            );
+          }),
+        ]);
+      } finally {
+        clearTimeout(flushDeadline);
+      }
 
       assert.match(session.persistenceUnavailable, /temporarily unavailable/i);
       assert.strictEqual(server.suspendedProjectScopes.has(project.id), false);
@@ -393,7 +410,7 @@ describe('workspace session migration regressions', function () {
       assert.strictEqual(authority.required, true);
       assert.strictEqual(server.suspendedProjectScopes.has(project.id), true);
       assert.match(
-        await fs.readFile(
+        fsSync.readFileSync(
           path.join(workspaceRoot, '.cc-web', 'sessions', scope.ownerKey, session.id, 'chat.jsonl'),
           'utf8',
         ),
@@ -415,6 +432,9 @@ describe('workspace session migration regressions', function () {
       );
       server.confirmProjectWorkspaceRestored(project, authority.identity);
     } finally {
+      releaseAdmitted();
+      await Promise.allSettled([append, replacement].filter(Boolean));
+      if (originalFlush) server.chatStore.flush = originalFlush;
       await server.shutdown().catch(() => undefined);
       await fs.rm(root, { recursive: true, force: true });
     }

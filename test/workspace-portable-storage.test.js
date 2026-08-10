@@ -25,6 +25,7 @@ const {
   publishLargeWorkspaceCwdFile,
   publishNewWorkspaceCwdFile,
   setWorkspaceCwdHelperSpawnerForTests,
+  statWorkspaceCwdFile,
 } = require('../dist/server/services/workspace-cwd-helper.js');
 
 const OWNER_A = 'portable-owner-key-a';
@@ -69,6 +70,19 @@ function assertChildFailure(result, expression) {
   assert.notStrictEqual(result.status, 0, `child unexpectedly succeeded: ${result.stdout}`);
   assert.strictEqual(result.errorResponse?.code, 'UNSAFE_WORKSPACE_STORAGE');
   assert.match(result.errorResponse?.message ?? '', expression);
+}
+
+function assertCutpointCrash(result, cutpoint) {
+  assert.ifError(result.error);
+  assert.ok(
+    result.signal !== null || result.status !== 0,
+    `helper survived cutpoint ${cutpoint}: status=${result.status} signal=${result.signal}`,
+  );
+  const marker = `CODE_AGENTS_WEBCLI_HELPER_TEST_CUTPOINT:${cutpoint}`;
+  assert.ok(
+    String(result.stderr).split(/\r?\n/).includes(marker),
+    `helper did not reach cutpoint ${cutpoint}: ${result.stderr}`,
+  );
 }
 
 function directLease(directory) {
@@ -355,7 +369,7 @@ describe('portable workspace storage', function () {
         operation: 'rename', name: 'rename.tmp', target: 'target.txt',
         expectedEntryDev: source.dev.toString(), expectedEntryIno: source.ino.toString(),
       }, 'rename-private-link');
-      assert.notStrictEqual(result.status, 0);
+      assertCutpointCrash(result, 'rename-private-link');
       assert.strictEqual(fs.readFileSync(path.join(dir, 'target.txt'), 'utf8'), 'old');
 
       result = childRequest(dir, {
@@ -376,7 +390,7 @@ describe('portable workspace storage', function () {
         operation: 'rename', name: 'rename.tmp', target: 'target.txt',
         expectedEntryDev: source.dev.toString(), expectedEntryIno: source.ino.toString(),
       }, 'rename-target-rename');
-      assert.notStrictEqual(result.status, 0);
+      assertCutpointCrash(result, 'rename-target-rename');
       result = childRequest(dir, {
         operation: 'reconcile-rename', name: 'rename.tmp', target: 'target.txt',
         expectedEntryDev: source.dev.toString(), expectedEntryIno: source.ino.toString(),
@@ -397,7 +411,7 @@ describe('portable workspace storage', function () {
         operation: 'unlink', name: 'remove.txt',
         expectedEntryDev: file.dev.toString(), expectedEntryIno: file.ino.toString(),
       }, 'unlink-quarantine');
-      assert.notStrictEqual(result.status, 0);
+      assertCutpointCrash(result, 'unlink-quarantine');
       result = childRequest(dir, {
         operation: 'verify-absent', name: 'remove.txt',
         expectedEntryDev: file.dev.toString(), expectedEntryIno: file.ino.toString(),
@@ -410,7 +424,7 @@ describe('portable workspace storage', function () {
         operation: 'rmdir', name: 'remove-dir',
         expectedEntryDev: directory.dev.toString(), expectedEntryIno: directory.ino.toString(),
       }, 'rmdir-quarantine');
-      assert.notStrictEqual(result.status, 0);
+      assertCutpointCrash(result, 'rmdir-quarantine');
       result = childRequest(dir, {
         operation: 'verify-absent', name: 'remove-dir', mode: 0o700,
         expectedEntryDev: directory.dev.toString(), expectedEntryIno: directory.ino.toString(),
@@ -423,7 +437,7 @@ describe('portable workspace storage', function () {
         operation: 'claim', name: 'private.guard', target: 'private.guard.claim',
         expectedEntryDev: privateGuard.dev.toString(), expectedEntryIno: privateGuard.ino.toString(),
       }, 'claim-private-link');
-      assert.notStrictEqual(result.status, 0);
+      assertCutpointCrash(result, 'claim-private-link');
       result = childRequest(dir, {
         operation: 'claim', name: 'private.guard', target: 'private.guard.claim',
         expectedEntryDev: privateGuard.dev.toString(), expectedEntryIno: privateGuard.ino.toString(),
@@ -442,7 +456,7 @@ describe('portable workspace storage', function () {
         operation: 'claim', name: 'writer.guard', target: 'writer.guard.claim',
         expectedEntryDev: guard.dev.toString(), expectedEntryIno: guard.ino.toString(),
       }, 'claim-target-link');
-      assert.notStrictEqual(result.status, 0);
+      assertCutpointCrash(result, 'claim-target-link');
       result = childRequest(dir, {
         operation: 'claim', name: 'writer.guard', target: 'writer.guard.claim',
         expectedEntryDev: guard.dev.toString(), expectedEntryIno: guard.ino.toString(),
@@ -469,7 +483,7 @@ describe('portable workspace storage', function () {
           operation: 'retire', name: sourceName, target: claimName,
           expectedEntryDev: identity.dev.toString(), expectedEntryIno: identity.ino.toString(),
         }, cutpoint);
-        assert.notStrictEqual(result.status, 0);
+        assertCutpointCrash(result, cutpoint);
         result = childRequest(dir, {
           operation: 'retire', name: sourceName, target: claimName,
           expectedEntryDev: identity.dev.toString(), expectedEntryIno: identity.ino.toString(),
@@ -483,6 +497,7 @@ describe('portable workspace storage', function () {
     });
 
     it('cold-recovers every authority claim and retirement crash cutpoint', function () {
+      this.timeout(60_000);
       const owner = JSON.stringify({
         version: 1, pid: 2147483647, host: os.hostname(), token: 'dead-cutpoint-owner',
         startedAt: 0, incarnation: 'dead-incarnation',
@@ -508,7 +523,7 @@ describe('portable workspace storage', function () {
         const crashed = childRequest(storage, {
           operation: cutpoint.startsWith('retire-') ? 'retire' : 'claim', ...request,
         }, cutpoint);
-        assert.notStrictEqual(crashed.status, 0);
+        assertCutpointCrash(crashed, cutpoint);
 
         const database = new WorkspaceSessionDatabase({
           workspaceRoot: root, ownerKey: OWNER_A,
@@ -523,6 +538,7 @@ describe('portable workspace storage', function () {
     });
 
     it('cold-recovers database replacement before and after the atomic target rename', function () {
+      this.timeout(60_000);
       for (const cutpoint of ['rename-private-link', 'rename-target-rename']) {
         const root = path.join(dir, `database-${cutpoint}`);
         fs.mkdirSync(root, { mode: 0o700 });
@@ -545,7 +561,7 @@ describe('portable workspace storage', function () {
           operation: 'rename', name: temporary, target: 'session-state.sqlite',
           expectedEntryDev: source.dev.toString(), expectedEntryIno: source.ino.toString(),
         }, cutpoint);
-        assert.notStrictEqual(result.status, 0);
+        assertCutpointCrash(result, cutpoint);
 
         database = new WorkspaceSessionDatabase({
           workspaceRoot: root, ownerKey: OWNER_A,
@@ -572,7 +588,7 @@ describe('portable workspace storage', function () {
           operation: 'publish', name: sourceName, target: targetName,
           expectedEntryDev: source.dev.toString(), expectedEntryIno: source.ino.toString(),
         }, cutpoint);
-        assert.notStrictEqual(result.status, 0);
+        assertCutpointCrash(result, cutpoint);
         result = childRequest(dir, { operation: 'recover-publish', name: targetName });
         assert.strictEqual(result.status, 0, result.stderr);
         if (cutpoint === 'publish-private-link') {
@@ -717,7 +733,7 @@ describe('portable workspace storage', function () {
         fs.writeFileSync(path.join(canonical, 'canary'), 'must-stay');
         assert.throws(
           () => runWorkspaceCwdHelper(storage, { operation: 'create', name: 'must-not-create', data: Buffer.from('x') }),
-          /identity|authorised parent|unsafe/i,
+          (error) => error?.code === 'UNSAFE_WORKSPACE_STORAGE' && /directory changed/i.test(error.message),
         );
         assert.strictEqual(fs.existsSync(path.join(canonical, 'must-not-create')), false);
         assert.strictEqual(fs.readFileSync(path.join(canonical, 'canary'), 'utf8'), 'must-stay');
@@ -732,6 +748,7 @@ describe('portable workspace storage', function () {
     });
 
     it('uses one portable image for multiple owners, removes its writer lease, and leaves no SQLite sidecars', function () {
+      this.timeout(60_000);
       if (!childProcessesWork()) this.skip();
       const options = { workspaceRoot: root, workspaceStorageOpenOptions: { forceCwdHelper: true } };
       const first = new WorkspaceSessionDatabase({ ...options, ownerKey: OWNER_A });
@@ -768,39 +785,78 @@ describe('portable workspace storage', function () {
     });
 
     it('rejects a second writer, reclaims a dead exact lease, and fail-stops after writer replacement', function () {
+      this.timeout(60_000);
       if (!childProcessesWork()) this.skip();
       const options = { workspaceRoot: root, workspaceStorageOpenOptions: { forceCwdHelper: true } };
-      const first = new WorkspaceSessionDatabase({ ...options, ownerKey: OWNER_A });
-      try {
-        const program = `
-          const { WorkspaceSessionDatabase } = require(${JSON.stringify(path.join(__dirname, '..', 'dist', 'server', 'services', 'workspace-session-database.js'))});
-          try {
-            new WorkspaceSessionDatabase(${JSON.stringify({ ...options, ownerKey: OWNER_B })});
-            process.exit(10);
-          } catch (error) {
-            process.exit(error && error.code === 'UNSAFE_WORKSPACE_STORAGE' ? 0 : 11);
+      const databaseModule = path.join(
+        __dirname, '..', 'dist', 'server', 'services', 'workspace-session-database.js',
+      );
+      const contenderProgram = `
+        const { WorkspaceSessionDatabase } = require(process.argv[1]);
+        const options = JSON.parse(process.argv[2]);
+        try {
+          new WorkspaceSessionDatabase({ ...options, ownerKey: process.argv[3] });
+          process.exit(10);
+        } catch (error) {
+          if (error && error.code === 'UNSAFE_WORKSPACE_STORAGE'
+            && /Another process owns the workspace database writer lease/i.test(error.message)) {
+            process.exit(0);
           }
-        `;
-        const contender = childProcess.spawnSync(process.execPath, ['-e', program], { encoding: 'utf8', timeout: 20_000 });
-        assert.ifError(contender.error);
-        assert.strictEqual(contender.status, 0, `${contender.stdout}\n${contender.stderr}`);
-
-        const lock = path.join(root, '.cc-web', '.session-state.writer');
-        fs.unlinkSync(lock);
-        fs.writeFileSync(lock, JSON.stringify({
-          version: 1, pid: 999_999_999, host: os.hostname(), token: 'replacement-owner', startedAt: 0,
-        }), { mode: 0o600 });
-        assert.throws(
-          () => first.setSetting('must-not-publish', 'x'),
-          (error) => error.code === 'WORKSPACE_DATABASE_POISONED',
-        );
-        assert.throws(
-          () => first.getSetting('must-not-publish'),
-          (error) => error.code === 'WORKSPACE_DATABASE_POISONED',
-        );
-      } finally {
-        try { first.close(); } catch { /* Replacement deliberately revokes close authority. */ }
-      }
+          process.stderr.write(String(error && error.stack || error));
+          process.exit(11);
+        }
+      `;
+      const failStopProgram = `
+        const childProcess = require('node:child_process');
+        const fs = require('node:fs');
+        const os = require('node:os');
+        const path = require('node:path');
+        const options = JSON.parse(process.argv[1]);
+        const databaseModule = process.argv[2];
+        const ownerA = process.argv[3];
+        const ownerB = process.argv[4];
+        const { WorkspaceSessionDatabase } = require(databaseModule);
+        try {
+          const first = new WorkspaceSessionDatabase({ ...options, ownerKey: ownerA });
+          const contender = childProcess.spawnSync(process.execPath, [
+            '-e', ${JSON.stringify(contenderProgram)}, databaseModule,
+            JSON.stringify(options), ownerB,
+          ], {
+            encoding: 'utf8', timeout: 20_000,
+          });
+          if (contender.error || contender.status !== 0) throw new Error(
+            \`contender failed: \${contender.error || contender.status} \${contender.stderr}\`,
+          );
+          const lock = path.join(options.workspaceRoot, '.cc-web', '.session-state.writer');
+          fs.unlinkSync(lock);
+          fs.writeFileSync(lock, JSON.stringify({
+            version: 1, pid: 999_999_999, host: os.hostname(),
+            token: 'replacement-owner', startedAt: 0,
+          }), { mode: 0o600 });
+          for (const operation of [
+            () => first.setSetting('must-not-publish', 'x'),
+            () => first.getSetting('must-not-publish'),
+          ]) {
+            try {
+              operation();
+              throw new Error('poisoned operation unexpectedly succeeded');
+            } catch (error) {
+              if (error.code !== 'WORKSPACE_DATABASE_POISONED') throw error;
+            }
+          }
+          process.exit(0);
+        } catch (error) {
+          process.stderr.write(String(error && error.stack || error));
+          process.exit(1);
+        }
+      `;
+      const failedWriter = childProcess.spawnSync(process.execPath, [
+        '-e', failStopProgram, JSON.stringify(options), databaseModule, OWNER_A, OWNER_B,
+      ], {
+        encoding: 'utf8', timeout: 40_000,
+      });
+      assert.ifError(failedWriter.error);
+      assert.strictEqual(failedWriter.status, 0, `${failedWriter.stdout}\n${failedWriter.stderr}`);
 
       const storage = path.join(root, '.cc-web');
       fs.rmSync(path.join(storage, '.session-state.writer'), { force: true });
@@ -855,7 +911,7 @@ describe('portable workspace storage', function () {
           ownerKey: OWNER_A,
           workspaceStorageOpenOptions: { forceCwdHelper: true },
         }),
-        /portable size limit/i,
+        /bounded read limit|portable size limit/i,
       );
     });
   });
@@ -1164,6 +1220,40 @@ describe('portable workspace storage', function () {
         /invalid response/i,
       );
       assert.strictEqual(fs.existsSync(path.join(dir, 'not-accepted')), false);
+    });
+
+    it('rejects malformed or oversized stat decimals before converting them to BigInt', function () {
+      for (const [field, value] of [
+        ['size', ''],
+        ['nlink', '0x2'],
+        ['mode', ' 33188'],
+        ['mtimeNs', '9'.repeat(1_000)],
+        ['ctimeNs', '-0'],
+      ]) {
+        setWorkspaceCwdHelperSpawnerForTests(() => ({
+          error: undefined,
+          status: 0,
+          signal: null,
+          stdout: `${JSON.stringify({
+            ok: true,
+            origin: 'source',
+            dev: '1',
+            ino: '2',
+            size: '0',
+            nlink: '1',
+            mode: '33188',
+            mtimeNs: '0',
+            ctimeNs: '0',
+            [field]: value,
+          })}\n`,
+          stderr: '',
+        }));
+        assert.throws(
+          () => statWorkspaceCwdFile(lease, 'stat.txt'),
+          (error) => error?.code === 'UNSAFE_WORKSPACE_STORAGE'
+            && new RegExp(`invalid ${field}`, 'i').test(error.message),
+        );
+      }
     });
 
     it('fails closed and preserves interrupted writer claim state', function () {

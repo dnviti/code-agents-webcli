@@ -152,6 +152,7 @@ function testCutpoint(name: string): void {
   // The production broker starts the child with a minimal empty environment,
   // so this native-test crash seam cannot be selected by application input.
   if (process.env.CODE_AGENTS_WEBCLI_HELPER_TEST_CUTPOINT === name) {
+    fs.writeSync(2, `CODE_AGENTS_WEBCLI_HELPER_TEST_CUTPOINT:${name}\n`);
     process.kill(process.pid, 'SIGKILL');
   }
 }
