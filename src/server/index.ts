@@ -1886,7 +1886,7 @@ export class ClaudeCodeWebServer {
       }
       // Cached direct-child handles must be gone before the project manager can
       // move the complete `.cc-web` tree into its deterministic staging slot.
-      closeWorkspaceSessionDirectoryLeasesForScope(scope);
+      await closeWorkspaceSessionDirectoryLeasesForScope(scope);
       const identity = await this.projectPaths.workspaceSessionStorageIdentity(project, owner);
       if (
         !identity
@@ -1977,7 +1977,7 @@ export class ClaudeCodeWebServer {
   private async beforeProjectWorkspaceDeletion(project: Project): Promise<void> {
     const scope = this.projectSessionStorageScope(project);
     const key = this.workspaceScopeKey(scope);
-    closeWorkspaceSessionDirectoryLeasesForScope(scope);
+    await closeWorkspaceSessionDirectoryLeasesForScope(scope);
     this.loadedWorkspaceScopes.delete(key);
     this.workspaceArtifactIdentities.delete(key);
     this.suspendedProjectScopes.delete(project.id);
@@ -2439,7 +2439,7 @@ export class ClaudeCodeWebServer {
 
     let shutdownError: unknown;
     try {
-      if (this.shutdownFinalizationPending) this.finishShutdownStorage();
+      if (this.shutdownFinalizationPending) await this.finishShutdownStorage();
       else await this.shutdownWithDataDirLeaseHeld();
     } catch (error) {
       shutdownError = error;
@@ -2609,17 +2609,17 @@ export class ClaudeCodeWebServer {
     // handle, which remains the final storage object closed below.
     this.shutdownTerminalError = finalPersistenceError;
     this.shutdownFinalizationPending = true;
-    this.finishShutdownStorage();
+    await this.finishShutdownStorage();
   }
 
-  private finishShutdownStorage(): void {
+  private async finishShutdownStorage(): Promise<void> {
     let shutdownFailure: unknown = null;
-    const finish = (operation: () => void): void => {
-      try { operation(); } catch (error) { shutdownFailure ??= error; }
+    const finish = async (operation: () => void | Promise<void>): Promise<void> => {
+      try { await operation(); } catch (error) { shutdownFailure ??= error; }
     };
-    finish(() => this.sessionStore.closeWorkspaces());
-    finish(() => closeWorkspaceSessionDirectoryLeases());
-    finish(() => closeWorkspaceCwdHelpers());
+    await finish(() => this.sessionStore.closeWorkspaces());
+    await finish(() => closeWorkspaceSessionDirectoryLeases());
+    await finish(() => closeWorkspaceCwdHelpers());
     try {
       this.database.close();
       this.dataDirWritersClosed = true;

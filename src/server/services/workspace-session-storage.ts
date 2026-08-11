@@ -8,6 +8,18 @@ import {
   inspectWorkspaceCwdDirectory,
   runWorkspaceCwdHelper,
 } from './workspace-cwd-helper.js';
+import {
+  admitSessionDirectoryLease,
+  cachedSessionDirectoryLease,
+  ensureSessionDirectoryLease,
+  retireSessionDirectoryLease,
+  retireSessionDirectoryLeasesBelow,
+} from './workspace-session-lease-cache.js';
+export {
+  closeWorkspaceSessionDirectoryLeases,
+  workspaceSessionFileParentLease,
+} from './workspace-session-lease-cache.js';
+export type { WorkspaceSessionFileParentLease } from './workspace-session-lease-cache.js';
 
 /**
  * An optional, immutable location for artefacts which belong to one workspace.
@@ -41,14 +53,6 @@ const NO_FOLLOW = (fs.constants as unknown as Record<string, number>).O_NOFOLLOW
 const NON_BLOCK = (fs.constants as unknown as Record<string, number>).O_NONBLOCK ?? 0;
 const DIRECTORY = (fs.constants as unknown as Record<string, number>).O_DIRECTORY ?? 0;
 const DIRECTORY_FLAGS = fs.constants.O_RDONLY | NO_FOLLOW | DIRECTORY;
-interface SessionDirectoryLeaseRecord {
-  readonly fd: number;
-  readonly accessPath: string;
-  readonly pathFallback: boolean;
-  readonly entryMutationPolicy: WorkspaceEntryMutationPolicy;
-}
-
-const sessionDirectoryLeases = new Map<string, SessionDirectoryLeaseRecord>();
 let descriptorRootCache: string | null | undefined;
 
 interface OpenDirectory {
@@ -72,22 +76,6 @@ export interface WorkspaceStorageDirectoryLease {
 export interface WorkspaceStorageIdentity {
   readonly dev: bigint;
   readonly ino: bigint;
-}
-
-/**
- * Pinned parent for one of the direct files in a workspace session directory.
- *
- * File stores retain this lease across the path-based fallback's unavoidable
- * name lookup. Verifying it before and after each lookup prevents a renamed
- * session directory from silently rebinding an operation to another inode.
- */
-export interface WorkspaceSessionFileParentLease {
-  readonly canonicalPath: string;
-  readonly accessPath: string;
-  readonly fd: number;
-  readonly pathFallback: boolean;
-  readonly entryMutationPolicy: WorkspaceEntryMutationPolicy;
-  verify(): void;
 }
 
 export interface WorkspaceStorageOpenOptions {
@@ -888,10 +876,10 @@ export function workspaceSessionAccessDirectory(
 ): string | null {
   const canonical = workspaceSessionDirectory(ref);
   if (!canonical) return null;
-  const cached = sessionDirectoryLeases.get(canonical);
+  const cached = cachedSessionDirectoryLease(canonical);
   if (cached) {
     try {
-      verifyDirectoryBinding(canonical, cached.fd, cached.accessPath);
+      cached.verify();
       const forcedPolicy = options.forcePathFallback
         ? 'deny'
         : options.forceCwdHelper
@@ -910,8 +898,7 @@ export function workspaceSessionAccessDirectory(
     // A test may deliberately select the conservative path backend after a
     // verified descriptor-backed lease was opened. This synchronous switch is
     // safe because the directory identity was just checked above.
-    try { fs.closeSync(cached.fd); } catch { /* Already invalidated. */ }
-    sessionDirectoryLeases.delete(canonical);
+    retireSessionDirectoryLease(canonical);
   }
 
   const storageRoot = ref.storageRoot ?? ref.storageScope?.workspaceRoot;
@@ -954,11 +941,13 @@ export function workspaceSessionAccessDirectory(
     );
     verifyDirectoryBinding(canonical, session.fd, session.accessPath);
     const accessPath = session.accessPath;
-    sessionDirectoryLeases.set(canonical, {
-      fd: session.fd,
+    const sessionFd = session.fd;
+    admitSessionDirectoryLease(canonical, {
+      fd: sessionFd,
       accessPath,
       pathFallback,
       entryMutationPolicy: container.entryMutationPolicy,
+      verify: () => verifyDirectoryBinding(canonical, sessionFd, accessPath),
     });
     session = null;
     return accessPath;
@@ -970,62 +959,25 @@ export function workspaceSessionAccessDirectory(
   }
 }
 
-/**
- * Return the pinned lease only when `file` is an exact direct child of a live
- * workspace session directory. Legacy global-store paths deliberately return
- * null and keep their existing path semantics.
- */
-export function workspaceSessionFileParentLease(file: string): WorkspaceSessionFileParentLease | null {
-  if (!path.isAbsolute(file)) return null;
-  const parent = path.dirname(file);
-  for (const [canonicalPath, lease] of sessionDirectoryLeases) {
-    if (parent !== canonicalPath && parent !== lease.accessPath) continue;
-    return {
-      canonicalPath,
-      accessPath: lease.accessPath,
-      fd: lease.fd,
-      pathFallback: lease.pathFallback,
-      entryMutationPolicy: lease.entryMutationPolicy,
-      verify: () => verifyDirectoryBinding(canonicalPath, lease.fd, lease.accessPath),
-    };
-  }
-  return null;
-}
-
 /** Release one cached session inode after its final artifact cleanup. */
-export function closeWorkspaceSessionDirectoryLease(ref: WorkspaceSessionIdentity): void {
+export function closeWorkspaceSessionDirectoryLease(ref: WorkspaceSessionIdentity): Promise<void> {
   const canonical = workspaceSessionDirectory(ref);
-  if (!canonical) return;
-  const lease = sessionDirectoryLeases.get(canonical);
-  if (!lease) return;
-  sessionDirectoryLeases.delete(canonical);
-  try { fs.closeSync(lease.fd); } catch { /* Idempotent teardown. */ }
+  if (!canonical) return Promise.resolve();
+  return retireSessionDirectoryLease(canonical);
 }
 
 /** Release every cached session inode before a workspace is explicitly deleted. */
 export function closeWorkspaceSessionDirectoryLeasesForScope(scope: {
   workspaceRoot: string;
   ownerKey: string;
-}): void {
+}): Promise<void> {
   const ownerRoot = path.join(
     path.resolve(scope.workspaceRoot),
     '.cc-web',
     'sessions',
     safeComponent(scope.ownerKey, 'owner key'),
   );
-  const prefix = `${ownerRoot}${path.sep}`;
-  for (const [canonical, lease] of sessionDirectoryLeases) {
-    if (!canonical.startsWith(prefix)) continue;
-    sessionDirectoryLeases.delete(canonical);
-    try { fs.closeSync(lease.fd); } catch { /* Idempotent teardown. */ }
-  }
-}
-
-export function closeWorkspaceSessionDirectoryLeases(): void {
-  for (const lease of sessionDirectoryLeases.values()) {
-    try { fs.closeSync(lease.fd); } catch { /* Already closed during teardown. */ }
-  }
-  sessionDirectoryLeases.clear();
+  return retireSessionDirectoryLeasesBelow(ownerRoot);
 }
 
 /**
@@ -1036,10 +988,10 @@ export function closeWorkspaceSessionDirectoryLeases(): void {
 export async function ensureWorkspaceSessionDirectory(ref: WorkspaceSessionIdentity): Promise<string | null> {
   const sessionDir = workspaceSessionDirectory(ref);
   if (!sessionDir) return null;
-
-  // Descriptor-relative creation pins every component and fails closed when a
-  // parent is exchanged concurrently. The older path walk below remains only
-  // for legacy refs without workspace storage.
-  workspaceSessionAccessDirectory(ref);
-  return sessionDir;
+  return ensureSessionDirectoryLease(
+    sessionDir,
+    ref,
+    () => workspaceSessionAccessDirectory(ref) ?? sessionDir,
+    verifyDirectoryBinding,
+  );
 }

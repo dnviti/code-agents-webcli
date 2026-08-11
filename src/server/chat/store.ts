@@ -4,7 +4,7 @@ import { SessionRecord } from '../types.js';
 import {
   ensureWorkspaceSessionDirectory,
   workspaceSessionAccessDirectory,
-  workspaceSessionFileParentLease,
+  workspaceSessionDirectory, workspaceSessionFileParentLease,
   WorkspaceSessionStorageRef,
 } from '../services/workspace-session-storage.js';
 import {
@@ -396,7 +396,7 @@ export class ChatStore implements ChatStoreLike {
    * function. A future caller that passes an id straight from a request would
    * otherwise turn a path join into a write anywhere on disk.
    */
-  private basePath(session: ChatSessionRef): string {
+  private basePath(session: ChatSessionRef, establishWorkspace = true): string {
     const id = String(session.id);
     if (!SESSION_ID_PATTERN.test(id) || id === '.' || id === '..') {
       throw new Error(`Refusing unsafe session id for chat storage: ${JSON.stringify(id)}`);
@@ -406,7 +406,7 @@ export class ChatStore implements ChatStoreLike {
       throw new Error(`Refusing non-integer owner id for chat storage: ${session.ownerUserId}`);
     }
 
-    const workspaceDir = workspaceSessionAccessDirectory(session);
+    const workspaceDir = establishWorkspace ? workspaceSessionAccessDirectory(session) : workspaceSessionDirectory(session);
     return workspaceDir ? path.join(workspaceDir, 'chat') : path.join(this.storageDir, String(session.ownerUserId), id);
   }
 
@@ -786,7 +786,7 @@ export class ChatStore implements ChatStoreLike {
     // transitions await it before they are broadcast or acknowledged.
     let base: string;
     try {
-      base = this.basePath(session);
+      base = this.basePath(session, false);
     } catch (error) {
       console.error('Refusing to store chat events:', error);
       const rejected = Promise.reject(error);

@@ -1,5 +1,8 @@
 import * as React from 'react';
-import { activityEvents, type ActivityEvent } from '../../chat/activity.js';
+import {
+  projectedActivitySnapshot,
+  type ActivityProjectionSnapshot,
+} from '../../chat/activity-projection.js';
 import type { ChatTranscript } from '../../chat/transcript.js';
 
 /**
@@ -16,12 +19,17 @@ import type { ChatTranscript } from '../../chat/transcript.js';
  * point: only the surfaces that are genuinely live pay for being live. The
  * header, the turn index and the composer stay on the quiet tier and are not
  * re-rendered per token.
+ *
+ * Projection is incremental and shared by transcript/settings. A content
+ * delta still wakes these live surfaces, but it re-derives only the message
+ * named by the transcript's change journal; the trace and ribbon then consume
+ * the same cached array instead of each scanning the conversation.
  */
 export function useActivity(
   transcript: ChatTranscript,
   reasoning: boolean,
   tools: boolean,
-): ActivityEvent[] {
+): ActivityProjectionSnapshot {
   const version = React.useSyncExternalStore(
     transcript.subscribeContent,
     transcript.getContentVersion,
@@ -29,7 +37,7 @@ export function useActivity(
   );
 
   return React.useMemo(
-    () => activityEvents(transcript.messages, { reasoning, tools }),
+    () => projectedActivitySnapshot(transcript, { reasoning, tools }),
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [transcript, version, reasoning, tools],
   );

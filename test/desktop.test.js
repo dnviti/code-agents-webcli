@@ -232,7 +232,14 @@ describe('Electron desktop helpers', function () {
   it('owns phone sharing in the desktop lifecycle without starting it implicitly', function () {
     const main = fs.readFileSync(path.join(__dirname, '..', 'desktop', 'main.js'), 'utf8');
     assert.match(main, /createPhoneAccessService\(\{[\s\S]*localAvailable:\s*false/);
-    assert.match(main, /createControllerGateway\(\{[\s\S]*phoneAccess:\s*phoneAccessService/);
+    assert.match(main, /startControllerGateway\(\{[\s\S]*gatewayOptions:\s*\{[\s\S]*phoneAccess:\s*phoneAccessService/);
+    const gatewayReady = main.indexOf('await startControllerGateway');
+    const authHook = main.indexOf('webRequest.onBeforeSendHeaders', gatewayReady);
+    const runtimeStart = main.indexOf('controllerRuntime.start()', gatewayReady);
+    const windowPolicy = main.indexOf('installRendererSessionPolicy', gatewayReady);
+    assert.ok(gatewayReady >= 0 && authHook > gatewayReady
+      && runtimeStart > authHook && windowPolicy > runtimeStart,
+    'auth, runtime, and renderer policy install only after the final gateway binds');
     assert.match(main, /attachLocal\([\s\S]*setLocalAvailable\(true\)/);
     assert.match(main, /reportLocalFailure\([\s\S]*setLocalAvailable\(false/);
     assert.match(main, /DESKTOP_PHONE_ACCESS_SMOKE_OK off-start-stop-port-released/);

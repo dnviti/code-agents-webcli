@@ -3,7 +3,14 @@ import { createHash, randomBytes } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { Worker } from 'node:worker_threads';
-import type { WorkspaceStorageDirectoryLease } from './workspace-session-storage.js';
+import type {
+  WorkspaceSessionFileParentLease,
+  WorkspaceStorageDirectoryLease,
+} from './workspace-session-storage.js';
+import {
+  closeWorkspaceCwdHelperWorker,
+  runWorkspaceCwdHelperOffThread,
+} from './workspace-cwd-helper-async.js';
 
 const MAX_FILE_BYTES = 24 * 1024 * 1024;
 const MAX_RESPONSE_BYTES = 34 * 1024 * 1024;
@@ -128,6 +135,7 @@ function closeHelperBroker(broker: WorkspaceCwdHelperBroker): void {
 /** Process-wide teardown used by tests and orderly server shutdown. */
 export function closeWorkspaceCwdHelpers(): void {
   if (helperBroker) closeHelperBroker(helperBroker);
+  closeWorkspaceCwdHelperWorker();
   clearBrokerFailure();
 }
 
@@ -534,6 +542,23 @@ export function runWorkspaceCwdHelper(
     ...(typeof response.entries === 'string' ? { entries: response.entries } : {}),
     ...(Number.isSafeInteger(response.helperPid) ? { helperPid: Number(response.helperPid) } : {}),
   };
+}
+
+/**
+ * Run a cwd-bound operation without parking the server's event loop.
+ *
+ * The synchronous transport remains for startup/lifecycle code and deterministic
+ * spawner seams. Production async callers use a worker whose own helper applies
+ * the same pinned-directory protocol against an immutable retained identity.
+ */
+export async function runWorkspaceCwdHelperAsync(
+  lease: WorkspaceSessionFileParentLease,
+  request: WorkspaceCwdHelperOperation,
+): Promise<WorkspaceCwdHelperResult> {
+  if (helperSpawner !== productionSpawner || helperBrokerExecutableForTests !== null) {
+    return runWorkspaceCwdHelper(lease, request);
+  }
+  return runWorkspaceCwdHelperOffThread(lease, request);
 }
 
 export function ensureWorkspaceCwdDirectory(

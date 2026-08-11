@@ -28,7 +28,8 @@ const {
   writeWindowState,
 } = require('./lib.js');
 const { ControllerCatalog } = require('./controller-catalog.js');
-const { readControllerPort, writeControllerPort } = require('./controller-endpoint.js');
+const { readControllerPort } = require('./controller-endpoint.js');
+const { startControllerGateway } = require('./controller-startup.js');
 const { findLanServers } = require('./controller-discovery.js');
 const { createElectronControllerSessions } = require('./controller-electron.js');
 const { createControllerGateway } = require('./controller-gateway.js');
@@ -895,16 +896,26 @@ async function boot() {
     dataDir: path.join(userData, 'controller'),
     localAvailable: false,
   });
-  controllerGateway = createControllerGateway({
-    publicDir: path.join(__dirname, '..', 'dist', 'public'),
-    controller: controllerRuntime,
-    phoneAccess: phoneAccessService,
-    port: controllerPort,
+  const startedController = await startControllerGateway({
+    createGateway: createControllerGateway,
+    gatewayOptions: {
+      publicDir: path.join(__dirname, '..', 'dist', 'public'),
+      controller: controllerRuntime,
+      phoneAccess: phoneAccessService,
+    },
+    persistedPort: controllerPort,
+    endpointFile: controllerEndpointFile,
   });
-  const controllerEndpoint = await controllerGateway.listen();
+  controllerGateway = startedController.gateway;
+  const controllerEndpoint = startedController.endpoint;
+  if (startedController.recoveredFrom) {
+    console.warn(
+      `Controller port ${startedController.recoveredFrom.port} was unavailable `
+      + `(${startedController.recoveredFrom.code}); moved to ${controllerEndpoint.port}.`,
+    );
+  }
   controllerOrigin = controllerEndpoint.origin;
   trustedRendererOrigin = controllerEndpoint.origin;
-  if (controllerPort === 0) writeControllerPort(controllerEndpointFile, controllerEndpoint.port);
   const controllerAuthentication = controllerGateway.authentication();
   const controllerUrls = [
     `${controllerAuthentication.origin}/*`,

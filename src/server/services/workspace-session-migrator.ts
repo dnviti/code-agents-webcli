@@ -3265,7 +3265,7 @@ export class WorkspaceSessionArtifactMigrator {
       try {
         return await this.migrateNow(ref);
       } finally {
-        try { closeWorkspaceSessionDirectoryLease(ref); } catch { /* Invalid refs were already blocked. */ }
+        try { await closeWorkspaceSessionDirectoryLease(ref); } catch { /* Invalid refs were already blocked. */ }
       }
     };
     const next = previous.then(run, run);
@@ -3447,7 +3447,7 @@ export class WorkspaceSessionArtifactMigrator {
     } finally {
       for (const lease of binaryPlan?.leases.reverse() ?? []) lease.close();
       for (const lease of fixedPlan?.leases.reverse() ?? []) lease.close();
-      closeWorkspaceSessionDirectoryLease(ref);
+      await closeWorkspaceSessionDirectoryLease(ref);
     }
   }
 
@@ -3490,7 +3490,7 @@ export class WorkspaceSessionArtifactMigrator {
       // secondary checkout is disposable. Replacement retries after repair.
       return true;
     } finally {
-      closeWorkspaceSessionDirectoryLease(ref);
+      await closeWorkspaceSessionDirectoryLease(ref);
     }
   }
 
