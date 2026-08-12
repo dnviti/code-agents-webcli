@@ -1,5 +1,10 @@
 # Changelog
 
+## [6.1.2] - 2026-08-12
+
+### Changed
+- Prepare release 6.1.2.
+
 ## [6.1.1] - 2026-08-08
 
 ### Fixed

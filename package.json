@@ -1,6 +1,6 @@
 {
   "name": "code-agents-webcli",
-  "version": "6.1.1",
+  "version": "6.1.2",
   "description": "Multiuser web CLI for Claude Code, Codex, and terminal sessions",
   "desktopName": "io.github.dnviti.code-agents-webcli.desktop",
   "main": "dist/server/index.js",
