@@ -15,16 +15,21 @@
     "desktop": "npm run build && electron desktop/main.js",
     "desktop:pack": "npm run build && electron-builder --dir",
     "desktop:dist": "npm run build && electron-builder",
+    "desktop:dist:win:unsigned": "npm run build && electron-builder --win nsis --x64 --publish never --config.forceCodeSigning=false --config.win.signExecutable=false",
+    "desktop:dist:mac:x64:unsigned": "npm run build && CODE_AGENTS_WEBCLI_SKIP_NOTARIZATION=1 electron-builder --mac dmg zip --x64 --publish never --config.forceCodeSigning=false --config.mac.identity=null --config.mac.hardenedRuntime=false",
+    "desktop:dist:mac:arm64:unsigned": "npm run build && CODE_AGENTS_WEBCLI_SKIP_NOTARIZATION=1 electron-builder --mac dmg zip --arm64 --publish never --config.forceCodeSigning=false --config.mac.identity=null --config.mac.hardenedRuntime=false",
     "desktop:dist:linux:deb": "npm run build && electron-builder --linux deb --publish never",
     "desktop:dist:linux:rpm": "npm run build && electron-builder --linux rpm --publish never",
     "desktop:dist:linux:deb-rpm": "npm run build && electron-builder --linux deb rpm --publish never",
     "start": "npm run build && node bin/cc-web.js",
     "dev": "npm run build && node bin/cc-web.js --dev",
-    "test": "npm run build && mocha --exit test/*.test.js",
+    "test": "npm run build && node scripts/run-tests.js",
+    "test:strict": "npm run test -- --strict",
     "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.client.json",
     "prepack": "npm run build",
     "release:pr": "bash scripts/release-pr.sh",
     "test:browser": "npm run build && node test/browser/run.js",
+    "test:browser:strict": "npm run build && node test/browser/run.js --strict",
     "test:desktop-attachments": "node test/electron-attachment/run.js",
     "verify:install": "bash scripts/verify-install.sh"
   },
@@ -57,7 +62,7 @@
     "ws": "^8.21.1"
   },
   "engines": {
-    "node": ">=22.13.0"
+    "node": ">=24.16.0"
   },
   "repository": {
     "type": "git",

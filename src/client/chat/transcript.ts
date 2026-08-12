@@ -44,6 +44,17 @@ import {
 type Listener = () => void;
 
 /**
+ * One entry in the live tier's bounded change journal.
+ *
+ * Activity selectors use this to update only the message that moved. `reset`
+ * means the message collection was replaced or reordered; `meta` wakes other
+ * live surfaces but cannot alter the activity projection.
+ */
+export type TranscriptContentChange =
+  | { readonly version: number; readonly kind: 'message'; readonly messageId: string }
+  | { readonly version: number; readonly kind: 'reset' | 'meta' };
+
+/**
  * Drop a runtime's echo of the prompt once the page carrying this app's own copy
  * has arrived.
  *
@@ -117,6 +128,17 @@ export class ChatTranscript {
    */
   private contentVersion = 0;
   private contentListeners = new Set<Listener>();
+  /**
+   * Recent live-tier changes, coalesced by target.
+   *
+   * A model can deliver thousands of consecutive deltas for one block. Those
+   * are one selector concern ("message x changed"), so the last entry advances
+   * instead of growing this journal per token. The hard ceiling covers a
+   * sleeping/off-screen consumer; falling behind it asks that consumer for one
+   * full rebuild rather than retaining an unbounded conversation-long log.
+   */
+  private contentChanges: TranscriptContentChange[] = [];
+  private contentChangeFloor = 0;
 
   /**
    * Lowest seq this client actually holds.
@@ -501,11 +523,30 @@ export class ChatTranscript {
     if (listeners) {
       for (const listener of listeners) listener();
     }
-    this.bumpContent();
+    this.bumpContent({ kind: 'message', messageId: id });
   }
 
-  private bumpContent(): void {
+  private bumpContent(
+    change: { kind: 'message'; messageId: string } | { kind: 'reset' | 'meta' },
+  ): void {
     this.contentVersion++;
+    const last = this.contentChanges[this.contentChanges.length - 1];
+    const sameTarget = last?.kind === change.kind
+      && (change.kind !== 'message'
+        || (last.kind === 'message' && last.messageId === change.messageId));
+    const next = { ...change, version: this.contentVersion } as TranscriptContentChange;
+    if (sameTarget) {
+      this.contentChanges[this.contentChanges.length - 1] = next;
+    } else {
+      this.contentChanges.push(next);
+      if (this.contentChanges.length > CONTENT_CHANGE_LIMIT) {
+        const removed = this.contentChanges.splice(
+          0,
+          this.contentChanges.length - CONTENT_CHANGE_LIMIT,
+        );
+        this.contentChangeFloor = removed[removed.length - 1].version;
+      }
+    }
     for (const listener of this.contentListeners) listener();
   }
 
@@ -513,7 +554,7 @@ export class ChatTranscript {
   private notify(): void {
     this.version++;
     for (const listener of this.listeners) listener();
-    this.bumpContent();
+    this.bumpContent({ kind: 'meta' });
   }
 
   private bumpAll(): void {
@@ -523,7 +564,7 @@ export class ChatTranscript {
       this.messageVersions.set(id, (this.messageVersions.get(id) || 0) + 1);
       for (const listener of listeners) listener();
     }
-    this.bumpContent();
+    this.bumpContent({ kind: 'reset' });
   }
 
   subscribe = (listener: Listener): (() => void) => {
@@ -561,6 +602,15 @@ export class ChatTranscript {
   };
 
   getContentVersion = (): number => this.contentVersion;
+
+  /**
+   * Live-tier changes after `version`, or null when the caller fell behind the
+   * bounded journal and must rebuild from `messages` once.
+   */
+  contentChangesSince(version: number): readonly TranscriptContentChange[] | null {
+    if (version < this.contentChangeFloor) return null;
+    return this.contentChanges.filter((change) => change.version > version);
+  }
 
   getVersion = (): number => this.version;
 
@@ -725,3 +775,6 @@ export class ChatTranscript {
     );
   }
 }
+
+/** Coalesced change entries retained for a sleeping live-tier consumer. */
+const CONTENT_CHANGE_LIMIT = 64;

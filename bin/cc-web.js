@@ -3,16 +3,16 @@
 const { Command } = require('commander');
 const packageJson = require('../package.json');
 
-const MIN_NODE_MAJOR = 22;
-const MIN_NODE_MINOR = 13;
+const MIN_NODE_MAJOR = 24;
+const MIN_NODE_MINOR = 16;
 
 /**
- * Refuse a Node too old for the built-in SQLite, before anything else runs.
+ * Refuse a Node too old for the built-in SQLite serialization APIs, before
+ * anything else runs.
  *
  * `engines` in package.json is advisory — npm prints a warning and installs
  * anyway — so without this check the first symptom of an unsupported Node is a
- * bare `Cannot find module 'node:sqlite'` from three frames deep inside the
- * server.
+ * bare SQLite serialization failure from three frames deep inside the server.
  */
 function checkNodeVersion() {
   const [major, minor] = process.versions.node.split('.').map(Number);
@@ -21,7 +21,7 @@ function checkNodeVersion() {
   }
   console.error(
     `code-agents-webcli needs Node ${MIN_NODE_MAJOR}.${MIN_NODE_MINOR} or newer `
-    + `(it uses Node's built-in SQLite), but this is ${process.version}.`,
+    + `(it uses Node's built-in SQLite serialization APIs), but this is ${process.version}.`,
   );
   console.error('Upgrade Node from https://nodejs.org and run it again.');
   process.exit(1);

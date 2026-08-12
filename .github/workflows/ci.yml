@@ -17,11 +17,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # 22 is the floor the package declares (the first release with an
-        # unflagged node:sqlite); 24 is current LTS.
+        # 24.16 is the package floor: it supplies node:sqlite serialize and
+        # deserialize, which the macOS workspace backend requires. Test both
+        # that exact floor and the current 24.x LTS line.
         node:
-          - 22
-          - 24
+          - '24.16'
+          - '24'
 
     steps:
       - name: Checkout
@@ -47,14 +48,14 @@ jobs:
         run: npm run typecheck
 
       - name: Test
-        run: npm test
+        run: npm run test:strict
 
       # Whole classes of defect here are invisible to the unit suite because
       # only a layout engine can answer them: whether a bar wraps, whether an
       # answer actually reaches the screen while it streams. The runner image
-      # ships Chrome, and the runner refuses to skip when CI is set.
+      # ships Chrome, and the explicit strict command refuses to skip.
       - name: Browser checks
-        run: npm run test:browser
+        run: npm run test:browser:strict
 
   install:
     name: Verify the documented install
@@ -143,3 +144,59 @@ jobs:
           test -f "release/Code-Agents-Web-CLI-${version}-linux-x64.deb"
           test -f "release/Code-Agents-Web-CLI-${version}-linux-x64.rpm"
           echo "deb and rpm for ${version} produced."
+
+  native-packaged-smoke:
+    name: Unsigned packaged smoke (${{ matrix.label }})
+    runs-on: ${{ matrix.os }}
+    needs: verify
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            label: Windows x64
+            package: npm run desktop:dist:win:unsigned
+            helper_marker: WORKSPACE_ENTRY_HELPER_OK app.asar
+          - os: macos-15-intel
+            label: macOS x64
+            package: npm run desktop:dist:mac:x64:unsigned
+            helper_marker: WORKSPACE_ENTRY_HELPER_OK app.asar
+          - os: macos-15
+            label: macOS arm64
+            package: npm run desktop:dist:mac:arm64:unsigned
+            helper_marker: WORKSPACE_ENTRY_HELPER_OK app.asar
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24.16'
+          cache: npm
+      - run: npm ci
+      - name: Exercise the native workspace helper and serialized database
+        shell: bash
+        run: npm run test:strict -- --test-file test/workspace-portable-storage.test.js --test-file test/sqlite-adapter.test.js
+      - name: Build explicitly unsigned native package
+        shell: bash
+        run: ${{ matrix.package }}
+      - name: Smoke the packaged application
+        shell: bash
+        timeout-minutes: 20
+        env:
+          CODE_AGENTS_WEBCLI_DESKTOP_SMOKE: '1'
+        run: |
+          set -euo pipefail
+          if [ '${{ runner.os }}' = 'Windows' ]; then
+            executable='release/win-unpacked/code-agents-webcli.exe'
+          else
+            executable="$(find release -type f -path '*/Code Agents Web CLI.app/Contents/MacOS/Code Agents Web CLI' -print -quit)"
+          fi
+          test -n "$executable"
+          test -f "$executable"
+          output="$("$executable")"
+          printf '%s\n' "$output"
+          grep -F 'DESKTOP_WORKSPACE_ATTACHMENT_SMOKE_OK' <<<"$output"
+          grep -F 'DESKTOP_PACKAGED_RENDERER_SMOKE_OK' <<<"$output"
+          grep -F 'DESKTOP_SMOKE_OK' <<<"$output"
+          if [ -n '${{ matrix.helper_marker }}' ]; then
+            grep -F '${{ matrix.helper_marker }}' <<<"$output"
+          fi

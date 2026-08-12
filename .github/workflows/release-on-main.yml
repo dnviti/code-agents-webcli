@@ -139,7 +139,7 @@ jobs:
         shell: bash
         run: bash scripts/configure-ci-electron-sandbox.sh
       - run: npm run typecheck
-      - run: npm test
+      - run: npm run test:strict
 
   docker:
     name: Publish Docker image
@@ -214,6 +214,7 @@ jobs:
             local missing=()
             if [ -z "${!primary:-}" ]; then
               echo "$platform=false" >> "$GITHUB_OUTPUT"
+              printf -v "${platform}_decision" '%s' false
               echo "::notice::$platform signing is not configured; the package will be built unsigned."
               return
             fi
@@ -225,6 +226,7 @@ jobs:
               exit 1
             else
               echo "$platform=true" >> "$GITHUB_OUTPUT"
+              printf -v "${platform}_decision" '%s' true
             fi
           }
           check_identity windows WINDOWS_CSC_LINK WINDOWS_CSC_LINK WINDOWS_CSC_KEY_PASSWORD WINDOWS_CERT_SUBJECT
@@ -236,10 +238,17 @@ jobs:
             echo 'FLATPAK_GPG_KEY_ID must be an exact 40-hex fingerprint.' >&2
             exit 1
           fi
-          if [ -n "$WINDOWS_CSC_LINK" ] && [ -n "$MACOS_CSC_LINK" ] && [ -n "$FLATPAK_GPG_PRIVATE_KEY" ]; then
+          signed_platforms=0
+          for decision in "$windows_decision" "$macos_decision" "$flatpak_decision"; do
+            if [ "$decision" = true ]; then signed_platforms=$((signed_platforms + 1)); fi
+          done
+          if [ "$signed_platforms" -eq 3 ]; then
             echo 'all_signed=true' >> "$GITHUB_OUTPUT"
-          else
+          elif [ "$signed_platforms" -eq 0 ]; then
             echo 'all_signed=false' >> "$GITHUB_OUTPUT"
+          else
+            echo 'Partial desktop signing configuration is unsafe: configure every platform or none.' >&2
+            exit 1
           fi
 
   desktop:
@@ -261,33 +270,16 @@ jobs:
             label: Windows x64
             args: --win nsis --x64 --config.publish.channel=latest
             packages: 1
-          # macOS is deliberately held back and publishes no package.
-          #
-          # Workspace-local session storage needs an openat-style descriptor
-          # namespace. macOS exposes /dev/fd but not the /dev/fd/<n>/child
-          # traversal `workspace-session-storage` requires, so it cannot create
-          # `.cc-web`, and there is no fallback to reach for: the create route
-          # derives its storage root from the working directory and loads
-          # workspace sessions for it either way, so every conversation fails
-          # with `workspace_persistence_unavailable`. Publishing a build that
-          # cannot open a conversation is worse than publishing none.
-          #
-          # Restore both legs together with the macOS storage support. The
-          # signed release path still requires the macOS packages through
-          # `scripts/validate-release-assets.js`, so a signed release cannot be
-          # cut while they are absent — it fails loudly on the missing DMG
-          # rather than publishing an incomplete set.
-          #
           # These remain native builds because node-pty is selected for the
           # build host. The channel names keep architecture feeds separate.
-          # - os: macos-15-intel
-          #   label: macOS x64
-          #   args: --mac dmg zip --x64 --config.publish.channel=latest-x64
-          #   packages: 1
-          # - os: macos-15
-          #   label: macOS arm64
-          #   args: --mac dmg zip --arm64 --config.publish.channel=latest-arm64
-          #   packages: 1
+          - os: macos-15-intel
+            label: macOS x64
+            args: --mac dmg zip --x64 --config.publish.channel=latest-x64
+            packages: 2
+          - os: macos-15
+            label: macOS arm64
+            args: --mac dmg zip --arm64 --config.publish.channel=latest-arm64
+            packages: 2
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -376,6 +368,13 @@ jobs:
           # unless this platform holds a complete signing identity.
           if [ "$signing" != true ]; then
             unset CSC_LINK CSC_KEY_PASSWORD
+            case '${{ runner.os }}' in
+              Windows) platform_config+=("--config.win.signExecutable=false") ;;
+              macOS)
+                export CODE_AGENTS_WEBCLI_SKIP_NOTARIZATION=1
+                platform_config+=("--config.mac.identity=null" "--config.mac.hardenedRuntime=false")
+                ;;
+            esac
           fi
           if [ '${{ runner.os }}' = 'Windows' ] && [ "$signing" = true ]; then
             platform_config+=("--config.win.signtoolOptions.publisherName=$WINDOWS_CERT_SUBJECT")
@@ -437,6 +436,8 @@ jobs:
               test "$embedded_fingerprint" = "$repository_fingerprint"
               ;;
             Windows)
+              test -f "$(find release -maxdepth 1 -name '*.exe' -print -quit)"
+              test -f release/latest.yml
               if [ '${{ needs.release-identities.outputs.windows }}' != true ]; then
                 echo 'Skipping Authenticode verification for unsigned Windows build.'
                 exit 0
@@ -450,6 +451,10 @@ jobs:
               test -f "$(find release -maxdepth 1 -name '*.exe.blockmap' -print -quit)"
               ;;
             macOS)
+              test -f "$(find release -maxdepth 1 -name '*.dmg' -print -quit)"
+              test -f "$(find release -maxdepth 1 -name '*.zip' -print -quit)"
+              test -f "$(find release -maxdepth 1 -name '*.zip.blockmap' -print -quit)"
+              test -f "$(find release -maxdepth 1 -name 'latest-*-mac.yml' -print -quit)"
               if [ '${{ needs.release-identities.outputs.macos }}' != true ]; then
                 echo 'Skipping signature and notarization verification for unsigned macOS build.'
                 exit 0
@@ -557,6 +562,9 @@ jobs:
           grep -F 'DESKTOP_WORKSPACE_ATTACHMENT_SMOKE_OK' <<<"$output"
           grep -F 'DESKTOP_PACKAGED_RENDERER_SMOKE_OK' <<<"$output"
           grep -F 'DESKTOP_SMOKE_OK' <<<"$output"
+          if [ '${{ runner.os }}' != 'Linux' ]; then
+            grep -F 'WORKSPACE_ENTRY_HELPER_OK app.asar' <<<"$output"
+          fi
       - name: Smoke the installed Flatpak artifact
         if: runner.os == 'Linux'
         shell: bash
@@ -857,6 +865,14 @@ jobs:
         with:
           pattern: desktop-*
           path: release-assets
+      - name: Refuse unsigned resume of a draft release
+        if: needs.verify.outputs.resume_draft == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo 'Refusing unsigned resume: an interrupted signed draft can contain signed-only assets.' >&2
+          echo 'Delete the draft release manually, then re-run this tag workflow from a clean release slot.' >&2
+          exit 1
       - name: Collect the built packages and write checksums
         shell: bash
         env:
@@ -881,26 +897,33 @@ jobs:
           # `needs: desktop` already fails this job if any matrix leg failed.
           # Name every installable package anyway, so a future matrix or
           # artifactName change cannot quietly publish a partial release.
-          # Restore the two macOS DMGs here when the macOS legs return to the
-          # desktop matrix, so a silently missing package still fails closed.
           for name in \
             "Code-Agents-Web-CLI-${VERSION}-linux-x64.AppImage" \
             "Code-Agents-Web-CLI-${VERSION}-linux-x64.deb" \
             "Code-Agents-Web-CLI-${VERSION}-linux-x64.rpm" \
             "Code-Agents-Web-CLI-${VERSION}-linux-x64.flatpak" \
-            "Code-Agents-Web-CLI-${VERSION}-win-x64.exe"; do
+            "Code-Agents-Web-CLI-${VERSION}-win-x64.exe" \
+            "Code-Agents-Web-CLI-${VERSION}-win-x64.exe.blockmap" \
+            "Code-Agents-Web-CLI-${VERSION}-mac-x64.dmg" \
+            "Code-Agents-Web-CLI-${VERSION}-mac-arm64.dmg" \
+            "Code-Agents-Web-CLI-${VERSION}-mac-x64.zip" \
+            "Code-Agents-Web-CLI-${VERSION}-mac-arm64.zip" \
+            "Code-Agents-Web-CLI-${VERSION}-mac-x64.zip.blockmap" \
+            "Code-Agents-Web-CLI-${VERSION}-mac-arm64.zip.blockmap" \
+            'latest.yml' \
+            'latest-linux.yml' \
+            'latest-x64-mac.yml' \
+            'latest-arm64-mac.yml'; do
             test -f "release-assets/published/$name" \
               || { echo "Missing expected release package: $name" >&2; exit 1; }
           done
-          if find release-assets/published -maxdepth 1 -name '*-mac-*' -print -quit | grep -q .; then
-            echo 'A macOS package was produced while macOS is held back; update the release notes.' >&2
-            exit 1
-          fi
           cd release-assets/published
           find . -maxdepth 1 -type f \( -name '*.AppImage' -o -name '*.deb' -o -name '*.rpm' \
-            -o -name '*.flatpak' -o -name '*.exe' -o -name '*.dmg' \) -printf '%f\0' \
+            -o -name '*.flatpak' -o -name '*.exe' -o -name '*.dmg' -o -name '*.zip' \
+            -o -name '*.blockmap' -o -name 'latest*.yml' \) -printf '%f\0' \
             | sort -z | xargs -0 sha256sum > SHA256SUMS
           sha256sum -c SHA256SUMS
+          node "$GITHUB_WORKSPACE/scripts/validate-release-assets.js" "$PWD" "$VERSION" --unsigned
       - name: Refuse to replace an already published release
         shell: bash
         env:
@@ -916,7 +939,7 @@ jobs:
             "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/releases/tags/$tag")"
           case "$release_status:${{ needs.verify.outputs.resume_draft }}" in
             404:false) ;;
-            200:true) ;;
+            200:true) echo "Unsigned releases cannot resume draft $tag; delete the draft and restart from a clean release slot." >&2; exit 1 ;;
             200:false) echo "Release $tag already exists; published versions are immutable." >&2; exit 1 ;;
             *) echo "Could not prove release $tag is unused (HTTP $release_status)." >&2; exit 1 ;;
           esac
@@ -944,24 +967,15 @@ jobs:
             - `*.rpm` — Linux x64, Red Hat / Fedora package (dnf/yum).
             - `*.flatpak` — Linux x64, sandboxed Flatpak bundle. Install the bundle directly; this release publishes no signed Flatpak remote.
             - `*.exe` — Windows x64 NSIS installer.
-            - `SHA256SUMS` — SHA-256 checksums for every desktop package.
+            - `*-x64.dmg` / `*-x64.zip` — macOS Intel installer and updater archive.
+            - `*-arm64.dmg` / `*-arm64.zip` — macOS Apple Silicon installer and updater archive.
+            - `latest-x64-mac.yml` / `latest-arm64-mac.yml` — architecture-specific macOS update manifests.
+            - `SHA256SUMS` — SHA-256 checksums for every published desktop file.
 
-            **There is no macOS package in this release, and that is
-            deliberate.** Workspace-local session storage needs an
-            `openat`-style descriptor namespace to bind a workspace directory
-            without a rename race. macOS exposes `/dev/fd` but not the child
-            traversal this requires, and there is no fallback to reach for, so
-            on macOS every attempt to open a conversation fails with
-            `workspace_persistence_unavailable`. Rather than publish a build
-            that cannot be used, macOS is held back until that support lands.
-            **macOS users should stay on the previous release.**
-
-            On the platforms published here, Linux always stores sessions in the
-            workspace. Windows does so on volumes where the storage layer can
-            prove an open handle blocks an ancestor rename, which ordinary NTFS
-            volumes do — include `.cc-web/` in your backups there. Where that
-            proof fails, such as some network filesystems, that workspace
-            reports `workspace_persistence_unavailable` instead.
+            Conversation databases, history, transcripts, pastes, and
+            attachments remain below the selected workspace's `.cc-web/` on
+            Linux, Windows, and macOS. Include that directory in project
+            backups.
 
             **In-app updates cannot install this release.** The updater
             manifests and blockmaps are published here, but the desktop updater

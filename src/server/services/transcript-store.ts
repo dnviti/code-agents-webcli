@@ -3,6 +3,7 @@ import path from 'node:path';
 import { SessionRecord } from '../types.js';
 import {
   ensureWorkspaceSessionDirectory,
+  hasWorkspaceSessionStorage,
   workspaceSessionAccessDirectory,
   workspaceSessionDirectory,
   WorkspaceSessionStorageRef,
@@ -41,7 +42,9 @@ export class TranscriptStore implements TranscriptStoreLike {
   readonly replayLimitBytes: number;
   readonly maxTranscriptBytes: number;
   private readonly pendingWrites: Map<string, Promise<void>>;
+  private readonly writeErrors = new Map<string, unknown>();
   private readonly appendedSinceCheck: Map<string, number>;
+  private readonly pendingBatches = new Map<string, { session: TranscriptSessionRef; chunks: Buffer[]; check: boolean }>();
 
   constructor(options: TranscriptStoreOptions) {
     this.storageDir = path.resolve(options.storageDir);
@@ -76,8 +79,11 @@ export class TranscriptStore implements TranscriptStoreLike {
     const visiblePath = this.getTranscriptPath(session);
     const transcriptPath = this.getTranscriptAccessPath(session);
     await ensureWorkspaceSessionDirectory(session);
-    await fs.promises.mkdir(path.dirname(transcriptPath), { recursive: true });
+    if (!hasWorkspaceSessionStorage(session)) {
+      await fs.promises.mkdir(path.dirname(transcriptPath), { recursive: true });
+    }
     await appendSessionFile(transcriptPath, '');
+    this.writeErrors.delete(transcriptPath);
     return visiblePath;
   }
 
@@ -91,7 +97,9 @@ export class TranscriptStore implements TranscriptStoreLike {
     }
 
     const transcriptPath = this.getTranscriptAccessPath(session);
-    const previous = this.pendingWrites.get(transcriptPath) || Promise.resolve();
+    const buffered = this.pendingBatches.get(transcriptPath);
+    const previous = this.pendingWrites.get(transcriptPath)?.catch(() => undefined)
+      || Promise.resolve();
 
     // Only stat once per ~1MB appended rather than on every PTY chunk.
     const appended =
@@ -99,20 +107,45 @@ export class TranscriptStore implements TranscriptStoreLike {
     const shouldCheckSize = appended >= 1024 * 1024;
     this.appendedSinceCheck.set(transcriptPath, shouldCheckSize ? 0 : appended);
 
+    if (buffered) {
+      buffered.chunks.push(Buffer.from(data, 'utf8'));
+      buffered.check ||= shouldCheckSize;
+      return;
+    }
+    this.pendingBatches.set(transcriptPath, {
+      session, chunks: [Buffer.from(data, 'utf8')], check: shouldCheckSize,
+    });
+
     const next = previous.then(async () => {
+      // Coalesce all output delivered in the same event-loop turn. On the cwd
+      // helper backend this avoids a blocking process launch/fsync per PTY
+      // chunk while retaining the existing per-session ordering contract.
+      await new Promise<void>((resolve) => queueMicrotask(resolve));
+      const batch = this.pendingBatches.get(transcriptPath);
+      if (!batch) return;
+      this.pendingBatches.delete(transcriptPath);
       await ensureWorkspaceSessionDirectory(session);
-      await fs.promises.mkdir(path.dirname(transcriptPath), { recursive: true });
-      await appendSessionFile(transcriptPath, data, 'utf8');
-      if (shouldCheckSize) {
+      if (!hasWorkspaceSessionStorage(session)) {
+        await fs.promises.mkdir(path.dirname(transcriptPath), { recursive: true });
+      }
+      const bytes = Buffer.concat(batch.chunks);
+      for (let offset = 0; offset < bytes.length; offset += 1024 * 1024) {
+        await appendSessionFile(transcriptPath, bytes.subarray(offset, offset + 1024 * 1024));
+      }
+      if (batch.check) {
         await this.truncateHeadIfOversized(transcriptPath);
       }
     });
 
-    this.pendingWrites.set(transcriptPath, next.catch(() => undefined));
+    this.pendingWrites.set(transcriptPath, next);
 
-    void next.catch((error) => {
-      console.error(`Failed to append transcript for session ${session.id}:`, error);
-    });
+    void next.then(
+      () => this.writeErrors.delete(transcriptPath),
+      (error) => {
+        this.writeErrors.set(transcriptPath, error);
+        console.error(`Failed to append transcript for session ${session.id}:`, error);
+      },
+    );
   }
 
   async readTranscriptChunks(session: TranscriptSessionRef): Promise<string[]> {
@@ -182,14 +215,22 @@ export class TranscriptStore implements TranscriptStoreLike {
 
   async deleteTranscript(session: TranscriptSessionRef): Promise<void> {
     const transcriptPath = this.getTranscriptAccessPath(session);
-    await this.flushPath(transcriptPath);
-
+    // Deletion must always be able to unlink a poisoned entry — a transcript
+    // that was symlinked out, or whose append failed for any other reason —
+    // so wait for in-flight appends but do not let a stored write error block
+    // the cleanup of the workspace entry itself.
+    const pending = this.pendingWrites.get(transcriptPath);
+    if (pending) {
+      await pending.catch(() => undefined);
+    }
+    this.writeErrors.delete(transcriptPath);
     try {
       await unlinkSessionEntry(transcriptPath);
     } catch (error) {
       console.error(`Failed to delete transcript for session ${session.id}:`, error);
     } finally {
       this.pendingWrites.delete(transcriptPath);
+      this.writeErrors.delete(transcriptPath);
     }
   }
 
@@ -199,9 +240,9 @@ export class TranscriptStore implements TranscriptStoreLike {
 
   private async flushPath(transcriptPath: string): Promise<void> {
     const pending = this.pendingWrites.get(transcriptPath);
-    if (pending) {
-      await pending.catch(() => undefined);
-    }
+    if (pending) await pending;
+    const failed = this.writeErrors.get(transcriptPath);
+    if (failed) throw failed;
   }
 }
 

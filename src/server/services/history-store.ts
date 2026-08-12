@@ -17,6 +17,7 @@ import {
   unlinkSessionEntry,
   writePreparedSessionFile,
 } from './safe-session-file.js';
+import { workspaceSessionFileParentLease } from './workspace-session-storage.js';
 
 /**
  * Append-only store of finalised scrollback lines, addressable by absolute line
@@ -94,6 +95,7 @@ export class HistoryStore implements HistoryStoreLike {
 
   private readonly states = new Map<string, SessionState>();
   private readonly queues = new Map<string, Promise<unknown>>();
+  private readonly writeErrors = new Map<string, unknown>();
 
   constructor(options: HistoryStoreOptions) {
     this.storageDir = path.resolve(options.storageDir);
@@ -290,7 +292,9 @@ export class HistoryStore implements HistoryStoreLike {
       try {
         await ensureWorkspaceSessionDirectory(session);
         await this.appendNow(base, lines);
+        this.writeErrors.delete(base);
       } catch (error) {
+        this.writeErrors.set(base, error);
         console.error(`Failed to append history for session ${session.id}:`, error);
         // The write may have half-landed. Drop the cached offsets so the next
         // operation re-reads from disk and reconciles, instead of computing
@@ -303,10 +307,14 @@ export class HistoryStore implements HistoryStoreLike {
   async flush(session: HistorySessionRef): Promise<void> {
     const base = this.basePath(session);
     await this.enqueue(base, async () => undefined);
+    const failed = this.writeErrors.get(base);
+    if (failed) throw failed;
   }
 
   private async appendNow(base: string, lines: string[]): Promise<void> {
-    await fs.promises.mkdir(path.dirname(base), { recursive: true });
+    if (!workspaceSessionFileParentLease(`${base}.log`)) {
+      await fs.promises.mkdir(path.dirname(base), { recursive: true });
+    }
 
     const existed = this.states.has(base);
     const state = await this.loadState(base);
@@ -511,6 +519,7 @@ export class HistoryStore implements HistoryStoreLike {
       );
     });
     this.queues.delete(base);
+    this.writeErrors.delete(base);
   }
 }
 

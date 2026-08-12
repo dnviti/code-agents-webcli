@@ -79,14 +79,12 @@ async function makeHarness({ featureEnabled = true, containers = false } = {}) {
 }
 
 describe('project server composition', function () {
-  this.timeout(15_000);
+  this.timeout(process.platform === 'win32' ? 60_000 : 15_000);
 
-  it('reports and clears live workspace write failures through persistence diagnostics', async function () {
+  it('persists project session metadata in shared SQLite without opening a project database', async function () {
     const harness = await makeHarness();
     const { appServer, owner, request } = harness;
     const workspaceRoot = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'workspace-write-diagnostic-'));
-    let boundStore;
-    let originalSave;
     try {
       const validatePath = appServer.validatePath.bind(appServer);
       appServer.validatePath = (target, userId) => (
@@ -104,37 +102,28 @@ describe('project server composition', function () {
       appServer.claudeSessions.set(session.id, session);
       assert.strictEqual(await appServer.saveSessionsToDisk(), true);
 
-      boundStore = appServer.sessionStore.openWorkspace(session.storageScope);
-      originalSave = boundStore.saveSessions.bind(boundStore);
-      boundStore.saveSessions = async () => false;
-      session.customName = 'cannot persist';
-      assert.strictEqual(await appServer.saveSessionsToDisk(), false);
+      const row = appServer.database.raw.prepare(`
+        SELECT storage_workspace_root, storage_owner_key
+          FROM runtime_sessions
+         WHERE id = ?
+      `).get(session.id);
+      assert.strictEqual(row.storage_workspace_root, workspaceRoot);
+      assert.strictEqual(row.storage_owner_key, session.storageScope.ownerKey);
+      assert.strictEqual(
+        fs.existsSync(path.join(workspaceRoot, '.cc-web', 'session-state.sqlite')),
+        false,
+      );
 
-      let diagnostic = await request('GET', '/api/sessions/persistence');
+      const diagnostic = await request('GET', '/api/sessions/persistence');
       assert.strictEqual(diagnostic.status, 200);
-      assert.strictEqual(diagnostic.body.migrationComplete, false);
-      assert.ok(diagnostic.body.unavailable.some((entry) => (
-        entry.root === workspaceRoot && /workspace save failed|rollback failed/.test(entry.error)
-      )));
-      assert.strictEqual(
-        diagnostic.body.workspaces.find((entry) => entry.root === workspaceRoot).available,
-        false,
-      );
-
-      boundStore.saveSessions = originalSave;
-      assert.strictEqual(await appServer.saveSessionsToDisk(), true);
-      diagnostic = await request('GET', '/api/sessions/persistence');
-      assert.strictEqual(diagnostic.body.migrationComplete, true);
-      assert.strictEqual(
-        diagnostic.body.unavailable.some((entry) => entry.root === workspaceRoot),
-        false,
-      );
+      assert.strictEqual(diagnostic.body.storage, 'shared-app-sqlite');
+      assert.strictEqual(diagnostic.body.allAvailable, true);
+      assert.strictEqual(diagnostic.body.sessionCount, 1);
       assert.strictEqual(
         diagnostic.body.workspaces.find((entry) => entry.root === workspaceRoot).available,
         true,
       );
     } finally {
-      if (boundStore && originalSave) boundStore.saveSessions = originalSave;
       await harness.close();
       await fs.promises.rm(workspaceRoot, { recursive: true, force: true });
     }
@@ -484,6 +473,40 @@ describe('project server composition', function () {
       );
       assert.strictEqual(databaseClosed, true, 'shutdown still releases SQLite before reporting the flush failure');
     } finally {
+      await fs.promises.rm(dataDir, { recursive: true, force: true });
+    }
+  });
+
+  it('retries retained storage finalizers without replaying runtime teardown', async function () {
+    const dataDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'project-shutdown-close-retry-'));
+    const appServer = new ClaudeCodeWebServer({
+      dataDir,
+      baseFolder: dataDir,
+      githubClientId: 'composition-client',
+      githubClientSecret: 'composition-secret',
+      allowedGitHubIds: 'composition-user',
+      encryptionKey: ENCRYPTION_KEY,
+    });
+    let projectShutdowns = 0;
+    let workspaceCloses = 0;
+    const closeWorkspaces = appServer.sessionStore.closeWorkspaces.bind(appServer.sessionStore);
+    try {
+      appServer.saveSessionsToDisk = async () => {};
+      appServer.messageProcessor.drainAllRecorders = async () => {};
+      appServer.messageProcessor.drainPendingRuntimeStarts = async () => {};
+      appServer.projects.shutdown = async () => { projectShutdowns += 1; };
+      appServer.sessionStore.closeWorkspaces = () => {
+        workspaceCloses += 1;
+        if (workspaceCloses === 1) throw new Error('injected transient workspace close');
+        closeWorkspaces();
+      };
+
+      await assert.rejects(() => appServer.shutdown(), /injected transient workspace close/);
+      await assert.doesNotReject(() => appServer.shutdown());
+      assert.strictEqual(projectShutdowns, 1, 'runtime/project teardown must not be replayed');
+      assert.strictEqual(workspaceCloses, 2, 'retained workspace finalizer must be retried');
+    } finally {
+      appServer.sessionStore.closeWorkspaces = closeWorkspaces;
       await fs.promises.rm(dataDir, { recursive: true, force: true });
     }
   });

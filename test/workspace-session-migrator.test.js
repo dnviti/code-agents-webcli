@@ -1,4 +1,5 @@
 const assert = require('assert');
+const childProcess = require('child_process');
 const { createHash } = require('crypto');
 const fs = require('fs');
 const os = require('os');
@@ -12,6 +13,124 @@ const {
   closeWorkspaceSessionDirectoryLease,
   workspaceDescriptorRoot,
 } = require('../dist/server/services/workspace-session-storage.js');
+
+const MIGRATOR_MODULE = path.join(__dirname, '..', 'dist', 'server', 'services', 'workspace-session-migrator.js');
+const CWD_HELPER_MODULE = path.join(__dirname, '..', 'dist', 'server', 'services', 'workspace-cwd-helper.js');
+
+function nestedChildProcessProbe() {
+  const program = `
+    const cp = require('node:child_process');
+    const result = cp.spawnSync(process.execPath, ['-e', 'process.exit(0)'], { encoding: 'utf8' });
+    if (result.error) {
+      process.stderr.write(String(result.error.code || result.error));
+      process.exit(97);
+    }
+    process.exit(result.status === 0 ? 0 : 98);
+  `;
+  return childProcess.spawnSync(process.execPath, ['-e', program], {
+    encoding: 'utf8', timeout: 10_000,
+  });
+}
+
+function runFreshMigrationProcess({ legacyStorageDir, ref, action, cutpoint }) {
+  if (cutpoint !== undefined && cutpoint !== 'migration-retire-quarantine') {
+    throw new Error(`Unsupported migration test cutpoint: ${cutpoint}`);
+  }
+  const program = `
+    const childProcess = require('node:child_process');
+    const payload = JSON.parse(process.argv[1]);
+    Object.defineProperty(process, 'platform', { configurable: true, value: 'win32' });
+    const helper = require(payload.helperModule);
+    if (payload.cutpoint) {
+      helper.setWorkspaceCwdHelperSpawnerForTests((executable, args, options) => {
+        const result = childProcess.spawnSync(executable, args, {
+          ...options,
+          env: { ...options.env, CODE_AGENTS_WEBCLI_HELPER_TEST_CUTPOINT: payload.cutpoint },
+        });
+        const marker = 'CODE_AGENTS_WEBCLI_HELPER_TEST_CUTPOINT:' + payload.cutpoint;
+        const crashed = !result.error && (result.signal !== null || result.status !== 0);
+        const reached = String(result.stderr).split(/\\r?\\n/).includes(marker);
+        if (crashed && reached) {
+          process.kill(process.pid, 'SIGKILL');
+        }
+        return result;
+      });
+    }
+    const { WorkspaceSessionArtifactMigrator } = require(payload.migratorModule);
+    (async () => {
+      const migrator = new WorkspaceSessionArtifactMigrator({ legacyStorageDir: payload.legacyStorageDir });
+      let result = null;
+      if (payload.action === 'migrate' || payload.action === 'migrate-confirm') {
+        result = await migrator.migrate(payload.ref);
+        if (result.status !== 'complete') throw new Error('migration did not complete: ' + JSON.stringify(result));
+      }
+      if (payload.action === 'confirm' || payload.action === 'migrate-confirm') {
+        await migrator.confirm(payload.ref);
+      }
+      process.stdout.write(JSON.stringify({ ok: true, result }) + '\\n');
+    })().catch((error) => {
+      process.stderr.write(String(error && error.stack || error));
+      process.exit(1);
+    });
+  `;
+  return childProcess.spawnSync(process.execPath, ['-e', program, JSON.stringify({
+    legacyStorageDir,
+    ref,
+    action,
+    cutpoint,
+    migratorModule: MIGRATOR_MODULE,
+    helperModule: CWD_HELPER_MODULE,
+  })], {
+    cwd: path.join(__dirname, '..'), encoding: 'utf8', timeout: 60_000, maxBuffer: 8 * 1024 * 1024,
+  });
+}
+
+function requireNestedChildProcesses(context) {
+  const probe = nestedChildProcessProbe();
+  const diagnostic = `${probe.error?.code ?? ''}\n${probe.stderr ?? ''}`;
+  if (/EPERM/.test(diagnostic)) {
+    if (process.env.CCWEB_TEST_STRICT === '1') {
+      assert.fail(`nestedSubprocess capability disappeared after strict preflight: ${diagnostic.trim()}`);
+    }
+    context.skip();
+  }
+  assert.ifError(probe.error);
+  assert.strictEqual(probe.status, 0, probe.stderr);
+}
+
+function assertFreshMigrationSucceeded(result) {
+  assert.ifError(result.error);
+  assert.strictEqual(result.status, 0, result.stderr);
+  const reply = JSON.parse(result.stdout.trim());
+  assert.strictEqual(reply.ok, true);
+  return reply;
+}
+
+function assertFreshHostKilled(result) {
+  assert.ifError(result.error);
+  assert.ok(
+    result.signal === 'SIGKILL' || (result.signal === null && result.status !== 0),
+    `fresh migration host survived cutpoint: status=${result.status} signal=${result.signal} stderr=${result.stderr}`,
+  );
+}
+
+function migrationRetireQuarantines(directory) {
+  if (!fs.existsSync(directory)) return [];
+  const found = [];
+  const visit = (current) => {
+    for (const entry of fs.readdirSync(current, { withFileTypes: true })) {
+      const absolute = path.join(current, entry.name);
+      if (entry.name.startsWith('.ccweb-quarantine-migration-retire-')) found.push(absolute);
+      if (entry.isDirectory()) visit(absolute);
+    }
+  };
+  visit(directory);
+  return found;
+}
+
+function migrationRetireQuarantinePrefix(name) {
+  return `.ccweb-quarantine-migration-retire-${createHash('sha256').update(name).digest('hex').slice(0, 24)}-`;
+}
 
 describe('WorkspaceSessionArtifactMigrator', function () {
   let root;
@@ -145,6 +264,103 @@ describe('WorkspaceSessionArtifactMigrator', function () {
       '{"seq":1}\n{"seq":2}\n',
       'an idempotent confirm must not compare live bytes with stale migration fingerprints',
     );
+  });
+
+  it('cold-recovers a host killed after helper quarantine of a legacy source', function () {
+    this.timeout(150_000);
+    requireNestedChildProcesses(this);
+    const contents = Buffer.from('native source retirement cutpoint');
+    const source = writeLegacy('chat_log', contents);
+    const backup = path.join(
+      path.dirname(source),
+      `.${path.basename(source)}.ccweb-session-migration.bak`,
+    );
+    const marker = path.join(sessionDir(), '.legacy-artifact-migration.v1.json');
+    const target = path.join(sessionDir(), 'chat.jsonl');
+
+    const killed = runFreshMigrationProcess({
+      legacyStorageDir: legacy,
+      ref,
+      action: 'migrate',
+      cutpoint: 'migration-retire-quarantine',
+    });
+    assertFreshHostKilled(killed);
+    assert.strictEqual(fs.existsSync(source), false);
+    assert.strictEqual(fs.existsSync(backup), true);
+    const sourceQuarantines = migrationRetireQuarantines(legacy);
+    assert.strictEqual(sourceQuarantines.length, 1);
+    assert.ok(path.basename(sourceQuarantines[0]).startsWith(
+      migrationRetireQuarantinePrefix(path.basename(source)),
+    ));
+    assert.strictEqual(fs.existsSync(marker), true);
+
+    assertFreshMigrationSucceeded(runFreshMigrationProcess({
+      legacyStorageDir: legacy,
+      ref,
+      action: 'migrate-confirm',
+    }));
+    assert.strictEqual(fs.existsSync(source), false);
+    assert.strictEqual(fs.existsSync(backup), false);
+    assert.deepStrictEqual(migrationRetireQuarantines(legacy), []);
+    assert.strictEqual(fs.existsSync(marker), false);
+    assert.deepStrictEqual(fs.readFileSync(target), contents);
+  });
+
+  it('cold-confirms a quarantined backup for an unreferenced enumerated attachment', function () {
+    this.timeout(150_000);
+    requireNestedChildProcesses(this);
+    const storedName = 'abcdef123456-unreferenced.bin';
+    const contents = Buffer.from('enumeration-only attachment retirement cutpoint');
+    const source = path.join(
+      workspace, '.cc-web', 'attachments', owner, sessionId, storedName,
+    );
+    const backup = path.join(path.dirname(source), `.${storedName}.ccweb-session-migration.bak`);
+    const target = path.join(
+      workspace, '.cc-web', 'attachments', ownerKey, sessionId, storedName,
+    );
+    const marker = path.join(sessionDir(), '.legacy-artifact-migration.v1.json');
+    fs.mkdirSync(path.dirname(source), { recursive: true });
+    fs.writeFileSync(source, contents);
+    ref.workingDir = workspace;
+
+    const migrated = assertFreshMigrationSucceeded(runFreshMigrationProcess({
+      legacyStorageDir: legacy,
+      ref,
+      action: 'migrate',
+    }));
+    assert.ok(migrated.result.artifacts.some((entry) => (
+      entry.artifact === 'attachment_file' && entry.state === 'migrated'
+    )), 'the unreferenced attachment must come from directory enumeration');
+    assert.strictEqual(fs.existsSync(source), false);
+    assert.strictEqual(fs.existsSync(backup), true);
+    assert.strictEqual(fs.existsSync(marker), true);
+
+    const killed = runFreshMigrationProcess({
+      legacyStorageDir: legacy,
+      ref,
+      action: 'confirm',
+      cutpoint: 'migration-retire-quarantine',
+    });
+    assertFreshHostKilled(killed);
+    assert.strictEqual(fs.existsSync(source), false);
+    assert.strictEqual(fs.existsSync(backup), false);
+    const backupQuarantines = migrationRetireQuarantines(workspace);
+    assert.strictEqual(backupQuarantines.length, 1);
+    assert.ok(path.basename(backupQuarantines[0]).startsWith(
+      migrationRetireQuarantinePrefix(path.basename(backup)),
+    ));
+    assert.strictEqual(fs.existsSync(marker), true);
+
+    assertFreshMigrationSucceeded(runFreshMigrationProcess({
+      legacyStorageDir: legacy,
+      ref,
+      action: 'migrate-confirm',
+    }));
+    assert.strictEqual(fs.existsSync(source), false);
+    assert.strictEqual(fs.existsSync(backup), false);
+    assert.deepStrictEqual(migrationRetireQuarantines(workspace), []);
+    assert.strictEqual(fs.existsSync(marker), false);
+    assert.deepStrictEqual(fs.readFileSync(target), contents);
   });
 
   it('resumes after publish by verifying the target before deleting the source', async function () {

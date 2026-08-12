@@ -8,6 +8,13 @@
  */
 exports.default = async function notarizeAfterSign(context) {
   if (context.electronPlatformName !== 'darwin') return;
+  if (process.env.CODE_AGENTS_WEBCLI_SKIP_NOTARIZATION === '1') {
+    if (process.env.CODE_AGENTS_WEBCLI_REQUIRE_NOTARIZATION === 'true') {
+      throw new Error('macOS notarization cannot be both required and explicitly disabled');
+    }
+    console.warn('Skipping macOS notarization for an explicitly unsigned build.');
+    return;
+  }
 
   const required = ['APPLE_API_KEY', 'APPLE_API_KEY_ID', 'APPLE_API_ISSUER'];
   const missing = required.filter((name) => !process.env[name]);

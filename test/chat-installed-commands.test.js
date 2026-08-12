@@ -267,6 +267,16 @@ describe('installed skills and commands', function () {
     // No `.git` anywhere above: only the working directory is searched. Climbing
     // to the filesystem root on the off chance would offer skills from whatever
     // project happens to own `/tmp`, which the session has nothing to do with.
+    // Some managed runners inject a `.git` directory in a shared ancestor.
+    // That makes the premise false, and should not make a production-semantic
+    // test fail: agy really would walk to that marker.
+    let ancestor = path.dirname(cwd());
+    while (true) {
+      if (fs.existsSync(path.join(ancestor, '.git'))) this.skip();
+      const parent = path.dirname(ancestor);
+      if (parent === ancestor) break;
+      ancestor = parent;
+    }
     skill('project/.agents/skills/mine', 'name: mine');
     skill('.agents/skills/stranger', 'name: stranger');
     assert.deepStrictEqual(names(scan('antigravity')), ['mine']);

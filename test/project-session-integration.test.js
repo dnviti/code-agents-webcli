@@ -406,14 +406,9 @@ describe('project session integration', function () {
         environment,
         workingDir: checkout,
         allowedWorkingDirs: [workspace],
-        containerAccess: {
-          projectId: 'project-1',
-          ownerUserId: USER.id,
-          containerName: 'project-1',
-          root: '/',
-          workspaceRoot: '/workspace',
-          ownerHomeRoot: '/home/owner',
-        },
+        // This host-environment seam does not expose the project container's
+        // POSIX namespace. File delegation is covered separately; omitting the
+        // capability here keeps this lifecycle test portable on Windows.
         leaseId: `fallback-${++ensures}`,
       }),
       releaseSessionLease: (_owner, _project, leaseId) => {

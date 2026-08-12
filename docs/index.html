@@ -47,7 +47,7 @@
             <pre class="snippet"><code>npx --allow-git=all github:dnviti/code-agents-webcli</code></pre>
             <p class="tagline">
               That is the whole install. Nothing compiles, no C++ toolchain, no second command.
-              Needs Node 22.13+ and a GitHub OAuth App.
+              Needs Node 24.16+ and a GitHub OAuth App.
             </p>
           </div>
           <div class="hero-aside">
@@ -114,7 +114,7 @@ https://localhost:32352/auth/github/callback</code></pre>
         <div class="container">
           <h2>Deploy</h2>
           <ul class="bullets">
-            <li><strong>Requirements:</strong> Node 22.13 or newer, <code>openssl</code> on PATH, and a GitHub OAuth App. Nothing else.</li>
+            <li><strong>Requirements:</strong> Node 24.16 or newer, <code>openssl</code> on PATH, and a GitHub OAuth App. Nothing else.</li>
             <li><strong>HTTPS only:</strong> the server generates its own certificate authority on first start; trust it once per device from <code>/ca.crt</code>. A plain-http origin costs you the service worker, the clipboard and the installable app.</li>
             <li><strong>Background service:</strong> the setup wizard can install a <code>systemd --user</code> unit that starts at boot and survives logout.</li>
             <li><strong>Docker:</strong> <code>ghcr.io/dnviti/code-agents-webcli</code> ships the web server only — derive an image to add the agent CLIs, and mount a volume or your users and sessions vanish with the container.</li>

@@ -42,6 +42,26 @@ describe('desktop phone access network', function () {
     ]);
   });
 
+  it('offers no LAN address when interface inspection is capability-denied', function () {
+    for (const denied of [
+      Object.assign(new Error('network interfaces are unavailable'), {
+        code: 'ERR_ACCESS_DENIED', permission: 'os.networkInterfaces',
+      }),
+      Object.assign(new Error('uv_interface_addresses returned Unknown system error 1'), {
+        code: 'ERR_SYSTEM_ERROR', syscall: 'uv_interface_addresses', errno: 1,
+      }),
+    ]) {
+      assert.deepStrictEqual(
+        listPhoneAccessInterfaces({ networkInterfaces: () => { throw denied; } }),
+        [],
+      );
+    }
+    assert.throws(
+      () => listPhoneAccessInterfaces({ networkInterfaces: () => { throw Object.assign(new Error('interface probe broke'), { code: 'EIO' }); } }),
+      /interface probe broke/,
+    );
+  });
+
   it('accepts an exact current address and rejects stale or unsafe addresses', function () {
     assert.deepStrictEqual(validatePhoneAccessAddress('fd12:3456:789a::12', interfaces), {
       name: 'wifi', address: 'fd12:3456:789a::12', family: 'IPv6',

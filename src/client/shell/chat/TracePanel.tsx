@@ -56,13 +56,14 @@ export function TracePanel({
   onApplyHunk,
   onRevertHunk,
 }: TracePanelProps): React.JSX.Element {
-  const events = useActivity(transcript, showThinking, showToolCalls);
+  const activity = useActivity(transcript, showThinking, showToolCalls);
 
   return (
     <div style={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column' }}>
       {showPlan ? <PlanPanel items={plan} variant="rail" /> : null}
       <ActivityTimeline
-        events={events}
+        events={activity.events}
+        revision={activity.revision}
         filter={filter}
         onFilter={onFilter}
         onReveal={onReveal}

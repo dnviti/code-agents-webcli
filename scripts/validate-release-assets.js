@@ -5,9 +5,14 @@ const fs = require('node:fs');
 const path = require('node:path');
 const YAML = require('yaml');
 
-const directory = process.argv[2];
-if (!directory) throw new Error('Usage: node scripts/validate-release-assets.js DIRECTORY [VERSION]');
-const version = process.argv[3] || require('../package.json').version;
+const [directory, ...argumentsAfterDirectory] = process.argv.slice(2);
+const unsignedArguments = argumentsAfterDirectory.filter((argument) => argument === '--unsigned');
+const versionArguments = argumentsAfterDirectory.filter((argument) => argument !== '--unsigned');
+if (!directory || unsignedArguments.length > 1 || versionArguments.length > 1) {
+  throw new Error('Usage: node scripts/validate-release-assets.js DIRECTORY [VERSION] [--unsigned]');
+}
+const unsigned = unsignedArguments.length === 1;
+const version = versionArguments[0] || require('../package.json').version;
 const fail = (message) => { throw new Error(`Release asset validation failed: ${message}`); };
 const escapedVersion = version.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
@@ -30,8 +35,10 @@ const artifacts = {
   deb: one(new RegExp(`^Code-Agents-Web-CLI-${escapedVersion}-linux-x64\\.deb$`), 'Debian package'),
   rpm: one(new RegExp(`^Code-Agents-Web-CLI-${escapedVersion}-linux-x64\\.rpm$`), 'RPM package'),
   flatpak: one(new RegExp(`^Code-Agents-Web-CLI-${escapedVersion}-linux-x64\\.flatpak$`), 'Flatpak bundle'),
-  flatpakRef: one(new RegExp(`^Code-Agents-Web-CLI-${escapedVersion}-linux-x64\\.flatpakref$`), 'Flatpak reference'),
-  flatpakRepo: one(new RegExp(`^Code-Agents-Web-CLI-${escapedVersion}-linux-x64\\.flatpakrepo$`), 'Flatpak repository descriptor'),
+  ...(unsigned ? {} : {
+    flatpakRef: one(new RegExp(`^Code-Agents-Web-CLI-${escapedVersion}-linux-x64\\.flatpakref$`), 'Flatpak reference'),
+    flatpakRepo: one(new RegExp(`^Code-Agents-Web-CLI-${escapedVersion}-linux-x64\\.flatpakrepo$`), 'Flatpak repository descriptor'),
+  }),
   windows: one(new RegExp(`^Code-Agents-Web-CLI-${escapedVersion}-win-x64\\.exe$`), 'Windows installer'),
   windowsBlockmap: one(new RegExp(`^Code-Agents-Web-CLI-${escapedVersion}-win-x64\\.exe\\.blockmap$`), 'Windows blockmap'),
   macX64Dmg: one(new RegExp(`^Code-Agents-Web-CLI-${escapedVersion}-mac-x64\\.dmg$`), 'macOS x64 DMG'),
@@ -128,8 +135,7 @@ async function main() {
     artifacts.deb,
     artifacts.rpm,
     artifacts.flatpak,
-    artifacts.flatpakRef,
-    artifacts.flatpakRepo,
+    ...(!unsigned ? [artifacts.flatpakRef, artifacts.flatpakRepo] : []),
     artifacts.windows,
     artifacts.macX64Dmg,
     artifacts.macArm64Dmg,
@@ -141,7 +147,7 @@ async function main() {
     }
   }
 
-  console.log(`Validated ${humanPackages.length} human-facing packages and exact updater metadata for ${version}.`);
+  console.log(`Validated ${humanPackages.length} human-facing packages and exact updater metadata for ${version}${unsigned ? ' (unsigned)' : ''}.`);
 }
 
 main().catch((error) => {

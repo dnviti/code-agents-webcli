@@ -39,17 +39,28 @@ function manager(workingDir, baseFolder) {
 
 describe('chat file confinement', function () {
   let workingDir;
-  // Deliberately NOT under the OS temp dir, which is a permitted root in its
-  // own right: a base-folder fixture built there is allowed by the temp rule
-  // before the base folder is ever consulted, and every assertion below would
-  // pass against code that had no idea what a base folder was.
+  let fixtureRoot;
+  let originalTmpdir;
+  // The browsable-area and outside-area fixtures are siblings in one writable
+  // test root. The manager sees a separate sibling as its OS scratch directory,
+  // so the production temp exception cannot make the confinement assertions
+  // pass before the base-folder boundary is consulted.
   let outside;
   before(function () {
-    workingDir = fs.mkdtempSync(path.join(os.tmpdir(), 'confine-project-'));
-    outside = fs.mkdtempSync(path.join(os.homedir(), '.ccweb-confine-test-'));
+    originalTmpdir = os.tmpdir;
+    fixtureRoot = fs.mkdtempSync(path.join(originalTmpdir(), 'ccweb-confine-test-'));
+    const browsable = path.join(fixtureRoot, 'browsable');
+    const scratch = path.join(fixtureRoot, 'scratch');
+    outside = path.join(fixtureRoot, 'outside');
+    workingDir = path.join(browsable, 'project');
+    for (const directory of [workingDir, scratch, outside]) {
+      fs.mkdirSync(directory, { recursive: true });
+    }
+    os.tmpdir = () => scratch;
   });
   after(function () {
-    if (outside) fs.rmSync(outside, { recursive: true, force: true });
+    if (originalTmpdir) os.tmpdir = originalTmpdir;
+    if (fixtureRoot) fs.rmSync(fixtureRoot, { recursive: true, force: true });
   });
 
   it('reads and writes inside the session directory', async function () {

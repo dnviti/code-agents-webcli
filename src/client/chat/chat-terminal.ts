@@ -431,7 +431,7 @@ export class ChatTerminal {
 const BY_CHAT = new Map<string, ChatTerminal[]>();
 const MAX_CHATS = 4;
 
-/** Browser key used by old builds; session ids now stay in workspace SQLite. */
+/** Browser key used by old builds; session ids now stay in shared app SQLite. */
 const REMEMBERED = 'cc-web-chat-terminals';
 
 function forgetLegacyRememberedTerminals(): void {
@@ -442,13 +442,13 @@ function forgetLegacyRememberedTerminals(): void {
   }
 }
 
-/** Ask the owning workspace record which durable child shells belong here. */
+/** Ask the shared session record which durable child shells belong here. */
 export async function rememberedTerminals(chatSessionId: string): Promise<string[]> {
   forgetLegacyRememberedTerminals();
   const response = await controllerFetch(
     `/api/sessions/${encodeURIComponent(chatSessionId)}/children`,
   );
-  // Compatibility with a server from before workspace-owned child discovery.
+  // Compatibility with a server from before server-owned child discovery.
   if (response.status === 404) return [];
   if (!response.ok) throw new Error(`Could not restore conversation terminals (${response.status})`);
   const body = await response.json() as { sessionIds?: unknown };

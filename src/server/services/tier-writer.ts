@@ -272,6 +272,28 @@ export default function (pi: any) {
 `;
 
 /**
+ * omp's model roles, in the order its own settings surface shows them.
+ *
+ * Each role names a job rather than a size; the rungs are the preference order
+ * the ladder answers with. The first rung with a model wins, so a blank rung
+ * falls back to a neighbour instead of leaving the role empty. `vision` reads
+ * images: if the floor model cannot see them, the multimodal model belongs on
+ * `mid`.
+ */
+const OMP_ROLES: ReadonlyArray<readonly [string, readonly ModelTier[]]> = [
+  ['default', ['mid', 'high']],
+  ['smol', ['floor', 'mid']],
+  ['slow', ['high', 'top']],
+  ['vision', ['floor', 'mid']],
+  ['plan', ['top', 'high']],
+  ['designer', ['mid', 'high']],
+  ['commit', ['floor', 'mid']],
+  ['tiny', ['floor', 'mid']],
+  ['task', ['mid', 'high']],
+  ['advisor', ['top', 'high']],
+];
+
+/**
  * pi.
  *
  * Written into the *session's* `.pi/agents/`, not `~/.pi/agent/agents/`.
@@ -369,6 +391,72 @@ const writePiTiers: Writer = (tiers, profile, ctx) => {
 };
 
 /**
+ * Same read-only tiers as TIER_TOOLS, in claude's PascalCase tool names.
+ *
+ * Claude codes its available tools as `Read`, `Grep`, `Glob`, `Bash`, `Write`,
+ * `Edit`, ... The restricted rungs get inspection tools only; the workhorse
+ * rungs omit the list and inherit everything.
+ */
+const CLAUDE_TIER_TOOLS: Partial<Record<ModelTier, string[]>> = {
+  floor: ['Read', 'Grep', 'Glob', 'Bash'],
+  top: ['Read', 'Grep', 'Glob', 'Bash'],
+};
+
+/**
+ * Claude Code.
+ *
+ * Claude has no per-role ladder either, but it does take session-scoped
+ * subagents on the command line: `--agents` accepts JSON defining agents that
+ * live for that one process. Each rung becomes one agent with the rung's
+ * model, so nothing is written into the user's repository — the whole ladder
+ * arrives as launch arguments, which is also why there is nothing to defer
+ * when no session directory is known.
+ *
+ * Verified against claude 2.1.221: `--agents <json>` is in the CLI reference,
+ * and the JSON accepts the same fields as `.claude/agents/<name>.md`
+ * frontmatter — `description`, `prompt`, `tools`, `model`, `effort` (see
+ * code.claude.com/docs/en/sub-agents).
+ */
+const writeClaudeTiers: Writer = (tiers, profile, ctx) => {
+  const result: TierWriteResult = { written: [], replaced: [], args: [] };
+
+  const agents: Record<string, unknown> = {};
+  for (const tier of MODEL_TIERS) {
+    const model = tiers[tier];
+    if (!model) continue;
+
+    const tools = CLAUDE_TIER_TOOLS[tier];
+    const readOnly = tools
+      ? [
+          'You are read-only. Use Bash for inspection only - searching, reading, ',
+          'and git history. Do not edit, write, install, or commit.',
+          '',
+        ]
+      : [];
+    agents[tier] = {
+      description: TIER_DESCRIPTION[tier],
+      prompt: [
+        TIER_DESCRIPTION[tier],
+        '',
+        ...readOnly,
+        'Report what you found or changed, with concrete file:line references.',
+        '',
+      ].join('\n'),
+      ...(tools ? { tools } : {}),
+      model,
+      effort: TIER_EFFORT[tier],
+    };
+  }
+  if (Object.keys(agents).length === 0) return result;
+
+  // One argv element: the spawn passes arguments verbatim, so the JSON needs
+  // no shell quoting, and it stays independent of anything the user's own
+  // ~/.claude settings do elsewhere.
+  result.args.push('--agents', JSON.stringify(agents));
+  return result;
+};
+
+/**
  * Oh My Pi.
  *
  * omp has native model roles, so tiers map onto config rather than onto agent
@@ -380,15 +468,20 @@ const writeOmpTiers: Writer = (tiers, profile, ctx) => {
 
   // omp's roles are not a 1:1 match for the four tiers: `smol` is the cheap
   // helper, `task` runs delegated work, `slow` is the reasoning model. `plan`
-  // and `designer` follow the tiers closest to their job.
-  const roles: [string, string | undefined][] = [
-    ['smol', tiers.floor],
-    ['task', tiers.mid],
-    ['designer', tiers.mid],
-    ['slow', tiers.high ?? tiers.top],
-    ['plan', tiers.top ?? tiers.high],
-    ['default', tiers.mid ?? tiers.high],
-  ];
+  // and `designer` follow the tiers closest to their job, and the utility
+  // roles — `vision`, `commit`, `tiny`, `advisor` — take the cheapest rung
+  // that can still do theirs. The table is shared, so every one of omp's ten
+  // roles resolves here in the same order omp presents them.
+  const roles: Array<[string, string]> = [];
+  for (const [role, rungs] of OMP_ROLES) {
+    for (const tier of rungs) {
+      const model = tiers[tier];
+      if (model) {
+        roles.push([role, model]);
+        break;
+      }
+    }
+  }
 
   const lines = [
     `# ${MANAGED_MARKER} (profile: ${profile.name})`,
@@ -398,7 +491,6 @@ const writeOmpTiers: Writer = (tiers, profile, ctx) => {
   ];
   let any = false;
   for (const [role, model] of roles) {
-    if (!model) continue;
     // Quoted so a model id containing ':' (a thinking-level suffix, say) stays
     // one scalar instead of parsing as a nested mapping.
     lines.push(`  ${role}: ${JSON.stringify(model)}`);

@@ -1,5 +1,25 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+- Persistence is split between one shared, per-user `app.sqlite` and each
+  project's `.cc-web/` directory. The database owns global configuration,
+  authentication, session/tab metadata, composer drafts, usage accounting and
+  immutable project-scope references. Project directories own only the bulk
+  conversation and terminal data: chat logs, transcripts, scrollback, pasted
+  images and attachments. Projects no longer contain `session-state.sqlite`.
+- This layout has no automatic migration path. A clean installation starts a
+  new `app.sqlite` and does not import state from an older storage layout;
+  existing files are left untouched. A complete backup or restore therefore
+  needs both the per-user application data directory and every project's
+  `.cc-web/` directory.
+- Project-file persistence is verified under `.cc-web/` on Linux, Windows, and
+  macOS. Native unsigned Windows and Intel / Apple-silicon macOS packages are
+  built and smoke-tested when release signing credentials are unavailable;
+  signed and notarized release paths remain available when their protected
+  identities are configured.
+
 ## [6.1.1] - 2026-08-08
 
 ### Fixed

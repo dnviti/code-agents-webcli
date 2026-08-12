@@ -3,6 +3,7 @@ const fs = require('fs').promises;
 const os = require('os');
 const path = require('path');
 const { TranscriptStore } = require('../dist/server/services/transcript-store.js');
+const safeSessionFiles = require('../dist/server/services/safe-session-file.js');
 
 describe('TranscriptStore', function() {
   let tempDir;
@@ -50,6 +51,34 @@ describe('TranscriptStore', function() {
 
     const exists = await fs.access(transcriptPath).then(() => true).catch(() => false);
     assert.strictEqual(exists, false);
+  });
+
+  it('keeps a failed append visible to lifecycle flush until a later write succeeds', async function() {
+    const transcriptPath = await transcriptStore.ensureTranscript(session);
+    const originalAppendFile = safeSessionFiles.appendSessionFile;
+    let injected = false;
+    safeSessionFiles.appendSessionFile = async function(file, ...args) {
+      if (!injected && String(file) === transcriptPath) {
+        injected = true;
+        throw new Error('injected transcript append failure');
+      }
+      return originalAppendFile(file, ...args);
+    };
+
+    try {
+      transcriptStore.appendOutput(session, 'lost');
+      await assert.rejects(
+        () => transcriptStore.flush(session),
+        /injected transcript append failure/,
+      );
+    } finally {
+      safeSessionFiles.appendSessionFile = originalAppendFile;
+    }
+
+    assert.strictEqual(injected, true);
+    transcriptStore.appendOutput(session, 'kept');
+    await assert.doesNotReject(() => transcriptStore.flush(session));
+    assert.strictEqual(await fs.readFile(transcriptPath, 'utf8'), 'kept');
   });
 
   it('refuses a workspace root reached through a symlink', async function() {

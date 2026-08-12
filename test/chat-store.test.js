@@ -367,6 +367,32 @@ describe('ChatStore', function () {
   });
 
   describe('crash repair', function () {
+    it('keeps a failed append visible to lifecycle flush until a later write succeeds', async function () {
+      const session = { id: 's1', ownerUserId: 1 };
+      const base = path.join(dir, '1', 's1');
+      const originalAppendFile = safeSessionFiles.appendSessionFile;
+      let injected = false;
+      safeSessionFiles.appendSessionFile = async function (file, ...args) {
+        if (!injected && String(file) === `${base}.jsonl`) {
+          injected = true;
+          throw new Error('injected chat append failure');
+        }
+        return originalAppendFile(file, ...args);
+      };
+
+      try {
+        await assert.rejects(() => store.append(session, makeEvents(1, 1)));
+      } finally {
+        safeSessionFiles.appendSessionFile = originalAppendFile;
+      }
+
+      assert.strictEqual(injected, true);
+      await assert.rejects(() => store.flush(session));
+      await store.append(session, makeEvents(1, 1));
+      await assert.doesNotReject(() => store.flush(session));
+      assert.deepStrictEqual((await store.read(session, 1, 10)).events.map((event) => event.seq), [1]);
+    });
+
     it('treats a complete log append as committed when the derived index append fails', async function () {
       const session = { id: 's1', ownerUserId: 1 };
       await store.append(session, makeEvents(1, 3));
