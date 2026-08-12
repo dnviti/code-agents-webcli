@@ -39,7 +39,14 @@ describe('tier writer', function () {
   it('knows which runtimes can express tiers', function () {
     assert.ok(supportsTiers('pi'));
     assert.ok(supportsTiers('omp'));
-    assert.ok(!supportsTiers('claude'));
+    assert.ok(supportsTiers('claude'));
+    assert.ok(supportsTiers('grok'));
+    // codex's per-role agent system has not shipped in a stable build yet, so
+    // its conversation model keeps flowing through the ordinary model plumbing
+    // rather than through a ladder that would land nowhere.
+    assert.ok(!supportsTiers('codex'));
+    assert.ok(!supportsTiers('kimi'));
+    assert.ok(!supportsTiers('qwen'));
     assert.ok(!supportsTiers('terminal'));
     assert.ok(tierCapableRuntimes().includes('pi'));
   });
@@ -52,7 +59,7 @@ describe('tier writer', function () {
 
   it('reports unsupported rather than silently discarding tiers', function () {
     // A user who typed four model names deserves to be told they went nowhere.
-    const result = applyTiers(profile({ runtime: 'claude', tiers: { mid: 'x' } }), ctx);
+    const result = applyTiers(profile({ runtime: 'kimi', tiers: { mid: 'x' } }), ctx);
     assert.strictEqual(result.unsupported, true);
     assert.deepStrictEqual(result.written, []);
   });
@@ -251,6 +258,120 @@ describe('tier writer', function () {
     });
   });
 
+  describe('grok', function () {
+    function grokProfile(tiers) {
+      return { id: 'p8', name: 'Role files', runtime: 'grok', tiers };
+    }
+
+    function roleDir() {
+      return path.join(ctx.workingDir, '.grok', 'roles');
+    }
+
+    it('writes one role file per named rung into the session project', function () {
+      const result = applyTiers(
+        grokProfile({ floor: 'vendor/small', top: 'vendor/large' }),
+        ctx,
+      );
+      const dir = roleDir();
+      assert.strictEqual(fs.readdirSync(dir).filter((n) => n.endsWith('.toml')).length, 2);
+      assert.ok(fs.existsSync(path.join(dir, 'floor.toml')));
+      assert.ok(fs.existsSync(path.join(dir, 'top.toml')));
+      assert.ok(!fs.existsSync(path.join(dir, 'mid.toml')));
+      assert.ok(result.written.length === 2);
+    });
+
+    it('gives the read-only rungs a capability mode and passes the model through', function () {
+      applyTiers(grokProfile({ floor: 'vendor/model:high', mid: 'm' }), ctx);
+      const floor = fs.readFileSync(path.join(roleDir(), 'floor.toml'), 'utf8');
+      assert.ok(floor.includes('model = "vendor/model:high"'), floor);
+      assert.ok(floor.includes('default_capability_mode = "read-only"'), floor);
+      const mid = fs.readFileSync(path.join(roleDir(), 'mid.toml'), 'utf8');
+      assert.ok(mid.includes('model = "m"'), mid);
+      assert.ok(!mid.includes('default_capability_mode'), mid);
+    });
+
+    it('marks the generated directory as ignored by git', function () {
+      applyTiers(grokProfile({ mid: 'm' }), ctx);
+      const ignore = path.join(roleDir(), '.gitignore');
+      assert.ok(fs.existsSync(ignore));
+      assert.ok(fs.readFileSync(ignore, 'utf8').includes('*'));
+    });
+
+    it('defers instead of guessing when no session directory is known', function () {
+      const { workingDir, ...noSession } = ctx;
+      const result = applyTiers(grokProfile({ mid: 'm' }), noSession);
+      assert.deepStrictEqual(result.written, []);
+      assert.match(result.deferred, /per session/i);
+      assert.ok(!fs.existsSync(path.join(ctx.homeDir, '.grok')));
+    });
+
+    it('replaces a role file the user wrote, keeping a .bak beside it', function () {
+      const dir = roleDir();
+      fs.mkdirSync(dir, { recursive: true });
+      const mine = path.join(dir, 'mid.toml');
+      fs.writeFileSync(mine, 'hand written\n');
+
+      applyTiers(grokProfile({ mid: 'x' }), ctx);
+      assert.ok(fs.readFileSync(mine, 'utf8').includes('model = "x"'));
+      assert.strictEqual(fs.readFileSync(`${mine}.bak`, 'utf8'), 'hand written\n');
+    });
+  });
+
+  describe('claude', function () {
+    function claudeProfile(tiers) {
+      return { id: 'p7', name: 'Session agents', runtime: 'claude', tiers };
+    }
+
+    function parsedAgents(result) {
+      assert.strictEqual(result.args[0], '--agents');
+      return JSON.parse(result.args[1]);
+    }
+
+    it('carries the ladder as session agents on the command line', function () {
+      const result = applyTiers(
+        claudeProfile({ floor: 'cheap', mid: 'work', high: 'sharp', top: 'best' }),
+        ctx,
+      );
+      assert.deepStrictEqual(result.written, []);
+      assert.deepStrictEqual(result.replaced, []);
+      const agents = parsedAgents(result);
+      assert.deepStrictEqual(Object.keys(agents), ['floor', 'mid', 'high', 'top']);
+      assert.strictEqual(agents.floor.model, 'cheap');
+      assert.strictEqual(agents.mid.model, 'work');
+      assert.strictEqual(agents.high.model, 'sharp');
+      assert.strictEqual(agents.top.model, 'best');
+    });
+
+    it('restricts the read-only rungs to inspection tools and cheap thinking', function () {
+      const result = applyTiers(claudeProfile({ floor: 'a', top: 'b' }), ctx);
+      const agents = parsedAgents(result);
+      assert.deepStrictEqual(agents.floor.tools, ['Read', 'Grep', 'Glob', 'Bash']);
+      assert.deepStrictEqual(agents.top.tools, ['Read', 'Grep', 'Glob', 'Bash']);
+      assert.strictEqual(agents.floor.effort, 'low');
+      assert.strictEqual(agents.top.effort, 'max');
+    });
+
+    it('leaves the workhorse rungs with every tool', function () {
+      const result = applyTiers(claudeProfile({ mid: 'm' }), ctx);
+      const agents = parsedAgents(result);
+      assert.deepStrictEqual(Object.keys(agents), ['mid']);
+      assert.strictEqual(agents.mid.tools, undefined);
+      assert.strictEqual(agents.mid.model, 'm');
+      assert.strictEqual(agents.mid.effort, 'medium');
+    });
+
+    it('passes the model through untouched', function () {
+      const result = applyTiers(claudeProfile({ mid: 'some-gateway/vendor/model:high' }), ctx);
+      assert.strictEqual(parsedAgents(result).mid.model, 'some-gateway/vendor/model:high');
+    });
+
+    it('writes nothing into the project or home directory', function () {
+      applyTiers(claudeProfile({ mid: 'm' }), ctx);
+      assert.ok(!fs.existsSync(path.join(ctx.workingDir, '.claude')));
+      assert.ok(!fs.existsSync(path.join(ctx.homeDir, '.claude')));
+    });
+  });
+
   describe('omp', function () {
     function ompProfile(tiers) {
       return { id: 'p9', name: 'Mixed', runtime: 'omp', tiers };
@@ -270,13 +391,21 @@ describe('tier writer', function () {
       assert.strictEqual(result.args[1], result.written[0]);
     });
 
-    it('maps tiers onto omp model roles', function () {
+    it('maps every one of the ten roles onto the tier rungs', function () {
       const result = applyTiers(ompProfile({ floor: 'f', mid: 'm', high: 'h', top: 't' }), ctx);
       const body = fs.readFileSync(result.written[0], 'utf8');
+      // Cheap utility roles take the floor, the workhorse roles take mid, and
+      // reasoning and judgment roles take high and top. Order is omp's own.
+      assert.ok(body.includes('default: "m"'), body);
       assert.ok(body.includes('smol: "f"'), body);
-      assert.ok(body.includes('task: "m"'), body);
       assert.ok(body.includes('slow: "h"'), body);
+      assert.ok(body.includes('vision: "f"'), body);
       assert.ok(body.includes('plan: "t"'), body);
+      assert.ok(body.includes('designer: "m"'), body);
+      assert.ok(body.includes('commit: "f"'), body);
+      assert.ok(body.includes('tiny: "f"'), body);
+      assert.ok(body.includes('task: "m"'), body);
+      assert.ok(body.includes('advisor: "t"'), body);
     });
 
     it('quotes model ids so a thinking suffix does not parse as a mapping', function () {
@@ -286,12 +415,17 @@ describe('tier writer', function () {
     });
 
     it('falls back between neighbouring tiers rather than emitting an empty role', function () {
-      // Only `high` given: `slow` uses it and `plan` falls back to it too.
+      // Only `high` given: every role with it in its chain answers from it
+      // (`slow`, `plan`, `default`, `designer`, `task`, `advisor`), and the
+      // floor-bound utility roles stay empty rather than climbing up.
       const result = applyTiers(ompProfile({ high: 'only' }), ctx);
       const body = fs.readFileSync(result.written[0], 'utf8');
-      assert.ok(body.includes('slow: "only"'), body);
-      assert.ok(body.includes('plan: "only"'), body);
-      assert.ok(!body.includes('smol:'), body);
+      for (const role of ['slow', 'plan', 'default', 'designer', 'task', 'advisor']) {
+        assert.ok(body.includes(`${role}: "only"`), body);
+      }
+      for (const role of ['smol', 'vision', 'commit', 'tiny']) {
+        assert.ok(!body.includes(`${role}:`), body);
+      }
     });
   });
 
