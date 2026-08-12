@@ -107,6 +107,10 @@ export function createProfileRoutes(deps: ProfileRoutesDeps): Router {
         // A writer that places its files per session cannot act on a save; the
         // sentence it hands back is what the dialog shows instead of silence.
         deferred: result.deferred,
+        // A writer that carries the ladder as launch arguments reports those,
+        // so the dialog can say the ladder was applied rather than staying
+        // silent about a save that landed nowhere visible.
+        args: result.args,
       };
     }
 
