@@ -39,7 +39,9 @@ const updaterBridge = updaterBridgeTag === releaseTag && added[0] === updaterPor
 // This immutable version check makes the new host-process permission a true
 // one-release migration. The workflow's automatically populated updater tag
 // must not turn into a standing exception for this broader D-Bus interface.
-const hostProcessBridge = releaseTag === 'v6.1.1' && added[0] === hostProcessBridgePermission;
+// v6.1.1 never shipped, so the migration rides the next stable release that
+// actually carries the permission change, v6.1.2.
+const hostProcessBridge = releaseTag === 'v6.1.2' && added[0] === hostProcessBridgePermission;
 if (added.length === 1 && (updaterBridge || hostProcessBridge)) {
   console.warn(`Allowing only the one-time reviewed Flatpak bridge in ${releaseTag}: ${added[0]}`);
   process.exit(0);
