@@ -26,7 +26,12 @@ try {
   const ref = (workerData as { ref?: unknown })?.ref as WorkspaceSessionIdentity;
   const canonicalPath = workspaceSessionDirectory(ref);
   if (!canonicalPath) throw new Error('Workspace session directory worker requires project-local storage');
-  const accessPath = workspaceSessionAccessDirectory(ref);
+  // This worker is only spawned on the win32 cold-start path
+  // (`establishSessionDirectoryLease`), where entry mutation is delegated to
+  // the cwd helper. The worker thread does not inherit a test-forced
+  // `process.platform`, so resolve with the same forced backend the parent
+  // commit to rather than letting the host's descriptor namespace decide.
+  const accessPath = workspaceSessionAccessDirectory(ref, { forceCwdHelper: true });
   const lease = detachSessionDirectoryLease(canonicalPath);
   if (!accessPath || !lease || accessPath !== lease.accessPath) {
     throw new Error('Workspace session directory worker could not transfer its lease');

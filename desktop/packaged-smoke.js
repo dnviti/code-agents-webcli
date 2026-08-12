@@ -116,6 +116,17 @@ function assertSharedInstallationSessionRow(server, sessionId, workspaceRoot) {
 
 function assertNoInstallationSessionCopy(server, dataDir, sessionId, payloads, filesystem = fs) {
   assertSharedInstallationSessionRow(server, sessionId, server.claudeSessions.get(sessionId).storageScope.workspaceRoot);
+  assertNoInstallationUsageRows(server);
+
+  // A workspace conversation must never gain an installation-global usage or
+  // accounting row. `runtime_sessions` alone carries the shared metadata row
+  // asserted above; every other table in the installation database stays empty.
+  function assertNoInstallationUsageRows(server) {
+    for (const table of ['usage_jobs', 'usage_job_models', 'usage_job_tools']) {
+      const row = server.database.raw.prepare(`SELECT COUNT(*) AS count FROM ${table}`).get();
+      assert.equal(row.count, 0, `${table} received a new installation-global row`);
+    }
+  }
 
   const payloadNeedles = (Array.isArray(payloads) ? payloads : [payloads])
     .map((payload) => payload.subarray(0, 64));

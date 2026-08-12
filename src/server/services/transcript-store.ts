@@ -215,8 +215,15 @@ export class TranscriptStore implements TranscriptStoreLike {
 
   async deleteTranscript(session: TranscriptSessionRef): Promise<void> {
     const transcriptPath = this.getTranscriptAccessPath(session);
-    await this.flushPath(transcriptPath);
-
+    // Deletion must always be able to unlink a poisoned entry — a transcript
+    // that was symlinked out, or whose append failed for any other reason —
+    // so wait for in-flight appends but do not let a stored write error block
+    // the cleanup of the workspace entry itself.
+    const pending = this.pendingWrites.get(transcriptPath);
+    if (pending) {
+      await pending.catch(() => undefined);
+    }
+    this.writeErrors.delete(transcriptPath);
     try {
       await unlinkSessionEntry(transcriptPath);
     } catch (error) {
