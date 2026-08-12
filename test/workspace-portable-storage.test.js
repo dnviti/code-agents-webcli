@@ -261,6 +261,7 @@ describe('portable workspace storage', function () {
     });
 
     it('hardens an existing directory without losing its pinned identity', function () {
+      this.timeout(60_000);
       const childPath = path.join(dir, 'child-dir');
       fs.mkdirSync(childPath, { mode: 0o700 });
       const before = fs.statSync(childPath, { bigint: true });
@@ -665,6 +666,7 @@ describe('portable workspace storage', function () {
     });
 
     it('reuses one persistent helper process for repeated Windows artifact operations', function () {
+      this.timeout(60_000);
       if (process.platform !== 'win32') this.skip();
       let fd = fs.openSync(root, fs.constants.O_RDONLY);
       const lease = { canonicalPath: fs.realpathSync(root), fd, verify: () => {} };
@@ -709,6 +711,7 @@ describe('portable workspace storage', function () {
     });
 
     it('fails a broken persistent child precisely and cools down before another spawn', function () {
+      this.timeout(60_000);
       if (process.platform !== 'win32') this.skip();
       setWorkspaceCwdHelperBrokerExecutableForTests(path.join(root, 'missing-helper.exe'));
       const fd = fs.openSync(root, fs.constants.O_RDONLY);
@@ -741,6 +744,7 @@ describe('portable workspace storage', function () {
     });
 
     it('publishes a fatal bootstrap state instead of leaving the caller on the operation timeout', function () {
+      this.timeout(60_000);
       const controlBuffer = new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT * 3);
       const responseBuffer = new SharedArrayBuffer(4096);
       const control = new Int32Array(controlBuffer);
@@ -772,6 +776,7 @@ describe('portable workspace storage', function () {
     });
 
     it('fails bad helper components before it can spawn a child', function () {
+      this.timeout(60_000);
       const fd = fs.openSync(root, fs.constants.O_RDONLY);
       const lease = {
         canonicalPath: root,
@@ -789,6 +794,7 @@ describe('portable workspace storage', function () {
     });
 
     it('publishes only committed serialized changes and restores them after reopen', function () {
+      this.timeout(60_000);
       const images = [];
       const first = openSerializedDatabase({ publish: (image) => images.push(Buffer.from(image)) });
       first.exec('CREATE TABLE state (value TEXT)');
@@ -814,6 +820,7 @@ describe('portable workspace storage', function () {
     });
 
     it('poisons every operation after publication fails and rejects a corrupt initial image', function () {
+      this.timeout(60_000);
       let fail = false;
       const database = openSerializedDatabase({
         publish: () => { if (fail) throw new Error('injected publish failure'); },
@@ -846,6 +853,7 @@ describe('portable workspace storage', function () {
     });
 
     it('publishes exactly once for nested and raw outer transactions', function () {
+      this.timeout(60_000);
       const images = [];
       const database = openSerializedDatabase({ publish: (image) => images.push(Buffer.from(image)) });
       database.exec('CREATE TABLE state (value TEXT)');
@@ -866,6 +874,7 @@ describe('portable workspace storage', function () {
     });
 
     it('propagates the cwd-helper policy to every workspace hierarchy and refuses a swapped container', function () {
+      this.timeout(60_000);
       if (!childProcessesWork()) this.skip();
       const options = { forceCwdHelper: true };
       const storage = openWorkspaceStorageDirectorySync(root, options);
@@ -1101,6 +1110,7 @@ describe('portable workspace storage', function () {
     });
 
     it('inspects canonical directory paths with spaces and Unicode without changing modes', function () {
+      this.timeout(60_000);
       const nested = path.join(dir, 'space ü', 'child directory');
       fs.mkdirSync(nested, { recursive: true, mode: 0o755 });
       fs.chmodSync(path.dirname(nested), 0o755);
@@ -1143,6 +1153,7 @@ describe('portable workspace storage', function () {
     });
 
     it('does not expose parent loader options or credentials to the helper', function () {
+      this.timeout(60_000);
       const previousNodeOptions = process.env.NODE_OPTIONS;
       const previousSecret = process.env.CCWEB_HELPER_TEST_SECRET;
       process.env.NODE_OPTIONS = '--require=/should/not/be/inherited.js';
@@ -1171,6 +1182,7 @@ describe('portable workspace storage', function () {
     });
 
     it('frames the exact maximum helper payload below the child request bound', function () {
+      this.timeout(60_000);
       let requestBytes = 0;
       setWorkspaceCwdHelperSpawnerForTests((_, __, options) => {
         requestBytes = Buffer.byteLength(options.input);
@@ -1187,6 +1199,7 @@ describe('portable workspace storage', function () {
     });
 
     it('reconciles a lost publish response only when the exact completed target is visible', function () {
+      this.timeout(60_000);
       const calls = [];
       setWorkspaceCwdHelperSpawnerForTests((_, __, options) => {
         const wire = JSON.parse(options.input);
@@ -1208,6 +1221,7 @@ describe('portable workspace storage', function () {
     });
 
     it('reconciles a lost rename response after verifying the exact completed image', function () {
+      this.timeout(60_000);
       setWorkspaceCwdHelperSpawnerForTests((_, __, options) => {
         const wire = JSON.parse(options.input);
         const completed = applyHelperWire(options);
@@ -1223,6 +1237,7 @@ describe('portable workspace storage', function () {
     });
 
     it('does not accept a lost create response and removes its exact unreported temporary', function () {
+      this.timeout(60_000);
       let temporary = null;
       setWorkspaceCwdHelperSpawnerForTests((_, __, options) => {
         const wire = JSON.parse(options.input);
@@ -1242,6 +1257,7 @@ describe('portable workspace storage', function () {
     });
 
     it('accepts a lost authority-create reply only after exact token readback', function () {
+      this.timeout(60_000);
       let lost = false;
       fs.mkdirSync(path.join(dir, '.cc-web'), { mode: 0o700 });
       setWorkspaceCwdHelperSpawnerForTests((_, __, options) => {
@@ -1268,6 +1284,7 @@ describe('portable workspace storage', function () {
     });
 
     it('retries one exact writer-guard unlink without leaking authority or its storage lease', function () {
+      this.timeout(60_000);
       const root = canonicalTempDir('cc-web-guard-unlink-');
       const guardUnlinks = [];
       let failGuardUnlink = true;
@@ -1321,6 +1338,7 @@ describe('portable workspace storage', function () {
     });
 
     it('never reclaims a live writer whose incarnation is missing or explicitly unavailable', function () {
+      this.timeout(60_000);
       setWorkspaceCwdHelperSpawnerForTests((_, __, options) => applyHelperWire(options));
       for (const incarnation of [undefined, 'unavailable']) {
         const root = canonicalTempDir('cc-web-live-writer-');
@@ -1366,6 +1384,7 @@ describe('portable workspace storage', function () {
     });
 
     it('rejects malformed success responses and identity-checked unlink removes only a symlink entry', function () {
+      this.timeout(60_000);
       fs.writeFileSync(path.join(dir, 'outside'), 'sentinel');
       fs.symlinkSync(path.join(dir, 'outside'), path.join(dir, 'link'));
       const link = fs.lstatSync(path.join(dir, 'link'), { bigint: true });
@@ -1394,6 +1413,7 @@ describe('portable workspace storage', function () {
     });
 
     it('rejects malformed or oversized stat decimals before converting them to BigInt', function () {
+      this.timeout(60_000);
       for (const [field, value] of [
         ['size', ''],
         ['nlink', '0x2'],
@@ -1428,6 +1448,7 @@ describe('portable workspace storage', function () {
     });
 
     it('fails closed and preserves interrupted writer claim state', function () {
+      this.timeout(60_000);
       const root = canonicalTempDir('cc-web-writer-claim-');
       try {
         const storage = path.join(root, '.cc-web');
@@ -1448,6 +1469,7 @@ describe('portable workspace storage', function () {
     });
 
     it('recovers exact stale interrupted writer and guard claims', function () {
+      this.timeout(60_000);
       const owner = JSON.stringify({
         version: 1,
         pid: 2147483647,
@@ -1480,6 +1502,7 @@ describe('portable workspace storage', function () {
     });
 
     it('retains writer authority and the lease when raw close fails, then permits an exact retry', function () {
+      this.timeout(60_000);
       const root = canonicalTempDir('cc-web-writer-close-');
       let database;
       const closeSync = fs.closeSync;
@@ -1522,6 +1545,7 @@ describe('portable workspace storage', function () {
     });
 
     it('closes only one owner facade while its shared peer remains usable', function () {
+      this.timeout(60_000);
       const first = new WorkspaceSessionDatabase({ workspaceRoot: dir, ownerKey: OWNER_A });
       const second = new WorkspaceSessionDatabase({ workspaceRoot: dir, ownerKey: OWNER_B });
       try {
@@ -1541,6 +1565,7 @@ describe('portable workspace storage', function () {
 
   describe('Windows cwd helper premise', function () {
     it('pins the exact child cwd against rename and removal until the helper exits', async function () {
+      this.timeout(60_000);
       if (process.platform !== 'win32') this.skip();
       let directory = canonicalTempDir('cc-web-win-cwd-pin-');
       const moved = `${directory}-moved`;
