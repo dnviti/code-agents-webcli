@@ -432,7 +432,7 @@ describe('chat wiring', function () {
 
   describe('start_chat', function () {
     it('rejects terminal and chat WebSocket starts before either runtime is invoked', async function () {
-      const reason = 'Workspace migration is blocked';
+      const reason = 'Workspace storage is unavailable';
       const { processor, session, chatManager, sent } = build({
         persistenceUnavailable: reason,
         rollbackRecoveryPending: true,
@@ -1392,7 +1392,7 @@ describe('chat wiring', function () {
   describe('rejoining', function () {
     it('does not open file-backed history for unavailable or recovery-only rows', async function () {
       for (const blocked of [
-        { persistenceUnavailable: 'workspace migration is blocked', message: /migration is blocked/ },
+        { persistenceUnavailable: 'workspace storage is unavailable', message: /storage is unavailable/ },
         { rollbackRecoveryPending: true, message: /incomplete rollback/ },
       ]) {
         const { processor, session, chatManager, sent } = build({ surface: 'chat', ...blocked });

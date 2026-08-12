@@ -25,13 +25,6 @@ const PNG = Buffer.from(
   'base64',
 );
 
-function archiveTrustForTest() {
-  return {
-    seal: (value) => `test:${Buffer.from(value).toString('base64url')}`,
-    open: (envelope) => Buffer.from(String(envelope).replace(/^test:/, ''), 'base64url').toString(),
-  };
-}
-
 // Issue #34 asked for copy-a-turn and branch-from-a-turn together. Copy
 // shipped; branch was announced in the changelog and never built — the hooks
 // existed, nothing passed them, and no runtime here can fork a session at a
@@ -401,9 +394,9 @@ describe('branching a conversation from one of its turns', function () {
 
   // -------------------------------------------------------- what is carried
 
-  it('refuses to branch a migration-blocked conversation without creating artifacts', async function () {
+  it('refuses to branch a persistence-unavailable conversation without creating artifacts', async function () {
     await record('source', conversation({ turns: 2, contextWindow: 200_000 }));
-    const reason = 'Workspace migration is waiting for write access';
+    const reason = 'Workspace storage is waiting for write access';
     sessions.get('source').persistenceUnavailable = reason;
     const before = fs.readFileSync(logPath('source'));
 
@@ -429,7 +422,7 @@ describe('branching a conversation from one of its turns', function () {
       ownerKey: 'stable-branch-owner',
     };
     recovery.rollbackRecoveryPending = true;
-    recovery.persistenceUnavailable = 'Workspace migration is waiting for write access';
+    recovery.persistenceUnavailable = 'Workspace storage is waiting for write access';
     recovery.tabOpen = false;
     sessions.set(recovery.id, recovery);
     const cleanup = [];
@@ -992,11 +985,16 @@ describe('branching a conversation from one of its turns', function () {
       workspaceRoot: workspaceDir,
       ownerKey: 'stable-branch-owner',
     };
-    const trust = archiveTrustForTest();
-    let persistent = new SessionStore({ ...scope, archiveTrust: trust });
+    const sharedDataDir = path.join(storageDir, 'shared-session-metadata');
+    let persistent = new SessionStore({ storageDir: sharedDataDir, scopedGlobalStore: true });
     try {
-      // Mark this authorised workspace fully loaded before a route save is
-      // allowed to prune rows which are absent from the shared map.
+      const now = new Date().toISOString();
+      persistent.database.raw.prepare(`
+        INSERT INTO users (
+          id, github_id, github_login, github_name, avatar_url, email,
+          created_at, updated_at, last_login_at
+        ) VALUES (?, ?, ?, NULL, NULL, NULL, ?, ?, ?)
+      `).run(USER.id, 'cold-recovery-owner', USER.githubLogin, now, now, now);
       await persistent.loadSessions();
       const source = chatRecord('cold-recovery-source', 'Cold recovery', workspaceDir);
       source.storageScope = scope;
@@ -1023,10 +1021,10 @@ describe('branching a conversation from one of its turns', function () {
       assert.ok(made.body.sessionId);
       persistent.database.close();
 
-      persistent = new SessionStore({ ...scope, archiveTrust: trust });
+      persistent = new SessionStore({ storageDir: sharedDataDir, scopedGlobalStore: true });
       const restored = await persistent.loadSessions();
       const anchor = restored.get(made.body.sessionId);
-      assert.ok(anchor, 'the recovery row is rediscovered from session-state.sqlite');
+      assert.ok(anchor, 'the recovery row is rediscovered from shared app SQLite');
       assert.strictEqual(anchor.rollbackRecoveryPending, true);
       assert.strictEqual(anchor.tabOpen, false);
       sessions.clear();
@@ -1040,7 +1038,7 @@ describe('branching a conversation from one of its turns', function () {
       assert.strictEqual(sessions.has(anchor.id), false);
       persistent.database.close();
 
-      persistent = new SessionStore({ ...scope, archiveTrust: trust });
+      persistent = new SessionStore({ storageDir: sharedDataDir, scopedGlobalStore: true });
       const afterRestart = await persistent.loadSessions();
       assert.strictEqual(afterRestart.has(anchor.id), false, 'the confirmed removal survives another boot');
       assert.strictEqual(afterRestart.has(source.id), true, 'cleanup never prunes the source conversation');

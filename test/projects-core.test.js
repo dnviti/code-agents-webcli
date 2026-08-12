@@ -19,6 +19,15 @@ const { EncryptionKeyRing } = require('../dist/server/services/encryption.js');
 const { DeployTargetStore } = require('../dist/server/services/deploy-targets.js');
 
 function root() { return fs.mkdtempSync(path.join(os.tmpdir(), 'cawc-project-')); }
+function projectHistoryPath(storage) {
+  return path.join(storage, 'sessions', 'owner', 'session-one', 'history.log');
+}
+function writeProjectHistory(storage, contents) {
+  const artifact = projectHistoryPath(storage);
+  fs.mkdirSync(path.dirname(artifact), { recursive: true });
+  fs.writeFileSync(artifact, contents);
+  return artifact;
+}
 function engine(overrides = {}) {
   const calls = [];
   const known = new Map();
@@ -144,8 +153,7 @@ function setup(initial = [], options = {}) {
     beforeWorkspaceReplacement: options.beforeWorkspaceReplacement,
     afterWorkspaceRestored: options.afterWorkspaceRestored,
     beforeWorkspaceDeletion: options.beforeWorkspaceDeletion,
-    hasLegacyProjectSessions: options.hasLegacyProjectSessions,
-    hasIncompleteProjectSessionMigration: options.hasIncompleteProjectSessionMigration,
+    hasUnavailableProjectSessionStorage: options.hasUnavailableProjectSessionStorage,
     localWorkspaceRoot: options.localWorkspaceRoot || path.join(dir, 'host-projects'),
   });
   return { dir, e, s, manager, environments, cfg };
@@ -842,22 +850,20 @@ describe('project core lifecycle', function () {
     assert.ok(!fs.existsSync(workspace));
   });
 
-  it('removes durable session storage only when the project itself is deleted', async function () {
+  it('removes durable project session artifacts only when the project itself is deleted', async function () {
     const p = project('one', 'running');
     const lifecycle = [];
-    let storage;
+    let historyArtifact;
     const { manager, s, dir } = setup([p], {
       beforeWorkspaceReplacement: () => { lifecycle.push('flush'); },
       afterWorkspaceRestored: () => { lifecycle.push('reopen'); },
       beforeWorkspaceDeletion: () => {
         lifecycle.push('close-for-delete');
-        assert.strictEqual(fs.readFileSync(path.join(storage, 'session-state.sqlite'), 'utf8'), 'session database');
+        assert.strictEqual(fs.readFileSync(historyArtifact, 'utf8'), 'terminal history');
       },
     });
     const workspace = path.join(dir, 'projects', 'one');
-    storage = path.join(workspace, '.cc-web');
-    fs.mkdirSync(storage, { recursive: true });
-    fs.writeFileSync(path.join(storage, 'session-state.sqlite'), 'session database');
+    historyArtifact = writeProjectHistory(path.join(workspace, '.cc-web'), 'terminal history');
 
     assert.deepStrictEqual(await manager.remove(1, 'one'), { ok: true });
 
@@ -915,10 +921,8 @@ describe('project core lifecycle', function () {
       const authoritative = path.join(workspace, '.cc-web-authoritative');
       const replacement = path.join(dir, `replacement-${operation}`);
       fs.mkdirSync(path.join(workspace, 'a', '.git'), { recursive: true });
-      fs.mkdirSync(storage);
-      fs.writeFileSync(path.join(storage, 'session-state.sqlite'), 'authoritative archive');
-      fs.mkdirSync(replacement);
-      fs.writeFileSync(path.join(replacement, 'session-state.sqlite'), 'replacement archive');
+      writeProjectHistory(storage, 'authoritative archive');
+      writeProjectHistory(replacement, 'replacement archive');
 
       const originalOpen = fsp.open;
       let storageChmods = 0;
@@ -954,11 +958,11 @@ describe('project core lifecycle', function () {
       assert.strictEqual(suspended, 1, `${operation} captures authority before suspending`);
       assert.strictEqual(reopened, 0, `${operation} must not reopen the replacement inode`);
       assert.strictEqual(
-        fs.readFileSync(path.join(authoritative, 'session-state.sqlite'), 'utf8'),
+        fs.readFileSync(projectHistoryPath(authoritative), 'utf8'),
         'authoritative archive',
       );
       assert.strictEqual(
-        fs.readFileSync(path.join(storage, 'session-state.sqlite'), 'utf8'),
+        fs.readFileSync(projectHistoryPath(storage), 'utf8'),
         'replacement archive',
       );
       assert.ok(fs.existsSync(path.join(workspace, 'a', '.git')), 'cleanup never starts after the identity swap');
@@ -1031,7 +1035,6 @@ describe('project core lifecycle', function () {
     fs.writeFileSync(path.join(workspace, 'discarded.txt'), 'transient');
     const sessionStorage = path.join(workspace, '.cc-web');
     fs.mkdirSync(path.join(sessionStorage, 'sessions', 'owner', 'session-one'), { recursive: true });
-    fs.writeFileSync(path.join(sessionStorage, 'session-state.sqlite'), 'session database');
     fs.writeFileSync(path.join(sessionStorage, 'sessions', 'owner', 'session-one', 'chat.jsonl'), 'chat history');
 
     assert.deepStrictEqual(await manager.release(1, 'one'), { ok: true });
@@ -1042,7 +1045,6 @@ describe('project core lifecycle', function () {
     assert.deepStrictEqual(await manager.start(1, 'one'), { ok: true, state: 'building' });
     await manager.waitForBuild('one');
     assert.strictEqual(s.getProject('one').state, 'running');
-    assert.strictEqual(fs.readFileSync(path.join(sessionStorage, 'session-state.sqlite'), 'utf8'), 'session database');
     assert.strictEqual(
       fs.readFileSync(path.join(sessionStorage, 'sessions', 'owner', 'session-one', 'chat.jsonl'), 'utf8'),
       'chat history',
@@ -1812,7 +1814,6 @@ describe('project core lifecycle', function () {
     fs.writeFileSync(path.join(checkout, 'uncommitted.txt'), 'only copy');
     const sessionStorage = path.join(harness.dir, 'projects', 'one', '.cc-web');
     fs.mkdirSync(path.join(sessionStorage, 'sessions', 'owner', 'session-one'), { recursive: true });
-    fs.writeFileSync(path.join(sessionStorage, 'session-state.sqlite'), 'session database');
     fs.writeFileSync(path.join(sessionStorage, 'sessions', 'owner', 'session-one', 'history.log'), 'terminal history');
     harness.e.exec = async (spec, command, args) => {
       harness.e.calls.push({ op: 'exec', spec, command, args });
@@ -1838,7 +1839,6 @@ describe('project core lifecycle', function () {
     assert.strictEqual(harness.s.getProject('one').state, 'running');
     assert.deepStrictEqual(operations, ['push', 'clone']);
     assert.strictEqual(harness.s.getProject('one').lastPreservedCommit, 'wip-commit');
-    assert.strictEqual(fs.readFileSync(path.join(sessionStorage, 'session-state.sqlite'), 'utf8'), 'session database');
     assert.strictEqual(
       fs.readFileSync(path.join(sessionStorage, 'sessions', 'owner', 'session-one', 'history.log'), 'utf8'),
       'terminal history',
@@ -1978,51 +1978,43 @@ describe('project core lifecycle', function () {
     e.remove = async () => { present = false; };
     const workspace = path.join(dir, 'projects', 'one'); fs.mkdirSync(workspace, { recursive: true }); fs.writeFileSync(path.join(workspace, 'discard.txt'), 'gone');
     const sessionStorage = path.join(workspace, '.cc-web');
-    fs.mkdirSync(sessionStorage);
-    fs.writeFileSync(path.join(sessionStorage, 'session-state.sqlite'), 'keep session state');
+    const historyArtifact = writeProjectHistory(sessionStorage, 'keep terminal history');
     await manager.start(1, 'one'); await manager.waitForBuild('one');
     assert.strictEqual(s.getProject('one').state, 'running');
     assert.ok(!fs.existsSync(path.join(workspace, 'discard.txt')));
-    assert.strictEqual(fs.readFileSync(path.join(sessionStorage, 'session-state.sqlite'), 'utf8'), 'keep session state');
+    assert.strictEqual(fs.readFileSync(historyArtifact, 'utf8'), 'keep terminal history');
   });
 
-  it('blocks a true rebuild before removing runtime or secondary legacy migration bytes', async function () {
+  it('blocks a true rebuild before removing runtime or unavailable session storage', async function () {
     const p = project('one');
     p.rebuildRequired = true;
     p.container = { name: 'saved' };
     let guardCalls = 0;
     const { manager, s, e, dir } = setup([p], {
-      hasIncompleteProjectSessionMigration: async (candidate) => {
+      hasUnavailableProjectSessionStorage: async (candidate) => {
         guardCalls += 1;
         assert.strictEqual(candidate.id, 'one');
         return true;
       },
     });
-    const secondary = path.join(dir, 'projects', 'one', 'checkout');
-    const rollback = path.join(
-      secondary,
-      '.cc-web',
-      'attachments',
-      '.legacy.bin.ccweb-session-migration.bak',
-    );
-    fs.mkdirSync(path.dirname(rollback), { recursive: true });
-    fs.writeFileSync(rollback, 'must remain until binary confirm');
+    const workspace = path.join(dir, 'projects', 'one');
+    const historyArtifact = writeProjectHistory(path.join(workspace, '.cc-web'), 'unavailable project history');
 
     assert.deepStrictEqual(await manager.start(1, 'one'), { ok: true, state: 'building' });
     await manager.waitForBuild('one');
 
     assert.ok(guardCalls > 0);
     assert.strictEqual(s.getProject('one').state, 'blocked');
-    assert.match(s.getProject('one').stateDetail, /migration is incomplete/);
-    assert.strictEqual(fs.readFileSync(rollback, 'utf8'), 'must remain until binary confirm');
+    assert.match(s.getProject('one').stateDetail, /session storage is unavailable/i);
+    assert.strictEqual(fs.readFileSync(historyArtifact, 'utf8'), 'unavailable project history');
     assert.ok(!e.calls.some((call) => call.op === 'remove'));
   });
 
-  it('allows an ordinary non-destructive start while binary cleanup is pending', async function () {
+  it('allows an ordinary non-destructive start while session storage is unavailable', async function () {
     const p = project('one');
     p.container = { name: 'saved' };
     const { manager, s, dir } = setup([p], {
-      hasIncompleteProjectSessionMigration: () => true,
+      hasUnavailableProjectSessionStorage: () => true,
       engine: {
         async describe(name) {
           return {
@@ -2041,10 +2033,8 @@ describe('project core lifecycle', function () {
         async ensure() { return { created: false }; },
       },
     });
-    const secondary = path.join(dir, 'projects', 'one', 'checkout');
-    const rollback = path.join(secondary, '.cc-web', 'pending.bak');
-    fs.mkdirSync(path.dirname(rollback), { recursive: true });
-    fs.writeFileSync(rollback, 'available after ordinary start');
+    const workspace = path.join(dir, 'projects', 'one');
+    const historyArtifact = writeProjectHistory(path.join(workspace, '.cc-web'), 'available after ordinary start');
 
     assert.deepStrictEqual(await manager.start(1, 'one'), { ok: true, state: 'building' });
     await manager.waitForBuild('one');
@@ -2054,7 +2044,7 @@ describe('project core lifecycle', function () {
       'running',
       s.getProject('one').stateDetail || 'ordinary start unexpectedly failed',
     );
-    assert.strictEqual(fs.readFileSync(rollback, 'utf8'), 'available after ordinary start');
+    assert.strictEqual(fs.readFileSync(historyArtifact, 'utf8'), 'available after ordinary start');
   });
 
   it('blocks a created replacement without wiping bytes when old-checkout preservation fails', async function () {
@@ -2082,51 +2072,46 @@ describe('project core lifecycle', function () {
     assert.ok(!e.calls.some((c) => c.op === 'remove'), 'container remains until session retirement succeeds');
   });
 
-  it('blocks explicit project deletion while legacy session rows still need migration', async function () {
+  it('blocks explicit project deletion while its session storage is unavailable', async function () {
     const p = project('one', 'running'); p.container = { name: 'saved' };
     let retired = false;
     const { manager, s, e, dir } = setup([p], {
-      hasLegacyProjectSessions: (projectId, ownerUserId) => {
-        assert.strictEqual(projectId, 'one');
-        assert.strictEqual(ownerUserId, 1);
+      hasUnavailableProjectSessionStorage: async (candidate) => {
+        assert.strictEqual(candidate.id, 'one');
         return true;
       },
       deleteProjectSessions: () => { retired = true; },
     });
     const workspace = path.join(dir, 'projects', 'one');
-    const storage = path.join(workspace, '.cc-web');
-    fs.mkdirSync(storage, { recursive: true });
-    fs.writeFileSync(path.join(storage, 'session-state.sqlite'), 'legacy destination');
+    const historyArtifact = writeProjectHistory(path.join(workspace, '.cc-web'), 'unavailable project history');
 
     const result = await manager.remove(1, 'one');
 
     assert.strictEqual(result.reason, 'preserve_failed');
-    assert.match(result.detail, /migration is incomplete/);
+    assert.match(result.detail, /session storage is unavailable/i);
     assert.strictEqual(s.getProject('one').state, 'running');
-    assert.match(s.getProject('one').stateDetail, /migration is incomplete/);
+    assert.match(s.getProject('one').stateDetail, /session storage is unavailable/i);
     assert.strictEqual(retired, false);
-    assert.strictEqual(fs.readFileSync(path.join(storage, 'session-state.sqlite'), 'utf8'), 'legacy destination');
+    assert.strictEqual(fs.readFileSync(historyArtifact, 'utf8'), 'unavailable project history');
     assert.ok(!e.calls.some((call) => call.op === 'remove'));
   });
 
-  it('releases an idle reclaim claim when legacy project sessions block migration', async function () {
+  it('releases an idle reclaim claim when project session storage is unavailable', async function () {
     const p = project('one', 'stopped');
     p.lastActivityAt = new Date(0).toISOString();
     const { manager, s, dir } = setup([p], {
       now: () => new Date('2026-08-01T12:00:00.000Z'),
-      hasLegacyProjectSessions: () => true,
+      hasUnavailableProjectSessionStorage: () => true,
     });
     const workspace = path.join(dir, 'projects', 'one');
-    const storage = path.join(workspace, '.cc-web');
-    fs.mkdirSync(storage, { recursive: true });
-    fs.writeFileSync(path.join(storage, 'session-state.sqlite'), 'legacy destination');
+    const historyArtifact = writeProjectHistory(path.join(workspace, '.cc-web'), 'unavailable project history');
 
     await manager.sweepOnce();
 
     assert.strictEqual(s.getProject('one').state, 'stopped');
     assert.strictEqual(s.getProject('one').rebuildRequired, false);
-    assert.match(s.getProject('one').stateDetail, /migration is incomplete/);
-    assert.strictEqual(fs.readFileSync(path.join(storage, 'session-state.sqlite'), 'utf8'), 'legacy destination');
+    assert.match(s.getProject('one').stateDetail, /session storage is unavailable/i);
+    assert.strictEqual(fs.readFileSync(historyArtifact, 'utf8'), 'unavailable project history');
   });
 
   it('preserves host-project session storage during idle reclaim', async function () {
@@ -2140,8 +2125,7 @@ describe('project core lifecycle', function () {
     });
     const workspace = path.join(hostRoot, 'one');
     const storage = path.join(workspace, '.cc-web');
-    fs.mkdirSync(storage, { recursive: true });
-    fs.writeFileSync(path.join(storage, 'session-state.sqlite'), 'host session database');
+    const historyArtifact = writeProjectHistory(storage, 'host terminal history');
     fs.writeFileSync(path.join(workspace, 'scratch.txt'), 'discard me');
 
     await manager.sweepOnce();
@@ -2149,7 +2133,7 @@ describe('project core lifecycle', function () {
     assert.strictEqual(s.getProject('one').state, 'stopped');
     assert.ok(fs.existsSync(workspace));
     assert.ok(!fs.existsSync(path.join(workspace, 'scratch.txt')));
-    assert.strictEqual(fs.readFileSync(path.join(storage, 'session-state.sqlite'), 'utf8'), 'host session database');
+    assert.strictEqual(fs.readFileSync(historyArtifact, 'utf8'), 'host terminal history');
     fs.rmSync(hostRoot, { recursive: true, force: true });
   });
 

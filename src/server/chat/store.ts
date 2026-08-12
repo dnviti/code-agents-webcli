@@ -4,6 +4,7 @@ import { SessionRecord } from '../types.js';
 import {
   ensureWorkspaceSessionDirectory,
   workspaceSessionAccessDirectory,
+  workspaceSessionDirectory, workspaceSessionFileParentLease,
   WorkspaceSessionStorageRef,
 } from '../services/workspace-session-storage.js';
 import {
@@ -357,6 +358,7 @@ export class ChatStore implements ChatStoreLike {
 
   private readonly states = new Map<string, SessionState>();
   private readonly queues = new Map<string, Promise<unknown>>();
+  private readonly writeErrors = new Map<string, unknown>();
   /**
    * Openings already read, so listing every conversation is not a scan per row.
    *
@@ -394,7 +396,7 @@ export class ChatStore implements ChatStoreLike {
    * function. A future caller that passes an id straight from a request would
    * otherwise turn a path join into a write anywhere on disk.
    */
-  private basePath(session: ChatSessionRef): string {
+  private basePath(session: ChatSessionRef, establishWorkspace = true): string {
     const id = String(session.id);
     if (!SESSION_ID_PATTERN.test(id) || id === '.' || id === '..') {
       throw new Error(`Refusing unsafe session id for chat storage: ${JSON.stringify(id)}`);
@@ -404,7 +406,7 @@ export class ChatStore implements ChatStoreLike {
       throw new Error(`Refusing non-integer owner id for chat storage: ${session.ownerUserId}`);
     }
 
-    const workspaceDir = workspaceSessionAccessDirectory(session);
+    const workspaceDir = establishWorkspace ? workspaceSessionAccessDirectory(session) : workspaceSessionDirectory(session);
     return workspaceDir ? path.join(workspaceDir, 'chat') : path.join(this.storageDir, String(session.ownerUserId), id);
   }
 
@@ -784,7 +786,7 @@ export class ChatStore implements ChatStoreLike {
     // transitions await it before they are broadcast or acknowledged.
     let base: string;
     try {
-      base = this.basePath(session);
+      base = this.basePath(session, false);
     } catch (error) {
       console.error('Refusing to store chat events:', error);
       const rejected = Promise.reject(error);
@@ -928,13 +930,18 @@ export class ChatStore implements ChatStoreLike {
         throw new ChatStoreAppendError('not_committed', error);
       }
     });
-    void write.catch(() => undefined);
+    void write.then(
+      () => this.writeErrors.delete(base),
+      (error) => this.writeErrors.set(base, error),
+    );
     return write;
   }
 
   async flush(session: ChatSessionRef): Promise<void> {
     const base = this.basePath(session);
     await this.enqueue(base, async () => undefined);
+    const failed = this.writeErrors.get(base);
+    if (failed) throw failed;
   }
 
   /** Whether the log ends with every byte of the attempted append batch. */
@@ -981,7 +988,9 @@ export class ChatStore implements ChatStoreLike {
       logRebased: boolean;
     },
   ): Promise<void> {
-    await fs.promises.mkdir(path.dirname(base), { recursive: true });
+    if (!workspaceSessionFileParentLease(`${base}.jsonl`)) {
+      await fs.promises.mkdir(path.dirname(base), { recursive: true });
+    }
 
     const state = await this.loadState(base);
 
@@ -1536,7 +1545,9 @@ export class ChatStore implements ChatStoreLike {
   async setOpeningContext(session: ChatSessionRef, context: string): Promise<void> {
     const base = this.basePath(session);
     await ensureWorkspaceSessionDirectory(session);
-    await fs.promises.mkdir(path.dirname(base), { recursive: true });
+    if (!workspaceSessionFileParentLease(`${base}${CONTEXT_SUFFIX}`)) {
+      await fs.promises.mkdir(path.dirname(base), { recursive: true });
+    }
     await replaceSessionFile(`${base}${CONTEXT_SUFFIX}`, context, 'utf8');
   }
 
@@ -1570,7 +1581,9 @@ export class ChatStore implements ChatStoreLike {
     await this.enqueue(base, async () => {
       await ensureWorkspaceSessionDirectory(session);
       const target = `${base}${PLAN_SUFFIX}`;
-      await fs.promises.mkdir(path.dirname(base), { recursive: true });
+      if (!workspaceSessionFileParentLease(target)) {
+        await fs.promises.mkdir(path.dirname(base), { recursive: true });
+      }
       await replaceSessionFile(target, JSON.stringify(plan), 'utf8');
     });
   }
@@ -2154,6 +2167,7 @@ export class ChatStore implements ChatStoreLike {
       );
     });
     this.queues.delete(base);
+    this.writeErrors.delete(base);
   }
 }
 

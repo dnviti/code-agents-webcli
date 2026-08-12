@@ -293,7 +293,7 @@ describe('workspace session final-component symlink safety', function () {
     }
   });
 
-  it('selects mutations only for a proved descriptor or Windows handle pin', function () {
+  it('selects descriptor mutation or the cwd-bound helper, never a Windows pathname pin', function () {
     assert.strictEqual(
       resolveWorkspaceEntryMutationPolicy('/dev/fd', 'darwin', false),
       'descriptor',
@@ -302,16 +302,16 @@ describe('workspace session final-component symlink safety', function () {
       resolveWorkspaceEntryMutationPolicy('/dev/fd', 'freebsd', false),
       'descriptor',
     );
-    assert.strictEqual(resolveWorkspaceEntryMutationPolicy(null, 'darwin', false), 'deny');
-    assert.strictEqual(resolveWorkspaceEntryMutationPolicy(null, 'linux', false), 'deny');
+    assert.strictEqual(resolveWorkspaceEntryMutationPolicy(null, 'darwin', false), 'cwd-helper');
+    assert.strictEqual(resolveWorkspaceEntryMutationPolicy(null, 'linux', false), 'cwd-helper');
     assert.strictEqual(
       resolveWorkspaceEntryMutationPolicy(null, 'win32', true),
-      'handle-pinned-path',
+      'cwd-helper',
     );
-    assert.strictEqual(resolveWorkspaceEntryMutationPolicy(null, 'win32', false), 'deny');
+    assert.strictEqual(resolveWorkspaceEntryMutationPolicy(null, 'win32', false), 'cwd-helper');
   });
 
-  it('establishes the Windows capability from ancestor rename pinning alone', function () {
+  it('never treats Windows ancestor rename pinning as pathname mutation authority', function () {
     const probeRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'cawc-windows-pin-probe-'));
     const fd = fs.openSync(probeRoot, fs.constants.O_RDONLY);
     const originalRename = fs.renameSync;
@@ -338,8 +338,8 @@ describe('workspace session final-component symlink safety', function () {
       // left this capability unreachable on every real Windows host, and the
       // policy stuck at 'deny' with `.cc-web` impossible to create. The
       // ancestor rename pin is what the probe now establishes.
-      assert.strictEqual(probeWorkspacePathMutationPin(probeRoot, fd), true);
-      assert.strictEqual(renameBlockedWhileOpen, true, 'the ancestor rename branch must be exercised');
+      assert.strictEqual(probeWorkspacePathMutationPin(probeRoot, fd), false);
+      assert.strictEqual(renameBlockedWhileOpen, false, 'the unsafe probe must not mutate the namespace');
 
       // Without rename pinning there is no namespace guarantee left to rely on.
       pinsRenames = false;

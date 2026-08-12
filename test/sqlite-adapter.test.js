@@ -5,6 +5,7 @@ const path = require('path');
 
 const {
   openDatabase,
+  openSerializedDatabase,
   resolveSqliteFileBindingBackend,
 } = require('../dist/server/services/sqlite.js');
 
@@ -227,6 +228,23 @@ describe('sqlite adapter', function () {
       assert.doesNotThrow(() => db.close());
     });
 
+    it('retries the same native handle when DatabaseSync.close throws', function () {
+      const { DatabaseSync } = require('node:sqlite');
+      const originalClose = DatabaseSync.prototype.close;
+      let fail = true;
+      DatabaseSync.prototype.close = function closeWithOneFailure() {
+        if (fail) throw new Error('injected native close failure');
+        return originalClose.call(this);
+      };
+      try {
+        assert.throws(() => db.close(), /injected native close failure/);
+        fail = false;
+        assert.doesNotThrow(() => db.close());
+      } finally {
+        DatabaseSync.prototype.close = originalClose;
+      }
+    });
+
     it('routes Windows to mandatory sharing and Unix to descriptor proof when available', function () {
       assert.strictEqual(
         resolveSqliteFileBindingBackend('win32', false),
@@ -379,5 +397,168 @@ describe('sqlite adapter', function () {
 
     db = openDatabase(path.join(dir, 'test.sqlite'));
     assert.strictEqual(count(), 1);
+  });
+
+  describe('serialized in-memory publication', function () {
+    it('does not serialize the database image for read-only get/all statements', function () {
+      const { DatabaseSync } = require('node:sqlite');
+      const originalSerialize = DatabaseSync.prototype.serialize;
+      let serializeCalls = 0;
+      let serialized;
+      DatabaseSync.prototype.serialize = function countedSerialize(...args) {
+        serializeCalls += 1;
+        return originalSerialize.apply(this, args);
+      };
+      try {
+        serialized = openSerializedDatabase({ publish: () => {} });
+        serialized.exec('CREATE TABLE portable (value TEXT)');
+        serialized.prepare('INSERT INTO portable VALUES (?)').run('read-only');
+        const beforeReads = serializeCalls;
+
+        assert.strictEqual(
+          serialized.prepare('SELECT value FROM portable').get().value,
+          'read-only',
+        );
+        assert.deepStrictEqual(
+          serialized.prepare('SELECT value FROM portable').all().map((row) => row.value),
+          ['read-only'],
+        );
+        assert.strictEqual(serializeCalls, beforeReads);
+      } finally {
+        try { serialized?.close(); } finally {
+          DatabaseSync.prototype.serialize = originalSerialize;
+        }
+      }
+    });
+
+    it('reopens the last published image and publishes only the outer transaction', function () {
+      const images = [];
+      const first = openSerializedDatabase({ publish: (image) => images.push(Buffer.from(image)) });
+      first.exec('CREATE TABLE portable (value TEXT)');
+      const before = images.length;
+      const outer = first.transaction(() => {
+        first.prepare('INSERT INTO portable VALUES (?)').run('outer');
+        const inner = first.transaction(() => first.prepare('INSERT INTO portable VALUES (?)').run('inner'));
+        inner();
+      });
+      outer();
+      assert.strictEqual(images.length, before + 1);
+      first.close();
+
+      const reopened = openSerializedDatabase({
+        initialImage: images.at(-1),
+        publish: () => assert.fail('read-only reopen unexpectedly published'),
+      });
+      assert.deepStrictEqual(
+        reopened.prepare('SELECT value FROM portable ORDER BY rowid').all().map((row) => row.value),
+        ['outer', 'inner'],
+      );
+      reopened.close();
+    });
+
+    it('restores the last durable image and becomes fail-stop after publication failure', function () {
+      let fail = false;
+      const serialized = openSerializedDatabase({
+        publish: () => { if (fail) throw new Error('injected publication failure'); },
+      });
+      serialized.exec('CREATE TABLE portable (value TEXT)');
+      fail = true;
+      assert.throws(
+        () => serialized.prepare('INSERT INTO portable VALUES (?)').run('lost'),
+        (error) => error.code === 'WORKSPACE_DATABASE_POISONED',
+      );
+      assert.throws(
+        () => serialized.prepare('SELECT * FROM portable').all(),
+        (error) => error.code === 'WORKSPACE_DATABASE_POISONED',
+      );
+      serialized.close();
+    });
+
+    it('publishes DML RETURNING through get/all and mutating pragmas', function () {
+      const images = [];
+      const serialized = openSerializedDatabase({ publish: (image) => images.push(Buffer.from(image)) });
+      serialized.exec('CREATE TABLE portable (value TEXT)');
+      const beforeReturning = images.length;
+      assert.strictEqual(
+        serialized.prepare('INSERT INTO portable VALUES (?) RETURNING value').get('one').value,
+        'one',
+      );
+      assert.deepStrictEqual(
+        serialized.prepare('INSERT INTO portable VALUES (?) RETURNING value').all('two').map((row) => row.value),
+        ['two'],
+      );
+      assert.strictEqual(images.length, beforeReturning + 2);
+      const beforePragma = images.length;
+      serialized.pragma('user_version = 7');
+      assert.strictEqual(images.length, beforePragma + 1);
+      serialized.close();
+
+      const reopened = openSerializedDatabase({
+        initialImage: images.at(-1),
+        publish: () => assert.fail('read-only verification unexpectedly published'),
+      });
+      assert.deepStrictEqual(
+        reopened.prepare('SELECT value FROM portable ORDER BY rowid').all().map((row) => row.value),
+        ['one', 'two'],
+      );
+      assert.strictEqual(reopened.pragma('user_version').user_version, 7);
+      reopened.close();
+    });
+
+    it('rolls back partial autocommit exec changes when a later statement is invalid', function () {
+      const images = [];
+      const serialized = openSerializedDatabase({ publish: (image) => images.push(Buffer.from(image)) });
+      serialized.exec('CREATE TABLE portable (value TEXT)');
+      const durableBeforeFailure = images.length;
+      assert.throws(
+        () => serialized.exec("INSERT INTO portable VALUES ('must-rollback'); THIS IS NOT SQL"),
+      );
+      assert.throws(
+        () => serialized.exec("INSERT INTO portable VALUES ('must-not-commit'); /* boundary */ COMMIT; THIS IS NOT SQL"),
+        /one standalone exec call/i,
+      );
+      assert.strictEqual(images.length, durableBeforeFailure);
+      assert.deepStrictEqual(serialized.prepare('SELECT value FROM portable').all(), []);
+      serialized.exec("INSERT INTO portable VALUES ('durable; quoted'); -- trailing ; comment\n");
+      serialized.close();
+
+      const reopened = openSerializedDatabase({
+        initialImage: images.at(-1),
+        publish: () => assert.fail('read-only verification unexpectedly published'),
+      });
+      assert.deepStrictEqual(
+        reopened.prepare('SELECT value FROM portable').all().map((row) => row.value),
+        ['durable; quoted'],
+      );
+      reopened.close();
+    });
+
+    it('rolls back prepared OR FAIL rows instead of leaking them into a later publish', function () {
+      const images = [];
+      const serialized = openSerializedDatabase({ publish: (image) => images.push(Buffer.from(image)) });
+      serialized.exec('CREATE TABLE portable (value TEXT UNIQUE)');
+      serialized.prepare('INSERT INTO portable VALUES (?)').run('existing');
+      const durableBeforeFailure = images.length;
+      assert.throws(
+        () => serialized.prepare("INSERT OR FAIL INTO portable VALUES ('partial'), ('existing')").run(),
+        /constraint|unique/i,
+      );
+      assert.strictEqual(images.length, durableBeforeFailure);
+      assert.deepStrictEqual(
+        serialized.prepare('SELECT value FROM portable ORDER BY value').all().map((row) => row.value),
+        ['existing'],
+      );
+      serialized.prepare('INSERT INTO portable VALUES (?)').run('durable');
+      serialized.close();
+
+      const reopened = openSerializedDatabase({
+        initialImage: images.at(-1), publish: () => assert.fail('read-only reopen unexpectedly published'),
+      });
+      assert.deepStrictEqual(
+        reopened.prepare('SELECT value FROM portable ORDER BY value').all().map((row) => row.value),
+        ['durable', 'existing'],
+      );
+      reopened.close();
+    });
   });
 });

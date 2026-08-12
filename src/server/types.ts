@@ -98,8 +98,9 @@ export interface Aliases {
  * The immutable location and account namespace of a persisted session.
  *
  * `ownerKey` is deliberately an opaque stable identifier, never a numeric
- * database id or a login. That lets a workspace state file survive a fresh
- * local AppDatabase without making one account's records visible to another.
+ * database id or a login. It namespaces project artifacts without exposing an
+ * account identity; the shared AppDatabase remains authoritative for the
+ * session record and its scope reference.
  */
 export interface SessionStorageScope {
   readonly workspaceRoot: string;
@@ -115,12 +116,12 @@ export interface SessionRecord {
    */
   rollbackRecoveryPending?: boolean;
   /**
-   * Legacy row retained read-only because its workspace archive could not be
-   * completed. It remains listable, but no runtime or mutation may write
-   * through it until a later migration retry succeeds.
+   * Row retained read-only because its referenced project artifact scope is not
+   * currently safe or available. It remains listable, but no runtime or
+   * project-file mutation may write through it until the scope is restored.
    */
   persistenceUnavailable?: string;
-  /** Set once at creation when this record belongs to workspace-local state. */
+  /** Immutable project-artifact scope stored with this global session record. */
   readonly storageScope?: SessionStorageScope;
   name: string;
   created: Date;
@@ -319,10 +320,10 @@ export interface SessionRecord {
    * conversation, dropped at a restart — and the one that got missed would be
    * the leak.
    *
-   * Persisted with the session in the workspace archive. Draft text and its
-   * attachment descriptors are session data, so keeping a fallback copy in
-   * Chromium Web Storage would leak them into Electron's installation-level
-   * userData and make a server restart lose the only project-local copy.
+   * Persisted with the session in the shared application database. Draft text
+   * and attachment descriptors are server-owned session metadata, so Chromium
+   * Web Storage deliberately keeps no fallback copy. Attachment bodies remain
+   * in the session's project artifact scope.
    */
   chatDraft?: ChatDraft;
   /**

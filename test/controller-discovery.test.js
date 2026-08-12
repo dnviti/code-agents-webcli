@@ -34,6 +34,23 @@ describe('desktop controller LAN discovery client', function () {
     }), ['255.255.255.255', '192.168.20.255', '10.7.255.255']);
   });
 
+  it('falls back to the limited broadcast when interface inspection is capability-denied', function () {
+    for (const denied of [
+      Object.assign(new Error('network interfaces are unavailable'), {
+        code: 'ERR_ACCESS_DENIED', permission: 'os.networkInterfaces',
+      }),
+      Object.assign(new Error('uv_interface_addresses returned Unknown system error 1'), {
+        code: 'ERR_SYSTEM_ERROR', syscall: 'uv_interface_addresses', errno: 1,
+      }),
+    ]) {
+      assert.deepStrictEqual(broadcastAddresses(() => { throw denied; }), ['255.255.255.255']);
+    }
+    assert.throws(
+      () => broadcastAddresses(() => { throw Object.assign(new Error('interface probe broke'), { code: 'EIO' }); }),
+      /interface probe broke/,
+    );
+  });
+
   it('does nothing until explicitly called, then sends one bounded scan and deduplicates candidates', async function () {
     let created = 0;
     const socket = new FakeSocket();

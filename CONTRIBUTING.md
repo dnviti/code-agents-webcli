@@ -2,7 +2,7 @@
 
 ## Stack
 
-- Node.js 22.13+ and TypeScript
+- Node.js 24.16+ and TypeScript
 - Express + `ws` for HTTP and WebSocket
 - xterm.js in the browser, React for the shell UI
 - Pseudo-terminals via `@lydell/node-pty` (prebuilt binaries, never node-gyp)
@@ -36,7 +36,8 @@ npm run dev
 npm run build          # compile server, bundle client, copy assets
 npm run build:watch    # rebuild on change
 npm run dev            # build, then start with extra logging
-npm test               # mocha
+npm test               # tests available on this host; reports capability-gated files
+npm run test:strict    # require every integration capability (used by CI)
 npm run typecheck      # server and client
 npm run test:browser   # headless browser checks against the real bundle
 npm run verify:install # install the working tree into a clean prefix and start it
@@ -91,9 +92,15 @@ Run `npm run verify:install` before touching anything in `package.json`,
 
 ## Persistence model
 
-- App settings, users, auth sessions and runtime sessions live in SQLite.
-- Bulk data does not. Scrollback, chat events and transcripts are append-only
-  files with fixed-width indexes.
+- One per-user `app.sqlite` owns installation settings, users, auth sessions,
+  runtime/session metadata, composer drafts, usage accounting and immutable
+  references to each session's project storage scope.
+- Projects do not contain SQLite databases. Bulk project data lives in the
+  authorised workspace's `.cc-web/`: scrollback, chat events and transcripts
+  are append-only files with fixed-width indexes, alongside pasted images and
+  attachments.
+- Production has no automatic migration from older storage layouts. Leave
+  unrecognised legacy files untouched.
 - Keep schema changes backward-compatible where possible.
 - If you change persisted structures, update the tests and the docs in the same
   change.

@@ -179,7 +179,7 @@ export interface SessionListItem {
    * is the same direction every other unknown in this rule takes.
    */
   bypassPermissions?: boolean;
-  /** Read-only legacy session whose workspace migration can be retried later. */
+  /** Read-only session whose authoritative workspace archive is unavailable. */
   persistenceUnavailable?: string;
   /** Hidden rollback anchor; only definitive deletion is permitted. */
   rollbackRecoveryPending?: boolean;

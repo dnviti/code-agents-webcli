@@ -1,5 +1,5 @@
-# Node 22.13+ is required for the built-in node:sqlite this app runs on; 24 is
-# the current LTS. The python3/make/g++ layer that used to be here is gone with
+# Node 24.16+ is required for the built-in node:sqlite serialization APIs this
+# app runs on. The python3/make/g++ layer that used to be here is gone with
 # the last compiled dependency — nothing in the tree builds native code now.
 FROM node:24-bookworm-slim AS build
 

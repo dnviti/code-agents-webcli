@@ -15,8 +15,9 @@ const SETTING = 'session_workspace_roots.v1';
 const OWNER_KEY = /^[A-Za-z0-9_-]{16,128}$/;
 
 /**
- * Installation-local discovery contains paths only. Conversation ids, titles,
- * activity, runtimes and tab state remain exclusively inside each workspace.
+ * Installation-local registry of authorised owner/path pairs. Session metadata
+ * lives beside this registry in the shared application database; only project
+ * artifact bodies live below the registered workspace roots.
  */
 export class WorkspaceCatalog {
   constructor(private readonly settings: SettingsStore) {}

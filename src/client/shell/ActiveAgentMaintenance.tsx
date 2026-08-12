@@ -77,7 +77,8 @@ export function ActiveAgentMaintenance({
   const [operationId, setOperationId] = React.useState<string | null>(null);
   React.useEffect(() => {
     // Old builds persisted this session-bound retry handle in Electron
-    // userData. The live hook owns it now; the workspace owns session state.
+    // userData. The live hook owns it now; durable session metadata belongs to
+    // the server's shared application database.
     try { localStorage.removeItem(operationKey); } catch { /* optional */ }
   }, [operationKey]);
   const operationSettled = React.useCallback((operation: AgentMaintenanceOperation): void => {

@@ -6,8 +6,8 @@ How the pieces fit together, for anyone changing the code.
 
 One Node process. It serves the client bundle over HTTPS, terminates WebSocket
 connections, and spawns agent CLIs into pseudo-terminals. Installation state
-lives in one global SQLite file; session and usage state lives in one SQLite
-file per authorised workspace.
+lives in one shared, per-user SQLite file. Project conversation and terminal
+bytes live as files in each authorised workspace.
 
 ```text
 browser ──HTTPS──▶ express ──▶ routes, static bundle, /ca.crt
@@ -16,9 +16,9 @@ browser ──HTTPS──▶ express ──▶ routes, static bundle, /ca.crt
                                           ├─▶ bridges/*  ─▶ pty ─▶ agent CLI
                                           ├─▶ ChatStore   (headless CLI protocols)
                                           ├─▶ ScrollbackRecorder ─▶ HistoryStore
-                                          └─▶ SessionStore ─▶ workspace .cc-web/session-state.sqlite
+                                          └─▶ SessionStore ─▶ global app.sqlite
 
-express ──▶ auth/settings/projects ──▶ global app.sqlite
+express ──▶ auth/settings/projects/usage ──▶ global app.sqlite
 ```
 
 ## Layout
@@ -77,22 +77,29 @@ it to reconstruct scrollback.
 ## Storage
 
 `app.sqlite` holds installation-wide settings, users, auth sessions, runtime
-profiles, deploy targets, credentials, projects, and a path-only catalog of
-authorised workspace roots. It is not used for new runtime-session or usage
-writes.
+profiles, deploy targets, credentials and projects. It also holds session/tab
+metadata, composer drafts, usage tables and each session's immutable workspace
+scope. The data-directory lease makes it the single shared SQLite writer for
+the installation.
 
-Each workspace has `.cc-web/session-state.sqlite`, with owner-scoped session/tab
-records, composer drafts and usage tables. Chat events, transcripts, terminal history and paste
-metadata are files under `.cc-web/sessions/<owner-key>/<session-id>/`; their
+Workspaces contain no SQLite database. Chat events, transcripts, terminal
+history, paste metadata and attachment bytes are files under `.cc-web/`, with
+per-session files below `.cc-web/sessions/<owner-key>/<session-id>/`. Their
 append-only logs use fixed-width indexes, so paging into a week-old session is a
-couple of positioned reads rather than a scan. Stores receive the session's
-immutable workspace scope, while coordinators open and aggregate the authorised
-workspace databases needed by account-wide views.
+couple of positioned reads rather than a scan. Stores receive the immutable
+scope recorded in `app.sqlite`; later working-directory changes cannot move a
+session's project data.
 
-The path-only discovery catalog admits a canonical workspace root for exactly
-one immutable account identity. A conflicting or legacy-ambiguous assignment
-fails closed before the local database or any session artifact is opened. The
-opaque owner key then prevents session-id collisions inside that archive.
+Workspace-file persistence is strict on Linux, Windows, and macOS. Linux uses a
+descriptor-relative namespace; Windows and macOS use verified-cwd helpers for
+race-safe project-file operations. SQLite is never opened or published inside
+a workspace.
+
+The workspace catalog admits a canonical root for exactly one immutable account
+identity. A conflicting or ambiguous assignment fails closed before any
+session artifact is opened. The opaque owner key prevents account namespaces
+from colliding inside that archive, while the trusted global row supplies
+runtime and resume authority.
 
 See [Configuration](configuration.md#where-state-lives) for the full layout.
 
@@ -118,7 +125,8 @@ The parts that get specific care:
 ## Testing
 
 ```bash
-npm test                # mocha, no network, no real CLIs
+npm test                # available tests; reports capability-gated integration files
+npm run test:strict     # require loopback, local sockets, and child processes
 npm run typecheck       # server and client
 npm run test:browser    # headless browser checks against the real bundle
 npm run verify:install  # install the working tree into a clean prefix and start it

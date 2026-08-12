@@ -28,7 +28,8 @@ const {
   writeWindowState,
 } = require('./lib.js');
 const { ControllerCatalog } = require('./controller-catalog.js');
-const { readControllerPort, writeControllerPort } = require('./controller-endpoint.js');
+const { readControllerPort } = require('./controller-endpoint.js');
+const { startControllerGateway } = require('./controller-startup.js');
 const { findLanServers } = require('./controller-discovery.js');
 const { createElectronControllerSessions } = require('./controller-electron.js');
 const { createControllerGateway } = require('./controller-gateway.js');
@@ -592,9 +593,6 @@ async function runSmokeCheck(started) {
     workspaceRoot: path.join(workingDir, 'workspace-smoke'),
     dataDir: started.server.database.storageDir,
   });
-  // The mode is reported rather than assumed: workspace-local persistence is
-  // available only where the storage layer can prove race-safe directory
-  // binding, which today means Linux.
   console.log(`DESKTOP_WORKSPACE_ATTACHMENT_SMOKE_OK bytes=${persistence.bytes} ${persistence.mode}`);
   console.log('DESKTOP_SMOKE_STAGE packaged-renderer');
   await runPackagedRendererSmoke(started, persistence.sessionName);
@@ -898,16 +896,26 @@ async function boot() {
     dataDir: path.join(userData, 'controller'),
     localAvailable: false,
   });
-  controllerGateway = createControllerGateway({
-    publicDir: path.join(__dirname, '..', 'dist', 'public'),
-    controller: controllerRuntime,
-    phoneAccess: phoneAccessService,
-    port: controllerPort,
+  const startedController = await startControllerGateway({
+    createGateway: createControllerGateway,
+    gatewayOptions: {
+      publicDir: path.join(__dirname, '..', 'dist', 'public'),
+      controller: controllerRuntime,
+      phoneAccess: phoneAccessService,
+    },
+    persistedPort: controllerPort,
+    endpointFile: controllerEndpointFile,
   });
-  const controllerEndpoint = await controllerGateway.listen();
+  controllerGateway = startedController.gateway;
+  const controllerEndpoint = startedController.endpoint;
+  if (startedController.recoveredFrom) {
+    console.warn(
+      `Controller port ${startedController.recoveredFrom.port} was unavailable `
+      + `(${startedController.recoveredFrom.code}); moved to ${controllerEndpoint.port}.`,
+    );
+  }
   controllerOrigin = controllerEndpoint.origin;
   trustedRendererOrigin = controllerEndpoint.origin;
-  if (controllerPort === 0) writeControllerPort(controllerEndpointFile, controllerEndpoint.port);
   const controllerAuthentication = controllerGateway.authentication();
   const controllerUrls = [
     `${controllerAuthentication.origin}/*`,

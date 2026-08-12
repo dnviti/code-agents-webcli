@@ -10,20 +10,11 @@ const SMOKE_PAYLOAD_BYTES = 1024 * 1024 + 257;
 /**
  * Hosts whose attachments must be stored inside the workspace.
  *
- * Workspace-local storage needs an openat-like descriptor namespace to prove
- * race-safe directory binding. Linux has one in `/proc/self/fd`, so both the
- * session and its attachments always land in `.cc-web`. Windows has none, but
- * `workspace-session-storage` accepts a pathname fallback per volume once it
- * has proven that an open descendant handle blocks an ancestor rename; the
- * attachment store resolves that policy separately, against the session working
- * directory, so a Windows host can keep the workspace session layout and still
- * store attachments in installation storage.
- *
- * Listing only the platform that guarantees the workspace-only outcome keeps
- * a Linux regression failing here, while a host that does achieve it is still
- * held to the complete contract below.
+ * Every supported packaged desktop host must persist project conversations
+ * entirely inside `.cc-web`. Linux uses descriptor-relative mutation; Windows
+ * and macOS use the verified cwd helper.
  */
-const WORKSPACE_LOCAL_PERSISTENCE_PLATFORMS = new Set(['linux']);
+const WORKSPACE_LOCAL_PERSISTENCE_PLATFORMS = new Set(['linux', 'win32', 'darwin']);
 
 /**
  * Windows spells one directory two ways. `fs.realpathSync` is implemented in
@@ -113,32 +104,38 @@ function fileContains(filename, needle, filesystem = fs) {
   }
 }
 
-/**
- * A workspace-local conversation must never gain an installation-global row,
- * whatever storage its attachments ended up in. This half of the check stays
- * valid when attachments alone fall back, because it never reads `dataDir`.
- */
-function assertNoInstallationSessionRows(server) {
-  for (const table of ['runtime_sessions', 'usage_jobs', 'usage_job_models', 'usage_job_tools']) {
-    const row = server.database.raw.prepare(`SELECT COUNT(*) AS count FROM ${table}`).get();
-    assert.equal(row.count, 0, `${table} received a new installation-global row`);
-  }
+function assertSharedInstallationSessionRow(server, sessionId, workspaceRoot) {
+  const row = server.database.raw.prepare(`
+    SELECT storage_workspace_root AS root, storage_owner_key AS ownerKey
+      FROM runtime_sessions WHERE id = ?
+  `).get(sessionId);
+  assert.ok(row, 'shared app.sqlite omitted the session metadata row');
+  assert.equal(path.resolve(row.root), path.resolve(workspaceRoot));
+  assert.match(row.ownerKey, /^[A-Za-z0-9._-]+$/);
 }
 
-function assertNoInstallationSessionCopy(server, dataDir, sessionId, payload, filesystem = fs) {
-  assertNoInstallationSessionRows(server);
+function assertNoInstallationSessionCopy(server, dataDir, sessionId, payloads, filesystem = fs) {
+  assertSharedInstallationSessionRow(server, sessionId, server.claudeSessions.get(sessionId).storageScope.workspaceRoot);
+  assertNoInstallationUsageRows(server);
 
-  const idNeedle = Buffer.from(sessionId, 'utf8');
-  // A random prefix proves that attachment bytes were not duplicated without
-  // reading a second full MiB from every installation file.
-  const payloadNeedle = payload.subarray(0, 64);
+  // A workspace conversation must never gain an installation-global usage or
+  // accounting row. `runtime_sessions` alone carries the shared metadata row
+  // asserted above; every other table in the installation database stays empty.
+  function assertNoInstallationUsageRows(server) {
+    for (const table of ['usage_jobs', 'usage_job_models', 'usage_job_tools']) {
+      const row = server.database.raw.prepare(`SELECT COUNT(*) AS count FROM ${table}`).get();
+      assert.equal(row.count, 0, `${table} received a new installation-global row`);
+    }
+  }
+
+  const payloadNeedles = (Array.isArray(payloads) ? payloads : [payloads])
+    .map((payload) => payload.subarray(0, 64));
   for (const entry of walk(dataDir, filesystem)) {
-    assert.ok(!entry.name.includes(sessionId), `session id leaked into ${entry.absolute}`);
     if (!entry.file) continue;
-    assert.equal(fileContains(entry.absolute, idNeedle, filesystem), false,
-      `session id leaked into installation file ${entry.absolute}`);
-    assert.equal(fileContains(entry.absolute, payloadNeedle, filesystem), false,
-      `attachment bytes leaked into installation file ${entry.absolute}`);
+    for (const payloadNeedle of payloadNeedles) {
+      assert.equal(fileContains(entry.absolute, payloadNeedle, filesystem), false,
+        `workspace payload leaked into installation file ${entry.absolute}`);
+    }
   }
 }
 
@@ -220,7 +217,6 @@ async function runPackagedWorkspacePersistenceSmoke(options) {
   const ccWeb = path.join(canonicalWorkspace, '.cc-web');
   const sessionDatabase = path.join(ccWeb, 'session-state.sqlite');
   const findWorkspaceSessionDirectory = () => {
-    if (!filesystem.existsSync(sessionDatabase)) return null;
     const sessionsRoot = path.join(ccWeb, 'sessions');
     const matches = walk(sessionsRoot, filesystem)
       .filter((entry) => entry.directory && entry.name === sessionId)
@@ -229,14 +225,73 @@ async function runPackagedWorkspacePersistenceSmoke(options) {
       ? matches[0]
       : null;
   };
-  // The session was accepted against this workspace root, so its history must
-  // be here. Only the attachment store resolves a separate policy and can still
-  // fall back on its own.
+  // Metadata is global, while history and transcript bodies stay in-project.
   const sessionDirectory = await waitFor(
     findWorkspaceSessionDirectory,
-    'workspace-local session database and transcript',
+    'workspace-local transcript directory',
   );
   assert.ok(resolvedInside(ccWeb, sessionDirectory));
+  assert.equal(filesystem.existsSync(sessionDatabase), false,
+    'project storage unexpectedly contains session-state.sqlite');
+
+  const sessions = started.server.claudeSessions;
+  const historyStore = started.server.historyStore;
+  const chatStore = started.server.chatStore;
+  const session = sessions?.get?.(sessionId);
+  if (!session || !historyStore?.append || !historyStore?.flush || !chatStore?.append || !chatStore?.flush) {
+    throw new Error('Desktop smoke cannot reach the session history or chat store.');
+  }
+  historyStore.append(session, ['packaged workspace persistence smoke history']);
+  await historyStore.flush(session);
+  for (const name of ['history.log', 'history.idx']) {
+    const filename = path.join(sessionDirectory, name);
+    assert.ok(filesystem.existsSync(filename), `workspace history file is missing: ${filename}`);
+    assert.ok(resolvedInside(ccWeb, filename));
+  }
+
+  // This is intentionally a direct store write rather than a session-create
+  // side effect: it exercises the durable chat log and index as packaged code
+  // does, and gives the installation-data scan a distinctive payload to find.
+  const chatPayload = 'packaged workspace persistence smoke chat payload';
+  const chatTimestamp = Date.now();
+  const chatMessageId = 'packaged-workspace-persistence-smoke-message';
+  await chatStore.append(session, [
+    {
+      t: 'msg_start', seq: 1, ts: chatTimestamp, id: chatMessageId,
+      role: 'user', turnId: 'packaged-workspace-persistence-smoke-turn',
+    },
+    {
+      t: 'block_start', seq: 2, ts: chatTimestamp, msgId: chatMessageId, index: 0,
+      block: { kind: 'text', text: chatPayload },
+    },
+  ]);
+  await chatStore.flush(session);
+  const chatLogPath = path.join(sessionDirectory, 'chat.jsonl');
+  const chatIndexPath = path.join(sessionDirectory, 'chat.idx');
+  for (const filename of [chatLogPath, chatIndexPath]) {
+    assert.ok(filesystem.existsSync(filename), `workspace chat file is missing: ${filename}`);
+    assert.ok(resolvedInside(ccWeb, filename));
+  }
+  assert.ok(
+    String(filesystem.readFileSync(chatLogPath, 'utf8')).includes(chatPayload),
+    'workspace chat log did not retain the smoke payload',
+  );
+
+  const pastePayload = Buffer.from([
+    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 0,
+  ]);
+  const pasteResponse = await fetchImpl(
+    `${started.url}/api/sessions/${encodeURIComponent(sessionId)}/paste-image`,
+    { method: 'POST', headers: commonHeaders, body: pastePayload },
+  );
+  const paste = await jsonResponse(pasteResponse, 'desktop smoke pasted image upload');
+  assert.equal(paste.bytes, pastePayload.length);
+  assert.equal(typeof paste.path, 'string');
+  const pastePath = path.resolve(paste.path);
+  assert.ok(resolvedInside(ccWeb, pastePath), `paste was stored outside workspace .cc-web: ${pastePath}`);
+  assert.deepEqual(filesystem.readFileSync(pastePath), pastePayload);
+  assert.ok(filesystem.existsSync(path.join(sessionDirectory, 'paste-manifest.json')),
+    'workspace paste metadata is missing');
 
   const payload = randomBytes(SMOKE_PAYLOAD_BYTES);
   const uploadResponse = await fetchImpl(
@@ -259,18 +314,9 @@ async function runPackagedWorkspacePersistenceSmoke(options) {
   assert.equal(typeof attachment.relativePath, 'string');
   const storedPath = path.resolve(attachment.path);
   const attachmentWorkspaceLocal = resolvedInside(ccWeb, storedPath);
-  if (workspaceLocalExpected) {
-    assert.ok(attachmentWorkspaceLocal,
-      `attachment was stored outside workspace .cc-web (${ccWeb}): ${storedPath}`);
-  } else if (!attachmentWorkspaceLocal) {
-    // Attachments resolve their own mutation policy against the session
-    // working directory, so a host can keep the workspace session layout and
-    // still fall back for attachments. Wherever they land it must be one of
-    // the two storage locations this smoke owns, never somewhere else.
-    assert.ok(resolvedInside(canonicalDataDir, storedPath),
-      'attachment left both the workspace and installation storage: '
-      + `${storedPath} is in neither ${ccWeb} nor ${canonicalDataDir}`);
-  }
+  assert.ok(workspaceLocalExpected, `Unsupported packaged smoke platform: ${process.platform}`);
+  assert.ok(attachmentWorkspaceLocal,
+    `attachment was stored outside workspace .cc-web (${ccWeb}): ${storedPath}`);
   if (attachmentWorkspaceLocal) {
     assert.equal(
       canonicalPath(path.resolve(canonicalWorkspace, attachment.relativePath), filesystem),
@@ -288,38 +334,33 @@ async function runPackagedWorkspacePersistenceSmoke(options) {
   assert.equal(downloadResponse.headers.get('cache-control'), 'no-store');
   assert.deepEqual(Buffer.from(await downloadResponse.arrayBuffer()), payload);
 
-  const workspaceOnly = attachmentWorkspaceLocal;
-  if (workspaceOnly) {
-    assertNoInstallationSessionCopy(
-      started.server,
-      canonicalDataDir,
-      sessionId,
-      payload,
-      filesystem,
-    );
-  } else {
-    // Attachments resolve their own policy, so they can fall back while the
-    // conversation stays workspace-local. Their bytes and their owner/session
-    // namespace are then legitimately inside `dataDir`, which rules out the
-    // filesystem sweep -- but the conversation itself must still own no
-    // installation-global row, and that half of the check remains exact.
-    assertNoInstallationSessionRows(started.server);
-  }
+  assertNoInstallationSessionCopy(
+    started.server,
+    canonicalDataDir,
+    sessionId,
+    [payload, pastePayload, Buffer.from(chatPayload, 'utf8')],
+    filesystem,
+  );
   return {
     sessionId,
     bytes: payload.length,
-    mode: workspaceOnly ? 'workspace-only' : 'installation-fallback',
-    workspaceOnly,
+    mode: 'shared-sqlite-project-artifacts',
+    workspaceOnly: false,
     sessionName,
     sessionDatabase,
+    globalDatabase: started.server.database.dbPath,
     sessionDirectory,
     attachmentPath: storedPath,
+    pastePath,
+    chatLogPath,
+    chatIndexPath,
+    chatPayload,
   };
 }
 
 module.exports = {
   SMOKE_PAYLOAD_BYTES,
   assertNoInstallationSessionCopy,
-  assertNoInstallationSessionRows,
+  assertSharedInstallationSessionRow,
   runPackagedWorkspacePersistenceSmoke,
 };

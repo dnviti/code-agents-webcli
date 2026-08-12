@@ -1,8 +1,9 @@
 # Changelog
 
-## Unreleased
+## [6.1.2] - 2026-08-12
 
 ### Changed
+- Prepare release 6.1.2.
 - **The capability ladder now reaches every role that can carry it.** Oh My Pi
   gets all ten of its model roles — `tiny`, `vision`, `commit` and `advisor`
   included — instead of six; Claude Code sessions gain one subagent per rung

@@ -43,7 +43,7 @@ import { randomBytes } from 'node:crypto';
 import type { StatementSync } from 'node:sqlite';
 
 /** Minimum Node that exposes `node:sqlite` without an --experimental flag. */
-const MIN_NODE = '22.13.0';
+const MIN_NODE = '24.16.0';
 
 export interface RunResult {
   changes: number;
@@ -121,6 +121,12 @@ export interface OpenDatabaseOptions {
   readonly fileBinding?: SqliteOpenFileBinding;
 }
 
+export interface SerializedDatabaseOptions {
+  readonly initialImage?: Uint8Array;
+  readonly publish: (image: Uint8Array) => void;
+  readonly poison?: (error: unknown) => void;
+}
+
 export type SqliteFileBindingBackend =
   | 'descriptor-inventory'
   | 'windows-mandatory-share'
@@ -135,7 +141,7 @@ function loadSqlite(): SqliteModule {
     return sqliteModule;
   }
 
-  // Node 22.x still tags the module experimental and prints a warning on first
+  // Older Node releases tagged the module experimental and printed a warning on first
   // load. It is not actionable — the app cannot opt out of a builtin's
   // stability tag — and it lands in the middle of the startup banner where it
   // reads as a fault. Swapping `emitWarning` only for the duration of the
@@ -159,10 +165,10 @@ function loadSqlite(): SqliteModule {
     sqliteModule = require('node:sqlite') as SqliteModule;
   } catch (error) {
     // Distinguish the two causes rather than blaming the Node version for
-    // both: telling somebody on Node 24 to "upgrade to 22.13" sends them off
-    // to fix something that is not wrong.
+    // both: telling somebody on Node 24.16+ to upgrade their runtime sends
+    // them off to fix something that is not wrong.
     const [major, minor] = process.versions.node.split('.').map(Number);
-    const tooOld = major < 22 || (major === 22 && minor < 13);
+    const tooOld = major < 24 || (major === 24 && minor < 16);
     const reason = error instanceof Error ? error.message : String(error);
 
     throw new Error(
@@ -449,6 +455,259 @@ function changedRegularDescriptors(
   return changed;
 }
 
+type SerializableDatabaseSync = InstanceType<SqliteModule['DatabaseSync']> & {
+  serialize(): Uint8Array;
+  deserialize(image: Uint8Array): void;
+};
+
+/**
+ * Avoid copying a potentially hundreds-of-megabytes image for ordinary reads.
+ * SQLite's less obvious write forms (`WITH ... INSERT`, DML `RETURNING`, and
+ * PRAGMA) deliberately take the conservative path below. `EXPLAIN` never runs
+ * the statement it describes, and a top-level SELECT/VALUES cannot mutate this
+ * connection because this adapter registers no user-defined SQL functions.
+ */
+function serializedSqlBody(sql: string): string {
+  let remaining = sql;
+  for (;;) {
+    remaining = remaining.trimStart();
+    if (remaining.startsWith('--')) {
+      const newline = remaining.indexOf('\n');
+      if (newline < 0) return '';
+      remaining = remaining.slice(newline + 1);
+      continue;
+    }
+    if (remaining.startsWith('/*')) {
+      const end = remaining.indexOf('*/', 2);
+      if (end < 0) return remaining;
+      remaining = remaining.slice(end + 2);
+      continue;
+    }
+    break;
+  }
+  return remaining;
+}
+
+function serializedStatementMayMutate(sql: string): boolean {
+  const keyword = /^[A-Za-z]+/u.exec(serializedSqlBody(sql))?.[0]?.toUpperCase();
+  return keyword !== 'SELECT' && keyword !== 'VALUES' && keyword !== 'EXPLAIN';
+}
+
+function splitSerializedStatements(sql: string): string[] {
+  const raw: string[] = [];
+  let start = 0;
+  let quote: "'" | '"' | '`' | ']' | null = null;
+  let lineComment = false;
+  let blockComment = false;
+  for (let index = 0; index < sql.length; index += 1) {
+    const char = sql[index];
+    const next = sql[index + 1];
+    if (lineComment) {
+      if (char === '\n') lineComment = false;
+      continue;
+    }
+    if (blockComment) {
+      if (char === '*' && next === '/') { blockComment = false; index += 1; }
+      continue;
+    }
+    if (quote) {
+      if (char === quote) {
+        if (next === quote) index += 1;
+        else quote = null;
+      }
+      continue;
+    }
+    if (char === '-' && next === '-') { lineComment = true; index += 1; continue; }
+    if (char === '/' && next === '*') { blockComment = true; index += 1; continue; }
+    if (char === "'" || char === '"' || char === '`') { quote = char; continue; }
+    if (char === '[') { quote = ']'; continue; }
+    if (char === ';') {
+      const statement = sql.slice(start, index).trim();
+      if (serializedSqlBody(statement)) raw.push(statement);
+      start = index + 1;
+    }
+  }
+  const tail = sql.slice(start).trim();
+  if (serializedSqlBody(tail)) raw.push(tail);
+
+  // Trigger bodies contain semicolon-delimited statements between BEGIN/END;
+  // those are one SQLite statement, not autocommit transaction controls.
+  const statements: string[] = [];
+  let trigger = '';
+  for (const statement of raw) {
+    const body = serializedSqlBody(statement);
+    if (!trigger && /^CREATE\s+(?:(?:TEMP|TEMPORARY)\s+)?TRIGGER\b[\s\S]*\bBEGIN\b/iu.test(body)) {
+      trigger = statement;
+      continue;
+    }
+    if (trigger) {
+      trigger += `; ${statement}`;
+      if (/^END\b/iu.test(body)) {
+        statements.push(trigger);
+        trigger = '';
+      }
+      continue;
+    }
+    statements.push(statement);
+  }
+  if (trigger) statements.push(trigger);
+  return statements;
+}
+
+function serializedTransactionControl(sql: string): boolean {
+  return /^\s*(?:BEGIN(?:\s+(?:DEFERRED|IMMEDIATE|EXCLUSIVE))?|COMMIT|END|ROLLBACK(?:\s+TO(?:\s+SAVEPOINT)?\s+[A-Za-z0-9_]+)?|SAVEPOINT\s+[A-Za-z0-9_]+|RELEASE(?:\s+SAVEPOINT)?\s+[A-Za-z0-9_]+)\s*;?\s*$/iu
+    .test(sql);
+}
+
+/** In-memory SQLite whose only durable write is a caller-provided atomic image publication. */
+export function openSerializedDatabase(options: SerializedDatabaseOptions): SqliteDatabase {
+  const { DatabaseSync: Ctor } = loadSqlite();
+  const db = new Ctor(':memory:', { timeout: BUSY_TIMEOUT_MS }) as SerializableDatabaseSync;
+  if (typeof db.serialize !== 'function' || typeof db.deserialize !== 'function') {
+    db.close();
+    throw new Error(`This build needs Node ${MIN_NODE} or newer for serialized workspace SQLite.`);
+  }
+  if (options.initialImage?.byteLength) db.deserialize(options.initialImage);
+  let durable = Buffer.from(db.serialize());
+  let closed = false;
+  let poisoned: unknown = null;
+
+  const usable = (): void => {
+    if (closed) throw new Error('Workspace SQLite connection is closed');
+    if (poisoned) throw Object.assign(new Error('Workspace SQLite connection is poisoned'), {
+      code: 'WORKSPACE_DATABASE_POISONED', cause: poisoned,
+    });
+  };
+  const publish = (before: Uint8Array): void => {
+    usable();
+    const next = Buffer.from(db.serialize());
+    if (next.equals(durable)) return;
+    try {
+      options.publish(next);
+      durable = next;
+    } catch (error) {
+      try { db.deserialize(before); } catch { /* The connection is fail-stop below. */ }
+      poisoned = error;
+      options.poison?.(error);
+      throw Object.assign(new Error('Workspace database image publication failed'), {
+        code: 'WORKSPACE_DATABASE_POISONED', cause: error,
+      });
+    }
+  };
+  const mutateOutsideTransaction = <Result>(operation: () => Result): Result => {
+    usable();
+    const wasTransaction = db.isTransaction;
+    // At every autocommit boundary the in-memory image is exactly `durable`.
+    // Reusing that immutable snapshot avoids one full image copy per write.
+    const before = durable;
+    const result = operation();
+    if ((!wasTransaction && !db.isTransaction) || (wasTransaction && !db.isTransaction)) publish(before);
+    return result;
+  };
+  const readOnly = <Result>(operation: () => Result): Result => {
+    usable();
+    return operation();
+  };
+  const mutateAtomically = <Result>(operation: () => Result): Result => {
+    usable();
+    if (db.isTransaction) return mutateOutsideTransaction(operation);
+    const before = durable;
+    const savepoint = `${SAVEPOINT}_autocommit`;
+    db.exec(`SAVEPOINT ${savepoint}`);
+    try {
+      const result = operation();
+      db.exec(`RELEASE ${savepoint}`);
+      publish(before);
+      return result;
+    } catch (error) {
+      if (db.isTransaction) {
+        try {
+          db.exec(`ROLLBACK TO ${savepoint}`);
+          db.exec(`RELEASE ${savepoint}`);
+        } catch { /* Preserve the original SQLite failure. */ }
+      }
+      throw error;
+    }
+  };
+  const execAtomically = (sql: string): void => {
+    usable();
+    const statements = splitSerializedStatements(sql);
+    const transactionBoundary = statements.some((statement) => {
+      const keyword = /^[A-Za-z]+/u.exec(serializedSqlBody(statement))?.[0]?.toUpperCase();
+      return keyword !== undefined
+        && new Set(['BEGIN', 'COMMIT', 'END', 'ROLLBACK', 'SAVEPOINT', 'RELEASE']).has(keyword);
+    });
+    if (transactionBoundary) {
+      if (statements.length !== 1 || !serializedTransactionControl(serializedSqlBody(statements[0]))) {
+        throw new TypeError('Serialized SQLite transaction control must be one standalone exec call.');
+      }
+      mutateOutsideTransaction(() => db.exec(sql));
+      return;
+    }
+    mutateAtomically(() => db.exec(sql));
+  };
+
+  return {
+    prepare: (sql) => {
+      usable();
+      const statement = db.prepare(sql);
+      const mayMutate = serializedStatementMayMutate(sql);
+      const get = (...params: unknown[]): unknown =>
+        statement.get(...(params as never[]));
+      const all = (...params: unknown[]): unknown[] =>
+        statement.all(...(params as never[])) as unknown[];
+      return {
+        run: (...params) => mutateAtomically(
+          () => statement.run(...(params as never[])) as unknown as RunResult,
+        ),
+        // SQLite permits DML with RETURNING through get/all. Keep those durable
+        // without serializing the whole database for the common SELECT path.
+        get: (...params) => mayMutate
+          ? mutateAtomically(() => get(...params))
+          : readOnly(() => get(...params)),
+        all: (...params) => mayMutate
+          ? mutateAtomically(() => all(...params))
+          : readOnly(() => all(...params)),
+      };
+    },
+    exec: execAtomically,
+    pragma: (body) => mutateOutsideTransaction(() => {
+      const rows = db.prepare(`PRAGMA ${body}`).all();
+      return rows.length ? rows[0] : null;
+    }),
+    transaction<Args extends unknown[], Result>(fn: (...args: Args) => Result) {
+      return (...args: Args): Result => {
+        usable();
+        const nested = db.isTransaction;
+        const before = durable;
+        db.exec(nested ? `SAVEPOINT ${SAVEPOINT}` : 'BEGIN');
+        try {
+          const result = fn(...args);
+          if (result && typeof (result as { then?: unknown }).then === 'function') {
+            throw new TypeError('A transaction function must not return a promise.');
+          }
+          db.exec(nested ? `RELEASE ${SAVEPOINT}` : 'COMMIT');
+          if (!nested) publish(before);
+          return result;
+        } catch (error) {
+          if (db.isTransaction) {
+            try {
+              db.exec(nested ? `ROLLBACK TO ${SAVEPOINT}` : 'ROLLBACK');
+              if (nested) db.exec(`RELEASE ${SAVEPOINT}`);
+            } catch { /* Preserve the original failure. */ }
+          }
+          throw error;
+        }
+      };
+    },
+    close: () => {
+      if (closed) return;
+      db.close();
+      closed = true;
+    },
+  };
+}
+
 export function openDatabase(databasePath: string, options: OpenDatabaseOptions = {}): SqliteDatabase {
   const { DatabaseSync: Ctor } = loadSqlite();
   const fileBinding = options.fileBinding;
@@ -651,8 +910,8 @@ export function openDatabase(databasePath: string, options: OpenDatabaseOptions 
       if (closed) {
         return;
       }
-      closed = true;
       db.close();
+      closed = true;
     },
   };
 

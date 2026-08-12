@@ -7,8 +7,9 @@ Sessions, scrollback, copy/paste, images, and the parts built for a phone.
 A session is a running agent or shell plus everything recorded about it: its
 working directory, its scrollback, its transcript. Sessions are **per user** —
 you only ever see your own — and they survive a reload, a new tab, or a
-different device. The record, transcript and indexed history live under the
-session's immutable workspace scope in `.cc-web/`, not under `--data-dir`.
+different device. The session record lives in the shared per-user `app.sqlite`;
+its transcript and indexed history live under the immutable workspace scope in
+`.cc-web/`.
 
 What they do not survive is the server restarting: the record, the history and
 the transcript all persist, but the live process is gone. A restarted session
