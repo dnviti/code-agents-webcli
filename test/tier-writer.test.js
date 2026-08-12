@@ -35,6 +35,21 @@ function agentFiles(dir) {
   return fs.readdirSync(dir).filter((name) => name.endsWith('.md'));
 }
 
+/**
+ * Create a link that lstat reports as a symlink, or false when the platform
+ * refuses (Windows without developer mode cannot create symlinks; a junction
+ * is a reparse point with the same lstat shape and needs no privileges).
+ */
+function makeLink(target, link) {
+  try {
+    fs.symlinkSync(target, link, process.platform === 'win32' ? 'junction' : undefined);
+    return true;
+  } catch (error) {
+    if (error && (error.code === 'EPERM' || error.code === 'EACCES' || error.code === 'ENOTSUP')) return false;
+    throw error;
+  }
+}
+
 describe('tier writer', function () {
   it('knows which runtimes can express tiers', function () {
     assert.ok(supportsTiers('pi'));
@@ -256,6 +271,19 @@ describe('tier writer', function () {
       // check had stopped recognising our own output.
       assert.ok(!fs.existsSync(path.join(ctx.workingDir, '.pi', 'agents', 'mid.md.bak')));
     });
+
+    it('refuses to write a tier agent through a symlink', function () {
+      const sentinel = path.join(root, 'sentinel.md');
+      fs.writeFileSync(sentinel, 'do not overwrite');
+      const dir = path.join(ctx.workingDir, '.pi', 'agents');
+      fs.mkdirSync(dir, { recursive: true });
+      if (!makeLink(sentinel, path.join(dir, 'mid.md'))) this.skip();
+
+      const result = applyTiers(profile({ tiers: { mid: 'm' } }), ctx);
+      assert.match(result.failed, /symlink/i);
+      assert.deepStrictEqual(result.written, []);
+      assert.strictEqual(fs.readFileSync(sentinel, 'utf8'), 'do not overwrite');
+    });
   });
 
   describe('grok', function () {
@@ -315,6 +343,31 @@ describe('tier writer', function () {
       assert.ok(fs.readFileSync(mine, 'utf8').includes('model = "x"'));
       assert.strictEqual(fs.readFileSync(`${mine}.bak`, 'utf8'), 'hand written\n');
     });
+
+    it('refuses to write a role file that is a symlink', function () {
+      const sentinel = path.join(root, 'sentinel.toml');
+      fs.writeFileSync(sentinel, 'do not overwrite');
+      const dir = roleDir();
+      fs.mkdirSync(dir, { recursive: true });
+      if (!makeLink(sentinel, path.join(dir, 'floor.toml'))) this.skip();
+
+      const result = applyTiers(grokProfile({ floor: 'a', mid: 'm' }), ctx);
+      assert.match(result.failed, /symlink/i);
+      assert.deepStrictEqual(result.written, []);
+      assert.strictEqual(fs.readFileSync(sentinel, 'utf8'), 'do not overwrite');
+    });
+
+    it('refuses a roles directory that is a symlink', function () {
+      const outside = path.join(root, 'outside-roles');
+      fs.mkdirSync(outside);
+      if (!makeLink(outside, path.join(ctx.workingDir, '.grok'))) this.skip();
+
+      const result = applyTiers(grokProfile({ mid: 'm' }), ctx);
+      assert.match(result.failed, /symlink/i);
+      assert.deepStrictEqual(result.written, []);
+      // Nothing landed in the linked directory either.
+      assert.deepStrictEqual(fs.readdirSync(outside), []);
+    });
   });
 
   describe('claude', function () {
@@ -345,10 +398,20 @@ describe('tier writer', function () {
     it('restricts the read-only rungs to inspection tools and cheap thinking', function () {
       const result = applyTiers(claudeProfile({ floor: 'a', top: 'b' }), ctx);
       const agents = parsedAgents(result);
-      assert.deepStrictEqual(agents.floor.tools, ['Read', 'Grep', 'Glob', 'Bash']);
-      assert.deepStrictEqual(agents.top.tools, ['Read', 'Grep', 'Glob', 'Bash']);
+      assert.deepStrictEqual(agents.floor.tools, ['Read', 'Grep', 'Glob']);
+      assert.deepStrictEqual(agents.top.tools, ['Read', 'Grep', 'Glob']);
       assert.strictEqual(agents.floor.effort, 'low');
       assert.strictEqual(agents.top.effort, 'max');
+    });
+
+    it('never hands a read-only rung an unrestricted shell', function () {
+      // A Bash tool with redirection, sed and rm is not read-only no matter how
+      // the prompt words it; the allowlist is the enforcement boundary.
+      const result = applyTiers(claudeProfile({ floor: 'a' }), ctx);
+      const agents = parsedAgents(result);
+      assert.ok(!agents.floor.tools.includes('Bash'));
+      assert.ok(!agents.floor.prompt.includes('Bash'));
+      assert.match(agents.floor.prompt, /You are read-only:/);
     });
 
     it('leaves the workhorse rungs with every tool', function () {
