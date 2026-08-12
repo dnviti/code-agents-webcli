@@ -3,6 +3,13 @@
 ## Unreleased
 
 ### Changed
+- **The capability ladder now reaches every role that can carry it.** Oh My Pi
+  gets all ten of its model roles — `tiny`, `vision`, `commit` and `advisor`
+  included — instead of six; Claude Code sessions gain one subagent per rung
+  via `--agents` launch arguments, with nothing written into the project; Grok
+  sessions gain one role file per rung in the project's `.grok/roles/`. Codex,
+  Kimi and Qwen keep reporting that a ladder has nowhere to land until their
+  CLIs ship a native per-role mechanism.
 - Persistence is split between one shared, per-user `app.sqlite` and each
   project's `.cc-web/` directory. The database owns global configuration,
   authentication, session/tab metadata, composer drafts, usage accounting and

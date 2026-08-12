@@ -417,7 +417,7 @@ const CLAUDE_TIER_TOOLS: Partial<Record<ModelTier, string[]>> = {
  * frontmatter — `description`, `prompt`, `tools`, `model`, `effort` (see
  * code.claude.com/docs/en/sub-agents).
  */
-const writeClaudeTiers: Writer = (tiers, profile, ctx) => {
+const writeClaudeTiers: Writer = (tiers, _profile, _ctx) => {
   const result: TierWriteResult = { written: [], replaced: [], args: [] };
 
   const agents: Record<string, unknown> = {};
@@ -453,6 +453,60 @@ const writeClaudeTiers: Writer = (tiers, profile, ctx) => {
   // no shell quoting, and it stays independent of anything the user's own
   // ~/.claude settings do elsewhere.
   result.args.push('--agents', JSON.stringify(agents));
+  return result;
+};
+
+/**
+ * Grok.
+ *
+ * Grok Build expresses per-role models natively: custom roles are declared in
+ * `~/.grok/config.toml` under `[subagents.roles.<name>]` or discovered from
+ * `.grok/roles/*.toml` (project) and `~/.grok/roles/*.toml` (user), one role
+ * per file with the file name as the role name. Each role carries its own
+ * `model` and `default_capability_mode`. Writing into the session's project
+ * `.grok/roles/` follows the same precedence trick as pi: the project copy
+ * lands where the per-session ladder belongs, and the user's home directory
+ * is never touched.
+ *
+ * Verified against grok's own user guide (`16-subagents.md` in the grok-build
+ * tree); the ACP entry point this app drives (`grok agent stdio`) reads the
+ * same configuration, so re-check against the installed build the first time
+ * one is present.
+ */
+const writeGrokTiers: Writer = (tiers, profile, ctx) => {
+  const result: TierWriteResult = { written: [], replaced: [], args: [] };
+
+  if (!ctx.workingDir) {
+    result.deferred =
+      'Applied per session: the rung role files are written into each session’s ' +
+      'working directory when it starts. Nothing in ~/.grok is touched.';
+    return result;
+  }
+
+  const dir = path.join(ctx.workingDir, '.grok', 'roles');
+  fs.mkdirSync(dir, { recursive: true });
+  ensureIgnored(dir);
+
+  for (const tier of MODEL_TIERS) {
+    const model = tiers[tier];
+    if (!model) continue;
+
+    const readOnly = tier === 'floor' || tier === 'top';
+    const lines = [
+      `# ${MANAGED_MARKER} (profile: ${profile.name})`,
+      // Quoted: descriptions contain colons, and TOML would read an unquoted
+      // string after `description =` only up to the first comma.
+      `description = ${JSON.stringify(TIER_DESCRIPTION[tier])}`,
+      `model = ${JSON.stringify(model)}`,
+      // The read-only rungs get a capability mode that cannot edit; the
+      // workhorse rungs omit it and use the role's full toolset.
+      ...(readOnly ? ['default_capability_mode = "read-only"'] : []),
+      '',
+    ].join('\n');
+
+    writeManaged(path.join(dir, `${tier}.toml`), lines, result);
+  }
+
   return result;
 };
 
@@ -508,6 +562,8 @@ const writeOmpTiers: Writer = (tiers, profile, ctx) => {
 
 const WRITERS: Record<string, Writer> = {
   pi: writePiTiers,
+  claude: writeClaudeTiers,
+  grok: writeGrokTiers,
   omp: writeOmpTiers,
 };
 
