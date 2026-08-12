@@ -1176,7 +1176,8 @@ does not move a conversation between archives.
 Session/tab metadata, composer drafts, per-turn usage and the immutable scope
 reference are kept in the shared per-user `app.sqlite`. Conversation events and
 indexes, Plan documents and question state, terminal transcript and history,
-paste data and attachment bodies are kept under that scope's `.cc-web/`. The
+paste data and attachment bodies, and the workspace archive database
+`session-state.sqlite`, are kept under that scope's `.cc-web/`. The
 server queries the shared database for account-wide tab, conversation and usage
 views, and revalidates an authorised artifact root before using it. See [Where state
 lives](configuration.md#where-state-lives) for the layout, discovery and backup

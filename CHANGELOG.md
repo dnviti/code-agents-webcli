@@ -13,9 +13,10 @@
 - Persistence is split between one shared, per-user `app.sqlite` and each
   project's `.cc-web/` directory. The database owns global configuration,
   authentication, session/tab metadata, composer drafts, usage accounting and
-  immutable project-scope references. Project directories own only the bulk
-  conversation and terminal data: chat logs, transcripts, scrollback, pasted
-  images and attachments. Projects no longer contain `session-state.sqlite`.
+  immutable project-scope references. Each project's `.cc-web/` keeps its own
+  workspace archive, `session-state.sqlite`, next to the bulk conversation and
+  terminal data: chat logs, transcripts, scrollback, pasted images and
+  attachments.
 - This layout has no automatic migration path. A clean installation starts a
   new `app.sqlite` and does not import state from an older storage layout;
   existing files are left untouched. A complete backup or restore therefore
