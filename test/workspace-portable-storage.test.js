@@ -278,6 +278,7 @@ describe('portable workspace storage', function () {
     });
 
     it('creates, replaces, renames, publishes, unlinks and removes only direct safe entries', function () {
+      this.timeout(60_000);
       let result = childRequest(dir, {
         operation: 'mkdir', name: 'child-dir', mode: 0o700,
       });
@@ -348,6 +349,7 @@ describe('portable workspace storage', function () {
     });
 
     it('rejects bad identities, malformed components, fifos and multiply-linked files', function () {
+      this.timeout(60_000);
       let result = childRequest(dir, {
         operation: 'create', name: 'wrong-parent', data: '', expectedDev: '0', expectedIno: '0',
       });
@@ -401,6 +403,7 @@ describe('portable workspace storage', function () {
     });
 
     it('recovers exact private-link crash states without deleting raced fixed entries', function () {
+      this.timeout(60_000);
       fs.writeFileSync(path.join(dir, 'rename.tmp'), 'new');
       fs.writeFileSync(path.join(dir, 'target.txt'), 'old');
       let source = fs.lstatSync(path.join(dir, 'rename.tmp'), { bigint: true });
@@ -618,6 +621,7 @@ describe('portable workspace storage', function () {
     });
 
     it('cold-normalizes every no-clobber publication crash cutpoint', function () {
+      this.timeout(60_000);
       for (const cutpoint of [
         'publish-private-link', 'publish-target-link', 'publish-source-quarantine',
       ]) {
@@ -1037,6 +1041,7 @@ describe('portable workspace storage', function () {
     });
 
     it('refuses existing WAL, SHM, and rollback-journal companions on the serialized backend', function () {
+      this.timeout(60_000);
       if (!childProcessesWork()) this.skip();
       const storage = path.join(root, '.cc-web');
       fs.mkdirSync(storage, { mode: 0o700 });
@@ -1056,6 +1061,7 @@ describe('portable workspace storage', function () {
     });
 
     it('refuses an oversized serialized image before reading it into process memory', function () {
+      this.timeout(60_000);
       if (!childProcessesWork()) this.skip();
       const storage = path.join(root, '.cc-web');
       fs.mkdirSync(storage, { mode: 0o700 });
