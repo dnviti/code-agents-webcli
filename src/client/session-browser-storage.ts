@@ -1,9 +1,10 @@
 /**
  * Retire browser-profile copies of workspace/session data written by old builds.
  *
- * Electron persists Web Storage below userData. New code keeps these values in
- * `.cc-web`; this cleanup runs before the app is constructed so even drafts for
- * conversations that are never reopened are removed from an upgraded profile.
+ * Electron persists Web Storage below userData. New code keeps session/tab and
+ * draft metadata in the server's shared app.sqlite, while bulk project files
+ * live in `.cc-web`; this cleanup runs before the app is constructed so even
+ * drafts for conversations that are never reopened leave the renderer profile.
  */
 export function purgeLegacySessionBrowserState(): void {
   try {

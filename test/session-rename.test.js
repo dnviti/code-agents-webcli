@@ -186,8 +186,8 @@ async function list() {
     assert.deepStrictEqual(mine.sent, [], 'a failed rename is never broadcast as successful');
   });
 
-  it('lists a migration-blocked reason but refuses to rename the read-only record', async function () {
-    const reason = 'The workspace is read-only; migration can be retried later';
+  it('lists an unavailable-storage reason but refuses to rename the read-only record', async function () {
+    const reason = 'The workspace storage is read-only';
     sessions.set('blocked', record('blocked', { persistenceUnavailable: reason }));
     const mine = socket('w1', USER.id);
     sockets.set(mine.id, mine);

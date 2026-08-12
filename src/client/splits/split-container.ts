@@ -477,8 +477,8 @@ export class SplitContainer {
   private saveState(): void {
     try {
       // Divider placement is a device preference. Session assignments, enabled
-      // state and focus are session metadata and belong to workspace storage,
-      // never Electron's Chromium profile.
+      // state and focus are live UI state and are deliberately not persisted in
+      // Electron's Chromium profile.
       const state = { dividerPosition: this.dividerPosition };
       localStorage.setItem('cc-web-splits', JSON.stringify(state));
     } catch (error) {

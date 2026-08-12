@@ -794,6 +794,17 @@ export class AppDatabase {
     // INTEGER is sufficient: positions are compact ordinals, not timestamps.
     this.addColumnIfMissing('runtime_sessions', 'tab_order', 'INTEGER');
 
+    // Runtime/session metadata is installation-global, while transcript,
+    // history, chat and attachment bytes live below the project's `.cc-web`.
+    // Persist the immutable artifact scope beside the global row so a changed
+    // working directory can never silently move an existing conversation.
+    this.addColumnIfMissing('runtime_sessions', 'storage_workspace_root', 'TEXT');
+    this.addColumnIfMissing('runtime_sessions', 'storage_owner_key', 'TEXT');
+
+    // Composer state is small coordination metadata. Its attachment bodies
+    // remain project-local and are addressed only through the immutable scope.
+    this.addColumnIfMissing('runtime_sessions', 'chat_draft_json', 'TEXT');
+
     // A branch rollback keeps this row as durable cleanup authority until all
     // workspace artifacts have been removed and the final row deletion saves.
     this.addColumnIfMissing(

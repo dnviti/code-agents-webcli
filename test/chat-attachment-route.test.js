@@ -16,6 +16,9 @@ const {
   storedAttachmentNameFromUrl,
   resolveAttachmentDirectoryBackend,
 } = require('../dist/server/services/attachment-store.js');
+const {
+  setWorkspaceCwdHelperSpawnerForTests,
+} = require('../dist/server/services/workspace-cwd-helper.js');
 
 // Uploading a file to a chat turn, end to end over the real route.
 //
@@ -29,6 +32,78 @@ const PNG = Buffer.from(
   'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==',
   'base64',
 );
+
+// A deliberately small in-process implementation of the child protocol. It
+// keeps the attachment-store test deterministic in sandboxes that prohibit a
+// nested Node process, while still checking that every helper response carries
+// the identity and metadata the store requires.
+function attachmentHelperSpawner(_executable, _args, options) {
+  const request = JSON.parse(options.input);
+  const entry = (name) => path.join(options.cwd, name);
+  const expected = request.expectedEntryDev === undefined ? null : {
+    dev: BigInt(request.expectedEntryDev), ino: BigInt(request.expectedEntryIno),
+  };
+  const checkedStat = (name) => {
+    const stat = fs.lstatSync(entry(name), { bigint: true });
+    if (expected && (stat.dev !== expected.dev || stat.ino !== expected.ino)) {
+      throw Object.assign(new Error('entry identity changed'), { code: 'UNSAFE_WORKSPACE_STORAGE' });
+    }
+    return stat;
+  };
+  const reply = (name, extra = {}) => {
+    const stat = checkedStat(name);
+    return {
+      error: undefined, status: 0, signal: null,
+      stdout: `${JSON.stringify({
+        ok: true, origin: 'source', dev: String(stat.dev), ino: String(stat.ino),
+        size: String(stat.size), nlink: String(stat.nlink), mode: String(stat.mode),
+        mtimeNs: String(stat.mtimeNs), ctimeNs: String(stat.ctimeNs), birthtimeNs: String(stat.birthtimeNs),
+        ...extra,
+      })}\n`, stderr: '',
+    };
+  };
+  try {
+    switch (request.operation) {
+      case 'inspect-directory': {
+        const stat = checkedStat(request.name);
+        if (stat.isSymbolicLink() || !stat.isDirectory()) throw new Error('not a real directory');
+        return reply(request.name);
+      }
+      case 'ensure-directory': {
+        if (!fs.existsSync(entry(request.name))) {
+          if (!request.createIfMissing) throw Object.assign(new Error('missing directory'), { code: 'ENOENT' });
+          fs.mkdirSync(entry(request.name), { mode: 0o700 });
+        }
+        const stat = checkedStat(request.name);
+        if (stat.isSymbolicLink() || !stat.isDirectory()) throw new Error('not a real directory');
+        if (request.harden) fs.chmodSync(entry(request.name), 0o700);
+        return reply(request.name);
+      }
+      case 'mkdir': fs.mkdirSync(entry(request.name), { mode: 0o700 }); return reply(request.name);
+      case 'create': fs.writeFileSync(entry(request.name), Buffer.from(request.data, 'base64'), { flag: 'wx', mode: request.mode }); return reply(request.name);
+      case 'publish': fs.linkSync(entry(request.name), entry(request.target)); fs.unlinkSync(entry(request.name)); return reply(request.target);
+      case 'unlink': checkedStat(request.name); fs.unlinkSync(entry(request.name)); break;
+      case 'rmdir': checkedStat(request.name); fs.rmdirSync(entry(request.name)); break;
+      case 'list': {
+        const entries = fs.readdirSync(options.cwd).map((name) => {
+          const stat = fs.lstatSync(entry(name), { bigint: true });
+          return {
+            name, dev: String(stat.dev), ino: String(stat.ino), size: String(stat.size),
+            nlink: String(stat.nlink), mode: String(stat.mode),
+            type: stat.isFile() ? 'file' : stat.isDirectory() ? 'directory' : stat.isSymbolicLink() ? 'symlink' : 'special',
+          };
+        });
+        return { error: undefined, status: 0, signal: null, stdout: `${JSON.stringify({ ok: true, origin: 'source', entries: JSON.stringify(entries) })}\n`, stderr: '' };
+      }
+      case 'stat': return reply(request.name);
+      case 'read': return reply(request.name, { data: fs.readFileSync(entry(request.name)).subarray(request.offset, request.offset + request.length).toString('base64') });
+      default: throw new Error(`unexpected attachment helper operation: ${request.operation}`);
+    }
+    return { error: undefined, status: 0, signal: null, stdout: '{"ok":true,"origin":"source"}\n', stderr: '' };
+  } catch (error) {
+    return { error: undefined, status: 1, signal: null, stdout: '', stderr: JSON.stringify({ code: error.code ?? 'EIO' }) };
+  }
+}
 
 describe('chat attachment route', function () {
   let server;
@@ -699,6 +774,16 @@ describe('portable attachment directory backend', function () {
     };
   }
 
+  async function withPlatform(platform, operation) {
+    const descriptor = Object.getOwnPropertyDescriptor(process, 'platform');
+    Object.defineProperty(process, 'platform', { configurable: true, value: platform });
+    try {
+      return await operation();
+    } finally {
+      Object.defineProperty(process, 'platform', descriptor);
+    }
+  }
+
   it('uses proved fdescfs on macOS/BSD and never assumes it on Windows', function () {
     assert.strictEqual(resolveAttachmentDirectoryBackend('auto', 'darwin', true), 'descriptor');
     assert.strictEqual(resolveAttachmentDirectoryBackend('auto', 'freebsd', true), 'descriptor');
@@ -709,6 +794,135 @@ describe('portable attachment directory backend', function () {
       () => resolveAttachmentDirectoryBackend('descriptor', 'win32', true),
       (error) => error && error.code === 'UNSAFE_ATTACHMENT_DIR',
     );
+  });
+
+  it('routes Windows pathname attachment reads, quota, clone and deletion through the cwd helper', async function () {
+    setWorkspaceCwdHelperSpawnerForTests(attachmentHelperSpawner);
+    try {
+      await withPlatform('win32', async () => {
+      const ids = ['aaaaaaaaaaaa', 'bbbbbbbbbbbb', 'cccccccccccc'];
+      const source = portableRef();
+      const target = { ...portableRef(), id: 'portable-clone-target' };
+      const store = new AttachmentStore({
+        maxFiles: 1,
+        quotaBytes: 64,
+        randomId: () => ids.shift(),
+      });
+      const saved = await store.save(source, {
+        filename: 'helper.txt', declaredMime: 'text/plain', bytes: Buffer.from('helper bytes'),
+      });
+
+      const resolved = await store.resolve(source, saved.storedName);
+      assert.strictEqual(resolved.bytes, Buffer.byteLength('helper bytes'));
+      const opened = await store.openForDownload(source, saved.storedName);
+      const chunks = [];
+      for await (const chunk of opened.stream) chunks.push(Buffer.from(chunk));
+      assert.strictEqual(Buffer.concat(chunks).toString('utf8'), 'helper bytes');
+
+      await assert.rejects(
+        () => store.save(source, {
+          filename: 'over-quota.txt', declaredMime: 'text/plain', bytes: Buffer.from('x'),
+        }),
+        (error) => error && error.code === 'QUOTA_EXCEEDED',
+      );
+
+      const clone = await store.cloneForBranch(source, target, {
+        url: `/api/sessions/${source.id}/chat-attachments/${saved.storedName}`,
+        name: saved.name,
+        mime: saved.mime,
+        size: saved.bytes,
+      });
+      const cloned = await store.openForDownload(
+        target,
+        storedAttachmentNameFromUrl(clone.url, target.id),
+      );
+      const clonedChunks = [];
+      for await (const chunk of cloned.stream) clonedChunks.push(Buffer.from(chunk));
+      assert.strictEqual(Buffer.concat(clonedChunks).toString('utf8'), 'helper bytes');
+
+      await store.deleteSessionAttachments(source);
+        assert.strictEqual(fs.existsSync(path.dirname(saved.absolutePath)), false);
+      });
+    } finally {
+      setWorkspaceCwdHelperSpawnerForTests(null);
+    }
+  });
+
+  it('rejects a real-directory attachment swap beneath a spaced Unicode cwd-helper root', async function () {
+    const nestedWorkspace = path.join(workspaceRoot, 'Project space ü');
+    fs.mkdirSync(nestedWorkspace, { mode: 0o755 });
+    const source = {
+      ...portableRef(),
+      workingDir: nestedWorkspace,
+      storageScope: { workspaceRoot: nestedWorkspace, ownerKey: 'portable-owner' },
+    };
+    const workspaceMode = fs.statSync(nestedWorkspace).mode;
+    setWorkspaceCwdHelperSpawnerForTests(attachmentHelperSpawner);
+    try {
+      await withPlatform('win32', async () => {
+        const saved = await new AttachmentStore({ randomId: () => 'abcdef012345' }).save(source, {
+          filename: 'canary.txt', declaredMime: 'text/plain', bytes: Buffer.from('original bytes'),
+        });
+        const namespace = path.dirname(saved.absolutePath);
+        const displaced = `${namespace}-displaced`;
+        const outsideName = path.basename(saved.absolutePath);
+        const outsideFile = path.join(outside, outsideName);
+        fs.writeFileSync(outsideFile, 'outside bytes', { mode: 0o640 });
+        const outsideDirectoryMode = fs.statSync(outside).mode;
+        const outsideFileMode = fs.statSync(outsideFile).mode;
+
+        const racing = new AttachmentStore({
+          testHooks: {
+            afterDirectoryOpened(operation) {
+              if (operation !== 'download') return;
+              fs.renameSync(namespace, displaced);
+              fs.renameSync(outside, namespace);
+            },
+          },
+        });
+        await assert.rejects(
+          () => racing.openForDownload(source, saved.storedName),
+          (error) => error && error.code === 'NOT_FOUND'
+            && error.cause?.code === 'UNSAFE_ATTACHMENT_DIR',
+        );
+
+        const replacement = path.join(namespace, outsideName);
+        assert.strictEqual(fs.readFileSync(replacement, 'utf8'), 'outside bytes');
+        assert.strictEqual(fs.statSync(namespace).mode, outsideDirectoryMode);
+        assert.strictEqual(fs.statSync(replacement).mode, outsideFileMode);
+        assert.strictEqual(fs.readFileSync(path.join(displaced, saved.storedName), 'utf8'), 'original bytes');
+        assert.strictEqual(fs.statSync(nestedWorkspace).mode, workspaceMode);
+      });
+    } finally {
+      setWorkspaceCwdHelperSpawnerForTests(null);
+    }
+  });
+
+  it('uses the cwd helper to scan a Windows legacy transcript before serving a flat attachment', async function () {
+    const source = portableRef();
+    const storedName = 'abcdef012345-legacy.txt';
+    const legacyRoot = path.join(workspaceRoot, '.cc-web', 'attachments');
+    const transcriptRoot = path.join(
+      workspaceRoot, '.cc-web', 'sessions', source.storageScope.ownerKey, source.id,
+    );
+    fs.mkdirSync(legacyRoot, { recursive: true });
+    fs.mkdirSync(transcriptRoot, { recursive: true });
+    fs.writeFileSync(path.join(legacyRoot, storedName), 'legacy helper bytes');
+    fs.writeFileSync(path.join(transcriptRoot, 'chat.jsonl'), JSON.stringify({
+      url: `/api/sessions/${source.id}/chat-attachments/${storedName}`,
+    }));
+
+    setWorkspaceCwdHelperSpawnerForTests(attachmentHelperSpawner);
+    try {
+      await withPlatform('win32', async () => {
+        const opened = await new AttachmentStore().openForDownload(source, storedName);
+        const chunks = [];
+        for await (const chunk of opened.stream) chunks.push(Buffer.from(chunk));
+        assert.strictEqual(Buffer.concat(chunks).toString('utf8'), 'legacy helper bytes');
+      });
+    } finally {
+      setWorkspaceCwdHelperSpawnerForTests(null);
+    }
   });
 
   it('keeps reads available but refuses create/delete through an unproved path backend', async function () {

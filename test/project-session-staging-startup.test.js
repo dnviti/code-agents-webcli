@@ -52,7 +52,14 @@ describe('project session archive startup recovery', function () {
     let first;
     let second;
     let listener;
+    const originalPath = process.env.PATH;
     try {
+      if (process.platform === 'win32') {
+        const gitOpenSsl = 'C:\\Program Files\\Git\\mingw64\\bin';
+        if (await fs.access(path.join(gitOpenSsl, 'openssl.exe')).then(() => true).catch(() => false)) {
+          process.env.PATH = `${gitOpenSsl}${path.delimiter}${originalPath || ''}`;
+        }
+      }
       first = new ClaudeCodeWebServer({
         dataDir,
         baseFolder: root,
@@ -85,8 +92,13 @@ describe('project session archive startup recovery', function () {
         scope,
       );
       first.claudeSessions.set(session.id, session);
-      const bound = first.sessionStore.openWorkspace(scope);
-      assert.strictEqual(await bound.saveSessions(new Map([[session.id, session]])), true);
+      assert.strictEqual(await first.saveSessionsToDisk(), true);
+      assert.strictEqual(
+        await fs.access(path.join(workspaceRoot, '.cc-web', 'session-state.sqlite'))
+          .then(() => true).catch(() => false),
+        false,
+        'project archives contain artifacts, never a SQLite database',
+      );
       const fixtureEvents = (await fs.readFile(
         path.join(__dirname, 'fixtures', 'chat', 'store-events.jsonl'),
         'utf8',
@@ -134,7 +146,7 @@ describe('project session archive startup recovery', function () {
         assert.strictEqual(
           await fs.access(canonicalArchive).then(() => true).catch(() => false),
           true,
-          'the exact archive is restored before session discovery',
+          'the exact artifact archive is restored before shared session metadata is loaded',
         );
         return originalLoad();
       };
@@ -172,6 +184,8 @@ describe('project session archive startup recovery', function () {
       }
       await second?.shutdown().catch(() => undefined);
       await first?.shutdown().catch(() => undefined);
+      if (originalPath === undefined) delete process.env.PATH;
+      else process.env.PATH = originalPath;
       await fs.rm(root, { recursive: true, force: true });
     }
   });

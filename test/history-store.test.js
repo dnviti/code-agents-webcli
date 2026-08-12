@@ -3,6 +3,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { HistoryStore } = require('../dist/server/services/history-store.js');
+const safeSessionFiles = require('../dist/server/services/safe-session-file.js');
 
 const SESSION = { id: 'sess-1', ownerUserId: 7 };
 
@@ -173,6 +174,31 @@ describe('HistoryStore', function () {
       assert.strictEqual(page.lines[batch * 2], `b${batch}-a`);
       assert.strictEqual(page.lines[batch * 2 + 1], `b${batch}-b`);
     }
+  });
+
+  it('keeps a failed append visible to lifecycle flush until a later write succeeds', async function () {
+    const base = path.join(dir, 'history', '7', 'sess-1');
+    const originalAppendFile = safeSessionFiles.appendSessionFile;
+    let injected = false;
+    safeSessionFiles.appendSessionFile = async function (file, ...args) {
+      if (!injected && String(file) === `${base}.log`) {
+        injected = true;
+        throw new Error('injected history append failure');
+      }
+      return originalAppendFile(file, ...args);
+    };
+
+    try {
+      store.append(SESSION, ['lost']);
+      await assert.rejects(() => store.flush(SESSION), /injected history append failure/);
+    } finally {
+      safeSessionFiles.appendSessionFile = originalAppendFile;
+    }
+
+    assert.strictEqual(injected, true);
+    store.append(SESSION, ['kept']);
+    await assert.doesNotReject(() => store.flush(SESSION));
+    assert.deepStrictEqual((await store.read(SESSION, 0, 10)).lines, ['kept']);
   });
 
   it('uses a workspace-local history file and keeps it readable after restart', async function () {

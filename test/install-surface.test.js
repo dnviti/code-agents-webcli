@@ -93,10 +93,10 @@ describe('install surface', function () {
     );
   });
 
-  it('requires a Node new enough for the built-in SQLite', function () {
+  it('requires a Node new enough for built-in SQLite serialization', function () {
     const pkg = JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8'));
-    // node:sqlite is only importable without a flag from 22.13.0.
-    assert.strictEqual(pkg.engines.node, '>=22.13.0');
+    // serialize()/deserialize() arrive in Node 24.16.0.
+    assert.strictEqual(pkg.engines.node, '>=24.16.0');
   });
 
   it('publishes the prebuilt output, so an install never has to build', function () {

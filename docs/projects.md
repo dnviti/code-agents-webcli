@@ -30,7 +30,7 @@ instead of making another container.
 You may create a project with no repository for scratch work. Confirm the
 disposability notice before doing so: there is no upstream source and no place
 to preserve its project workspace. A rebuild, long-idle reclaim, or deletion
-discards ordinary project files. The app preserves its own `.cc-web` session
+discards ordinary project files. The app preserves its own `.cc-web` artifact
 archive across a rebuild or reclaim, and files in your persistent home survive;
 neither is a backup of the scratch project's source files.
 
@@ -54,7 +54,7 @@ data:
 | --- | --- |
 | Your persistent home directory mounted in the project container | Kept. Agent sign-ins, installed user tooling, shell configuration and other files stored there survive. |
 | Project overlay mounted at `/opt/code-agents-project` | Kept for this project only. Project-specific settings and additions survive. Deleting the project removes the overlay. |
-| `.cc-web/` at the canonical project workspace root | Kept across rebuild and reclaim. During the destructive interval, the exact directory is atomically staged in a deterministic sibling outside the container-writable root and then restored to this location. It contains session/tab state, conversation events, terminal history, attachments, paste metadata and usage; deleting the project removes it with the project. |
+| `.cc-web/` at the canonical project workspace root | Kept across rebuild and reclaim. During the destructive interval, the exact directory is atomically staged in a deterministic sibling outside the container-writable root and then restored to this location. It contains project-specific files such as conversation events, terminal history, attachments and paste data; session/tab metadata, drafts and usage remain in the shared per-user `app.sqlite`. Deleting the project removes the artifact tree with the project. |
 | The repository checkout under `/workspace` | Disposable. A rebuild clones it afresh from its repository. |
 | Other paths in the project container outside your persistent home | Disposable. Do not use them as the only copy of important work. |
 
@@ -73,17 +73,18 @@ disposable. Container-local paths are executed and browsed through that
 project's already owner-checked environment; they are never treated as paths on
 the server host or as a way to select another project's container.
 
-Session persistence is always anchored to the canonical project workspace,
-even when a session runs in one of those subfolders or container-only paths.
-Before replacing a checkout, the project manager flushes and closes the open
-session database and verifies `.cc-web` without following symlinks. It atomically
+Project artifact persistence is always anchored to the canonical project
+workspace, even when a session runs in one of those subfolders or container-only
+paths. Before replacing a checkout, the project manager flushes the shared
+session metadata and project artifact stores, then verifies `.cc-web` without
+following symlinks. It atomically
 moves that exact pinned directory to
 `.<project-id>.ccweb-session-storage-retained`, a deterministic sibling outside
 the project root mounted into the container, and synchronises both parent
 directories. It can then remove disposable entries and create a fresh checkout.
 The manager restores and verifies the same directory inode, makes that rename
-durable, and only then reopens the local database. A competing `.cc-web` name is
-never allowed to replace or overwrite the staged archive.
+durable, and only then re-enables project-file access. A competing `.cc-web`
+name is never allowed to replace or overwrite the staged archive.
 
 If a process crashes in this interval, the next startup first reconciles and
 quiesces reachable managed runtimes so no old container can mutate the archive,

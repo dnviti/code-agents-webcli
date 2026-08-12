@@ -65,8 +65,20 @@ function interfaceFamily(entry) {
 
 /** Enumerate addresses currently assigned to non-internal interfaces. */
 function listPhoneAccessInterfaces({ networkInterfaces = os.networkInterfaces } = {}) {
-  const interfaces = typeof networkInterfaces === 'function'
-    ? networkInterfaces() : networkInterfaces;
+  let interfaces;
+  try {
+    interfaces = typeof networkInterfaces === 'function'
+      ? networkInterfaces() : networkInterfaces;
+  } catch (error) {
+    // Node's permission model can withhold this capability in managed desktop
+    // environments.  With no verified local address, LAN sharing must remain
+    // unavailable rather than guessing one or failing app startup.
+    if (error?.code === 'ERR_ACCESS_DENIED'
+      || (error?.code === 'ERR_SYSTEM_ERROR'
+        && error?.syscall === 'uv_interface_addresses'
+        && Number(error?.errno) === 1)) return [];
+    throw error;
+  }
   const result = [];
 
   for (const [name, entries] of Object.entries(interfaces || {})) {

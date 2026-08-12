@@ -1,6 +1,6 @@
 import * as React from 'react';
 import { ChatState } from '../../../shared/chat-events.js';
-import { activityForTurn, type ActivityEvent } from '../../chat/activity.js';
+import type { ActivityEvent } from '../../chat/activity.js';
 import type { ChatTranscript } from '../../chat/transcript.js';
 import type { TurnSummary } from '../../chat/turns.js';
 import { compactCount, formatDuration } from '../../chat/tool-meta.js';
@@ -226,13 +226,17 @@ export function LiveStreamRibbon({
   canInterrupt: boolean;
   onInterrupt(): void;
 }): React.JSX.Element {
-  const events = useActivity(transcript, showThinking, showToolCalls);
+  const activity = useActivity(transcript, showThinking, showToolCalls);
+  const turnMessages = React.useMemo(
+    () => (turn ? new Set(turn.messageIds) : undefined),
+    [turn],
+  );
   const busy = state === 'thinking' || state === 'running' || state === 'starting';
 
   return (
     <StreamRibbon
       state={state}
-      label={ribbonLabel(events, turn, state)}
+      label={ribbonLabel(activity.events, turnMessages, state)}
       // Recomputed on every content bump, which during a turn is every token —
       // so the elapsed figure ticks without a timer of its own.
       elapsedMs={turn && busy ? Date.now() - turn.startedAt : undefined}
@@ -244,15 +248,18 @@ export function LiveStreamRibbon({
 }
 
 /** What the ribbon says the agent is doing, straight from the live timeline. */
-function ribbonLabel(
+export function ribbonLabel(
   events: ActivityEvent[],
-  turn: TurnSummary | undefined,
+  turnMessages: ReadonlySet<string> | undefined,
   state: ChatState,
 ): string | undefined {
   if (state === 'awaiting_permission' || state === 'awaiting_answer') return undefined;
-  const scoped = turn ? activityForTurn(turn, events) : events;
-  for (let i = scoped.length - 1; i >= 0; i -= 1) {
-    const event = scoped[i];
+  // The newest live event is overwhelmingly at the tail. Filtering the whole
+  // conversation here rebuilt a Set and an events array for every answer token
+  // even though the ribbon needs one row; walk backwards and stop at it.
+  for (let i = events.length - 1; i >= 0; i -= 1) {
+    const event = events[i];
+    if (turnMessages && !turnMessages.has(event.messageId)) continue;
     if (event.status !== 'running' && event.status !== 'pending') continue;
     if (event.kind === 'reasoning') return 'Thinking';
     return `Working — ${event.name}${event.target ? ` ${event.target}` : ''}`;

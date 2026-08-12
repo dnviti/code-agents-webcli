@@ -25,9 +25,33 @@ function ipv4String(value) {
 }
 
 /** Directed broadcasts reach LANs that discard the all-hosts broadcast. */
-function broadcastAddresses(interfaces = os.networkInterfaces()) {
+/**
+ * Sandboxed desktop hosts can deny Node's network-interface capability.  LAN
+ * discovery remains useful there: the limited broadcast is still valid, it
+ * just cannot add directed broadcasts for interfaces we cannot inspect.
+ */
+function networkInterfacesOrEmpty(networkInterfaces = os.networkInterfaces) {
+  try {
+    return typeof networkInterfaces === 'function' ? networkInterfaces() : networkInterfaces;
+  } catch (error) {
+    if (isNetworkInterfacesCapabilityDenied(error)) return {};
+    throw error;
+  }
+}
+
+function isNetworkInterfacesCapabilityDenied(error) {
+  return error?.code === 'ERR_ACCESS_DENIED'
+    // Node's managed sandbox currently exposes the same denied capability as
+    // libuv's EPERM-shaped system error rather than ERR_ACCESS_DENIED.
+    || (error?.code === 'ERR_SYSTEM_ERROR'
+      && error?.syscall === 'uv_interface_addresses'
+      && Number(error?.errno) === 1);
+}
+
+function broadcastAddresses(interfaces = os.networkInterfaces) {
+  const snapshot = networkInterfacesOrEmpty(interfaces);
   const addresses = new Set(['255.255.255.255']);
-  for (const entries of Object.values(interfaces || {})) {
+  for (const entries of Object.values(snapshot || {})) {
     for (const entry of entries || []) {
       if (entry.family !== 'IPv4' || entry.internal) continue;
       const address = ipv4Number(entry.address);
@@ -139,5 +163,6 @@ module.exports = {
   findLanServers,
   ipv4Number,
   ipv4String,
+  networkInterfacesOrEmpty,
   scanTimeout,
 };

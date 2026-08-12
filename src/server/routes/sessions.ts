@@ -555,7 +555,7 @@ export function createSessionRoutes(deps: SessionRoutesDeps): Router {
         if (current.some((session) => session.persistenceUnavailable)) {
           res.status(409).json({
             error: 'session_persistence_unavailable',
-            message: 'A tab is read-only until its workspace migration can be retried',
+            message: 'A tab is read-only while its workspace persistence is unavailable',
             retryable: true,
           });
           return;
@@ -1091,6 +1091,15 @@ export function createSessionRoutes(deps: SessionRoutesDeps): Router {
           return;
         }
         if (!owner) session.tabOrder = nextAccountTabOrder(deps.claudeSessions, user.id);
+        // Provision the project-local durability anchor before publishing its
+        // shared SQLite reference. A failed artifact write must not leave a
+        // durable metadata row pointing at an archive that never existed.
+        try {
+          await deps.transcriptStore.ensureTranscript(session);
+        } catch (error) {
+          reportWorkspacePersistenceUnavailable(res, error);
+          return;
+        }
         deps.claudeSessions.set(sessionId, session);
 
         // Keep both the project admission lease and the account tab turn until
@@ -1104,6 +1113,11 @@ export function createSessionRoutes(deps: SessionRoutesDeps): Router {
         }
         if (!saved) {
           deps.claudeSessions.delete(sessionId);
+          try {
+            await deps.transcriptStore.deleteTranscript(session);
+          } catch (error) {
+            console.error(`Failed to clean transcript for uncommitted session ${sessionId}:`, error);
+          }
           res.status(503).json({
             error: 'session_not_saved',
             message: 'The new session could not be saved',
@@ -1111,7 +1125,6 @@ export function createSessionRoutes(deps: SessionRoutesDeps): Router {
           return;
         }
 
-        void deps.transcriptStore.ensureTranscript(session);
         // Every screen this person has open, including the one that asked — which
         // adds the tab from this response and folds the announcement into it. A
         // shell created *inside* a conversation announces nothing; see the helper.
@@ -1668,9 +1681,9 @@ export function createSessionRoutes(deps: SessionRoutesDeps): Router {
       res.status(404).json({ error: 'Session not found' });
       return;
     }
-    // A legacy migration failure outranks recovery. Without a usable workspace
-    // database this process cannot prove that cleanup authority is durable, so
-    // DELETE must not touch a byte even when both markers are present.
+    // Workspace unavailability outranks recovery. Without a usable archive this
+    // process cannot prove that cleanup authority is durable, so DELETE must
+    // not touch a byte even when both markers are present.
     if (session.persistenceUnavailable) {
       rejectUnavailablePersistence(res, session);
       return;
@@ -1867,12 +1880,10 @@ export function createSessionRoutes(deps: SessionRoutesDeps): Router {
         res.status(404).json({ error: 'Session not found' });
         return;
       }
-      // Legacy rows whose destination is unavailable remain visible so the
-      // user can retry migration, but their installation-global files are an
-      // import source, not a live store. History reads can repair/truncate a
-      // torn index, so even export must fail closed until the workspace owns
-      // the data. Recovery anchors are likewise cleanup authority, not an
-      // exportable conversation.
+      // History reads can repair or truncate a torn index, so even export must
+      // fail closed until the workspace archive is available and authoritative.
+      // Recovery anchors are likewise cleanup authority, not an exportable
+      // conversation.
       if (rejectUnavailablePersistence(res, session)) return;
 
       res.setHeader('Content-Type', 'text/markdown; charset=utf-8');
@@ -2597,8 +2608,8 @@ async function summarise(
     session.persistenceUnavailable || session.rollbackRecoveryPending,
   );
   // `stat()` intentionally repairs a derived chat index. That is correct for
-  // a workspace-local archive, but a blocked legacy row must remain byte-for-
-  // byte import-only. `describe()` is a bounded read of the JSONL head and
+  // a healthy workspace archive, but an unavailable row must remain byte-for-
+  // byte unchanged. `describe()` is a bounded read of the JSONL head and
   // does not publish, truncate or append any file, so the diagnostic row can
   // still retain its useful opening line.
   const [stats, description] = await Promise.all([
@@ -2622,7 +2633,7 @@ async function summarise(
     workingDirKind: session.projectId
       ? session.projectWorkingDirKind ?? 'host'
       : 'host',
-    // Keep an unavailable legacy record in the conversation list even when we
+    // Keep an unavailable record in the conversation list even when we
     // deliberately refused the mutating stat/repair path above.
     events: stats?.cursor ?? (session.persistenceUnavailable ? 1 : 0),
     firstMessage: description?.firstMessage ?? null,

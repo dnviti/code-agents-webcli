@@ -179,6 +179,49 @@ function ensureIgnored(dir: string): void {
 }
 
 /**
+ * The first component of `dest` under `anchor` that is a symlink, or null.
+ *
+ * Grok and pi write into directories a repository controls (`.grok/roles/`,
+ * `.pi/agents/`). Every fs call that follows symlinks turns a checked-in link
+ * into a write to an arbitrary path under the server account, so the
+ * destination is walked component by component with `lstat` — which never
+ * follows — before anything is created. A symlink anywhere in the path,
+ * including the final file, rejects the write.
+ */
+function symlinkViolation(anchor: string, dest: string): string | null {
+  const relative = path.relative(anchor, dest);
+  if (!relative || relative.startsWith('..') || path.isAbsolute(relative)) return null;
+  let current = anchor;
+  for (const part of relative.split(/[\\/]+/)) {
+    if (!part) continue;
+    current = path.join(current, part);
+    let stat;
+    try {
+      stat = fs.lstatSync(current);
+    } catch {
+      // The component does not exist yet: nothing to follow, and nothing
+      // below it can exist either.
+      break;
+    }
+    if (stat.isSymbolicLink()) return current;
+  }
+  return null;
+}
+
+/**
+ * Refuse the write-through when `dest` passes through a symlink, explaining
+ * why on `result.failed`. Returns true when the caller must abort.
+ */
+function rejectSymlinkedDestination(anchor: string, dest: string, result: TierWriteResult): boolean {
+  const violation = symlinkViolation(anchor, dest);
+  if (!violation) return false;
+  result.failed =
+    `Not applied: ${violation} is a symlink, and writing through it could ` +
+    'overwrite a file the repository does not own. Remove the symlink and re-apply.';
+  return true;
+}
+
+/**
  * pi's half of the escalation channel, as a pi extension.
  *
  * Every other laddered runtime is handed the tool as an MCP server. pi cannot
@@ -272,6 +315,28 @@ export default function (pi: any) {
 `;
 
 /**
+ * omp's model roles, in the order its own settings surface shows them.
+ *
+ * Each role names a job rather than a size; the rungs are the preference order
+ * the ladder answers with. The first rung with a model wins, so a blank rung
+ * falls back to a neighbour instead of leaving the role empty. `vision` reads
+ * images: if the floor model cannot see them, the multimodal model belongs on
+ * `mid`.
+ */
+const OMP_ROLES: ReadonlyArray<readonly [string, readonly ModelTier[]]> = [
+  ['default', ['mid', 'high']],
+  ['smol', ['floor', 'mid']],
+  ['slow', ['high', 'top']],
+  ['vision', ['floor', 'mid']],
+  ['plan', ['top', 'high']],
+  ['designer', ['mid', 'high']],
+  ['commit', ['floor', 'mid']],
+  ['tiny', ['floor', 'mid']],
+  ['task', ['mid', 'high']],
+  ['advisor', ['top', 'high']],
+];
+
+/**
  * pi.
  *
  * Written into the *session's* `.pi/agents/`, not `~/.pi/agent/agents/`.
@@ -310,12 +375,15 @@ const writePiTiers: Writer = (tiers, profile, ctx) => {
   }
 
   const dir = path.join(ctx.workingDir, '.pi', 'agents');
+  if (rejectSymlinkedDestination(ctx.workingDir, dir, result)) return result;
   fs.mkdirSync(dir, { recursive: true });
   ensureIgnored(dir);
 
   for (const tier of MODEL_TIERS) {
     const model = tiers[tier];
     if (!model) continue;
+    const file = path.join(dir, `${tier}.md`);
+    if (rejectSymlinkedDestination(ctx.workingDir, file, result)) return result;
 
     const tools = TIER_TOOLS[tier];
     const frontmatter = [
@@ -334,8 +402,7 @@ const writePiTiers: Writer = (tiers, profile, ctx) => {
       '',
       ...(tools
         ? [
-            'You are read-only. Use bash for inspection only - searching, reading, ',
-            'and git history. Do not edit, write, install, or commit.',
+            'You are read-only: use bash for inspection only - searching, reading, and git history; never edit, write, install, or commit.',
             '',
           ]
         : []),
@@ -343,7 +410,7 @@ const writePiTiers: Writer = (tiers, profile, ctx) => {
       '',
     ].join('\n');
 
-    writeManaged(path.join(dir, `${tier}.md`), frontmatter, result);
+    writeManaged(file, frontmatter, result);
   }
 
   // And the one thing pi cannot be handed any other way. pi has no MCP support
@@ -352,9 +419,11 @@ const writePiTiers: Writer = (tiers, profile, ctx) => {
   // as an MCP server has to arrive as a pi extension instead. Same socket, same
   // frame, same session on the other end.
   const extensionDir = path.join(ctx.workingDir, '.pi', 'ccweb');
+  if (rejectSymlinkedDestination(ctx.workingDir, extensionDir, result)) return result;
   fs.mkdirSync(extensionDir, { recursive: true });
   ensureIgnored(extensionDir);
   const extension = path.join(extensionDir, 'tier-ladder.ts');
+  if (rejectSymlinkedDestination(ctx.workingDir, extension, result)) return result;
   writeManaged(extension, PI_TIER_EXTENSION, result);
   if (result.written.includes(extension)) {
     // Relative, deliberately: an absolute host path is not the path this file
@@ -363,6 +432,130 @@ const writePiTiers: Writer = (tiers, profile, ctx) => {
     // because pi auto-discovers the latter for a trusted project, and a
     // extension loaded twice registers its tool twice.
     result.args.push('-e', path.join('.pi', 'ccweb', 'tier-ladder.ts'));
+  }
+
+  return result;
+};
+
+/**
+ * Same read-only tiers as TIER_TOOLS, in claude's PascalCase tool names.
+ *
+ * Claude codes its available tools as `Read`, `Grep`, `Glob`, `Bash`, `Write`,
+ * `Edit`, ... The restricted rungs get inspection tools only; the workhorse
+ * rungs omit the list and inherit everything. Bash is deliberately absent from
+ * the read-only rungs: a shell with redirection and `sed`/`rm` is not a
+ * read-only agent, however the prompt words it.
+ */
+const CLAUDE_TIER_TOOLS: Partial<Record<ModelTier, string[]>> = {
+  floor: ['Read', 'Grep', 'Glob'],
+  top: ['Read', 'Grep', 'Glob'],
+};
+
+/**
+ * Claude Code.
+ *
+ * Claude has no per-role ladder either, but it does take session-scoped
+ * subagents on the command line: `--agents` accepts JSON defining agents that
+ * live for that one process. Each rung becomes one agent with the rung's
+ * model, so nothing is written into the user's repository — the whole ladder
+ * arrives as launch arguments, which is also why there is nothing to defer
+ * when no session directory is known.
+ *
+ * Verified against claude 2.1.221: `--agents <json>` is in the CLI reference,
+ * and the JSON accepts the same fields as `.claude/agents/<name>.md`
+ * frontmatter — `description`, `prompt`, `tools`, `model`, `effort` (see
+ * code.claude.com/docs/en/sub-agents).
+ */
+const writeClaudeTiers: Writer = (tiers, _profile, _ctx) => {
+  const result: TierWriteResult = { written: [], replaced: [], args: [] };
+
+  const agents: Record<string, unknown> = {};
+  for (const tier of MODEL_TIERS) {
+    const model = tiers[tier];
+    if (!model) continue;
+
+    const tools = CLAUDE_TIER_TOOLS[tier];
+    const readOnly = tools
+      ? [
+          'You are read-only: inspect with Read, Grep, and Glob, and never edit, write, install, or commit.',
+          '',
+        ]
+      : [];
+    agents[tier] = {
+      description: TIER_DESCRIPTION[tier],
+      prompt: [
+        TIER_DESCRIPTION[tier],
+        '',
+        ...readOnly,
+        'Report what you found or changed, with concrete file:line references.',
+        '',
+      ].join('\n'),
+      ...(tools ? { tools } : {}),
+      model,
+      effort: TIER_EFFORT[tier],
+    };
+  }
+  if (Object.keys(agents).length === 0) return result;
+
+  // One argv element: the spawn passes arguments verbatim, so the JSON needs
+  // no shell quoting, and it stays independent of anything the user's own
+  // ~/.claude settings do elsewhere.
+  result.args.push('--agents', JSON.stringify(agents));
+  return result;
+};
+
+/**
+ * Grok.
+ *
+ * Grok Build expresses per-role models natively: custom roles are declared in
+ * `~/.grok/config.toml` under `[subagents.roles.<name>]` or discovered from
+ * `.grok/roles/*.toml` (project) and `~/.grok/roles/*.toml` (user), one role
+ * per file with the file name as the role name. Each role carries its own
+ * `model` and `default_capability_mode`. Writing into the session's project
+ * `.grok/roles/` follows the same precedence trick as pi: the project copy
+ * lands where the per-session ladder belongs, and the user's home directory
+ * is never touched.
+ *
+ * Verified against grok's own user guide (`16-subagents.md` in the grok-build
+ * tree); the ACP entry point this app drives (`grok agent stdio`) reads the
+ * same configuration, so re-check against the installed build the first time
+ * one is present.
+ */
+const writeGrokTiers: Writer = (tiers, profile, ctx) => {
+  const result: TierWriteResult = { written: [], replaced: [], args: [] };
+
+  if (!ctx.workingDir) {
+    result.deferred =
+      'Applied per session: the rung role files are written into each session’s ' +
+      'working directory when it starts. Nothing in ~/.grok is touched.';
+    return result;
+  }
+
+  const dir = path.join(ctx.workingDir, '.grok', 'roles');
+  if (rejectSymlinkedDestination(ctx.workingDir, dir, result)) return result;
+  fs.mkdirSync(dir, { recursive: true });
+  ensureIgnored(dir);
+
+  for (const tier of MODEL_TIERS) {
+    const model = tiers[tier];
+    if (!model) continue;
+    const file = path.join(dir, `${tier}.toml`);
+    if (rejectSymlinkedDestination(ctx.workingDir, file, result)) return result;
+
+    const readOnly = tier === 'floor' || tier === 'top';
+    const lines = [
+      `# ${MANAGED_MARKER} (profile: ${profile.name})`,
+      // Quoted: TOML requires double-quoted strings for text values (bare
+      // words are not string syntax), and JSON.stringify quotes and escapes.
+      `description = ${JSON.stringify(TIER_DESCRIPTION[tier])}`,
+      `model = ${JSON.stringify(model)}`,
+      // The read-only rungs get a capability mode that cannot edit; the
+      // workhorse rungs omit it and use the role's full toolset.
+      ...(readOnly ? ['default_capability_mode = "read-only"'] : []),
+      '',
+    ].join('\n');
+
+    writeManaged(file, lines, result);
   }
 
   return result;
@@ -379,16 +572,22 @@ const writeOmpTiers: Writer = (tiers, profile, ctx) => {
   const result: TierWriteResult = { written: [], replaced: [], args: [] };
 
   // omp's roles are not a 1:1 match for the four tiers: `smol` is the cheap
-  // helper, `task` runs delegated work, `slow` is the reasoning model. `plan`
-  // and `designer` follow the tiers closest to their job.
-  const roles: [string, string | undefined][] = [
-    ['smol', tiers.floor],
-    ['task', tiers.mid],
-    ['designer', tiers.mid],
-    ['slow', tiers.high ?? tiers.top],
-    ['plan', tiers.top ?? tiers.high],
-    ['default', tiers.mid ?? tiers.high],
-  ];
+  // helper, `task` runs delegated work, `slow` is the reasoning model, and
+  // `plan` and `advisor` ride the top rung. `designer` follows the tiers
+  // closest to its job, and the small utility roles — `vision`, `commit`,
+  // `tiny` — take the cheapest rung that can still do theirs. The table is
+  // shared, so every one of omp's ten roles resolves here in the same order
+  // omp presents them.
+  const roles: Array<[string, string]> = [];
+  for (const [role, rungs] of OMP_ROLES) {
+    for (const tier of rungs) {
+      const model = tiers[tier];
+      if (model) {
+        roles.push([role, model]);
+        break;
+      }
+    }
+  }
 
   const lines = [
     `# ${MANAGED_MARKER} (profile: ${profile.name})`,
@@ -398,7 +597,6 @@ const writeOmpTiers: Writer = (tiers, profile, ctx) => {
   ];
   let any = false;
   for (const [role, model] of roles) {
-    if (!model) continue;
     // Quoted so a model id containing ':' (a thinking-level suffix, say) stays
     // one scalar instead of parsing as a nested mapping.
     lines.push(`  ${role}: ${JSON.stringify(model)}`);
@@ -416,6 +614,8 @@ const writeOmpTiers: Writer = (tiers, profile, ctx) => {
 
 const WRITERS: Record<string, Writer> = {
   pi: writePiTiers,
+  claude: writeClaudeTiers,
+  grok: writeGrokTiers,
   omp: writeOmpTiers,
 };
 

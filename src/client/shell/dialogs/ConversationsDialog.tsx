@@ -607,7 +607,7 @@ export function ConversationRow({
             <Badge variant="success" style={badgeStyle}>running</Badge>
           ) : null}
           {conversation.persistenceUnavailable ? (
-            <Badge variant="destructive" style={badgeStyle}>migration blocked</Badge>
+            <Badge variant="destructive" style={badgeStyle}>storage unavailable</Badge>
           ) : null}
           {conversation.rollbackRecoveryPending ? (
             <Badge variant="destructive" style={badgeStyle}>rollback cleanup pending</Badge>
@@ -652,7 +652,7 @@ function rowDescription(conversation: ConversationSummary, hasTab: boolean): str
   parts.push(conversation.runtimeLabel || conversation.runtime || 'chat');
   parts.push(`last active ${new Date(conversation.lastActivity).toLocaleString()}`);
   if (conversation.running) parts.push('running now');
-  if (conversation.persistenceUnavailable) parts.push('workspace migration blocked');
+  if (conversation.persistenceUnavailable) parts.push('workspace storage unavailable');
   else if (conversation.rollbackRecoveryPending) {
     parts.push('rollback cleanup pending; delete this entry to retry cleanup');
   }

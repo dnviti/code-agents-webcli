@@ -165,7 +165,7 @@ describe('listing every conversation by project', function () {
     assert.deepStrictEqual(flat(got.body), ['dov’è finito lo script di release?']);
   });
 
-  it('keeps a migration-blocked conversation visible with its retry reason', async function () {
+  it('keeps a persistence-unavailable conversation visible with its reason', async function () {
     const reason = 'Workspace archive is unavailable';
     await conversation('blocked', 'conversation still discoverable', {
       persistenceUnavailable: reason,

@@ -49,6 +49,8 @@ export interface TierWriteReport {
   deferred?: string;
   /** Set when the write-through failed outright. */
   failed?: string;
+  /** Launch arguments the tier wiring contributes (e.g. claude's --agents). */
+  args?: string[];
 }
 
 export interface RuntimeProfilesDialogProps {
@@ -598,7 +600,19 @@ function TierReport({ report }: { report: TierWriteReport }): React.JSX.Element 
     );
   }
   const replaced = report.replaced ?? [];
-  if (!report.written.length && !replaced.length) return null;
+  if (!report.written.length && !replaced.length) {
+    // claude's ladder travels as launch arguments rather than files, so there
+    // is nothing to list — but a ladder that went somewhere should say so,
+    // exactly like the writers that do land files.
+    if (report.args?.length) {
+      return (
+        <div style={{ ...noteStyle, marginTop: 8 }}>
+          Applied on launch: the rung agents ride on the command line.
+        </div>
+      );
+    }
+    return null;
+  }
 
   return (
     <div style={{ ...noteStyle, marginTop: 8 }}>

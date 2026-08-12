@@ -349,8 +349,7 @@ That makes codex figures a different kind of number, and the app says so:
   estimate, marked as such. A later price change never rewrites an estimate
   already recorded — live or backfilled.
 - **Removal follows the record.** The estimate is a column on the job row, so
-  the existing data lifecycle that removes or migrates a job removes its
-  estimate with it.
+  deleting a job removes its estimate with it.
 
 The refresh makes a single request to the public pricing endpoint and sends no
 conversation, usage, account, model-selection or user data.
@@ -1102,20 +1101,22 @@ sampled.
 
 ## Where the data lives
 
-Three owner-scoped tables live beside the session in
-`<workspace>/.cc-web/session-state.sqlite`: `usage_jobs`, one row per job;
-`usage_job_models`, its per-model breakdown; and `usage_job_tools`, its per-tool
-call counts. No new usage row is written to the installation's global
-`app.sqlite`. The server opens only authorised workspace databases and combines
-them for the account-wide dashboard, facets, history, export, burn rate and
-conversation totals. See [Where state lives](configuration.md#where-state-lives)
-for discovery, migration and backup requirements.
+Three owner-scoped tables live in the shared per-user `app.sqlite`:
+`usage_jobs`, one row per job; `usage_job_models`, its per-model breakdown; and
+`usage_job_tools`, its per-tool call counts. The dashboard, facets, history,
+export, burn rate and conversation totals all query that one global store and
+apply the normal account and installer visibility rules. Project `.cc-web`
+trees contain no usage database.
+
+There is no automatic import from an older storage layout. A fresh installation
+starts a new database and leaves old files untouched. See
+[Where state lives](configuration.md#where-state-lives) for the complete backup
+requirements.
 
 Jobs have no retention window and no automatic age pruning. A record outlives
-the runtime process and can outlive the conversation record it was filed under;
-deleting that conversation does not erase its accounting history. It remains,
-however, part of the workspace archive: deleting the managed project or removing
-that `.cc-web` archive removes its usage too. Recording a job is idempotent (it
-is keyed on `<sessionId>:<turnId>` and replaces rather than duplicates), so
+the runtime process, the conversation record it was filed under and the
+project's `.cc-web` archive; deleting those project-specific files does not
+erase global accounting history. Recording a job is idempotent (it is keyed on
+`<sessionId>:<turnId>` and replaces rather than duplicates), so
 recovering from a crash between the write and the acknowledgement never doubles
 anybody's bill.

@@ -13,6 +13,11 @@ import {
   replaceSessionFile,
   unlinkSessionEntry,
 } from './safe-session-file.js';
+import { workspaceSessionFileParentLease } from './workspace-session-storage.js';
+import {
+  createTemporaryWorkspaceCwdFile,
+  removeWorkspaceCwdEntry,
+} from './workspace-cwd-helper.js';
 
 /**
  * Stores images pasted from the browser and hands back the path to type into
@@ -318,7 +323,9 @@ export class PasteStore implements PasteStoreLike {
     if (Buffer.byteLength(serialized, 'utf8') > MAX_PASTE_MANIFEST_BYTES) {
       throw this.invalidManifest(file, `exceeds ${MAX_PASTE_MANIFEST_BYTES} bytes`);
     }
-    await fs.promises.mkdir(path.dirname(file), { recursive: true });
+    if (!workspaceSessionFileParentLease(file)) {
+      await fs.promises.mkdir(path.dirname(file), { recursive: true });
+    }
     await replaceSessionFile(file, serialized, 'utf8');
   }
 
@@ -520,25 +527,31 @@ export class PasteStore implements PasteStoreLike {
       // wx never follows a symlink at the final component and never clobbers,
       // which closes the window the lstat checks above only narrow.
       let wroteFile = false;
+      let helperIdentity: { dev?: bigint; ino?: bigint } | null = null;
       try {
         pasteLease.verify();
-        const handle = await fs.promises.open(
-          writePath,
-          fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | NO_FOLLOW,
-          0o600,
-        );
-        wroteFile = true;
-        try {
-          const stat = await handle.stat();
-          if (!stat.isFile() || stat.nlink !== 1) {
-            throw Object.assign(new Error('Refusing an unsafe pasted image entry'), {
-              code: 'UNSAFE_PASTE_DIR',
-            });
+        if (pasteLease.entryMutationPolicy === 'cwd-helper') {
+          helperIdentity = createTemporaryWorkspaceCwdFile(pasteLease, name, bytes);
+          wroteFile = true;
+        } else {
+          const handle = await fs.promises.open(
+            writePath,
+            fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | NO_FOLLOW,
+            0o600,
+          );
+          wroteFile = true;
+          try {
+            const stat = await handle.stat();
+            if (!stat.isFile() || stat.nlink !== 1) {
+              throw Object.assign(new Error('Refusing an unsafe pasted image entry'), {
+                code: 'UNSAFE_PASTE_DIR',
+              });
+            }
+            await handle.chmod(0o600);
+            await handle.writeFile(bytes);
+          } finally {
+            await handle.close().catch(() => undefined);
           }
-          await handle.chmod(0o600);
-          await handle.writeFile(bytes);
-        } finally {
-          await handle.close().catch(() => undefined);
         }
         pasteLease.verify();
 
@@ -551,7 +564,17 @@ export class PasteStore implements PasteStoreLike {
         // retire. Unlink the unpredictable file we just created and surface a
         // retryable failure instead.
         if (wroteFile) {
-          await fs.promises.unlink(writePath).catch(() => undefined);
+          if (pasteLease.entryMutationPolicy === 'cwd-helper') {
+            try {
+              if (helperIdentity?.dev !== undefined && helperIdentity.ino !== undefined) {
+                removeWorkspaceCwdEntry(
+                  pasteLease, name, { dev: helperIdentity.dev, ino: helperIdentity.ino },
+                );
+              }
+            } catch { /* cleanup */ }
+          } else {
+            await fs.promises.unlink(writePath).catch(() => undefined);
+          }
         }
         throw error;
       } finally {
@@ -648,11 +671,17 @@ export class PasteStore implements PasteStoreLike {
           if (!lease) throw new Error('Paste cleanup root lease is unavailable');
           const entryPath = path.join(lease.accessPath, path.basename(candidate));
           lease.verify();
-          const state = await fs.promises.lstat(entryPath).catch(() => null);
+          const state = await fs.promises.lstat(entryPath, { bigint: true }).catch(() => null);
           if (!state || state.isSymbolicLink() || !state.isFile()) continue;
-          await fs.promises.unlink(entryPath).catch((error: NodeJS.ErrnoException) => {
-            if (error.code !== 'ENOENT') throw error;
-          });
+          if (lease.entryMutationPolicy === 'cwd-helper') {
+            removeWorkspaceCwdEntry(
+              lease, path.basename(candidate), { dev: state.dev, ino: state.ino },
+            );
+          } else {
+            await fs.promises.unlink(entryPath).catch((error: NodeJS.ErrnoException) => {
+              if (error.code !== 'ENOENT') throw error;
+            });
+          }
           lease.verify();
         }
 

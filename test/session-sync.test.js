@@ -40,6 +40,8 @@ let finalTeardown;
 let saves;
 let saveSessions;
 let loadWorkspaceSessions;
+let ensureTranscript;
+let deleteTranscript;
 let tabAcquireRequests;
 
 async function waitUntil(check, message, timeoutMs = 1000) {
@@ -136,8 +138,8 @@ describe('telling every screen what happened to a session', function () {
         getRuntimeBridge: () => null,
         saveSessionsToDisk: () => saveSessions(),
         transcriptStore: {
-          ensureTranscript: async () => {},
-          deleteTranscript: async () => {},
+          ensureTranscript: (session) => ensureTranscript(session),
+          deleteTranscript: (session) => deleteTranscript(session),
         },
         historyStore: { deleteHistory: async () => {} },
         getScreenSnapshot: () => [],
@@ -176,6 +178,8 @@ describe('telling every screen what happened to a session', function () {
     tabAcquireRequests = 0;
     saveSessions = async () => { saves++; };
     loadWorkspaceSessions = async () => {};
+    ensureTranscript = async () => {};
+    deleteTranscript = async () => {};
     currentUser = USER;
   });
 
@@ -231,6 +235,28 @@ describe('telling every screen what happened to a session', function () {
       message: 'workspace root is already assigned to another account',
       retryable: true,
     });
+    assert.strictEqual(sessions.size, 0);
+    assert.strictEqual(saves, 0);
+  });
+
+  it('does not publish shared metadata when the project transcript cannot be provisioned', async function () {
+    const order = [];
+    ensureTranscript = async () => {
+      order.push('artifact');
+      throw new Error('injected transcript provisioning failure');
+    };
+    saveSessions = async () => {
+      order.push('sqlite');
+      saves++;
+      return true;
+    };
+
+    const result = await create({ workingDir: '/projects/alpha' });
+
+    assert.strictEqual(result.status, 409);
+    assert.strictEqual(result.body.error, 'workspace_persistence_unavailable');
+    assert.match(result.body.message, /transcript provisioning failure/);
+    assert.deepStrictEqual(order, ['artifact']);
     assert.strictEqual(sessions.size, 0);
     assert.strictEqual(saves, 0);
   });
@@ -348,7 +374,7 @@ describe('telling every screen what happened to a session', function () {
     assert.deepStrictEqual((await list()).body.sessions.map((entry) => entry.id), ['chat']);
   });
 
-  it('refuses tab, order and delete mutations while workspace migration is blocked', async function () {
+  it('refuses tab, order and delete mutations while workspace persistence is unavailable', async function () {
     const reason = 'Workspace archive cannot currently be opened';
     const blocked = record('blocked', {
       surface: 'chat',
@@ -825,6 +851,24 @@ describe('announcing a session over the socket that made it', function () {
       message: 'Workspace persistence is unavailable: workspace root is already assigned to another account',
     }]);
     assert.strictEqual(claudeSessions.size, 0);
+  });
+
+  it('removes a provisional transcript when shared metadata persistence fails', async function () {
+    const asking = socket('w1', USER.id);
+    const { processor, claudeSessions } = processorWith([asking], []);
+    const order = [];
+    processor.deps.transcriptStore.ensureTranscript = async () => { order.push('artifact'); };
+    processor.deps.saveSessionsToDisk = async () => { order.push('sqlite'); return false; };
+    processor.deps.transcriptStore.deleteTranscript = async () => { order.push('cleanup'); };
+
+    await processor.createAndJoinSession('w1', 'not durable', '/projects/alpha');
+
+    assert.deepStrictEqual(order, ['artifact', 'sqlite', 'cleanup']);
+    assert.strictEqual(claudeSessions.size, 0);
+    assert.deepStrictEqual(asking.sent, [{
+      type: 'error',
+      message: 'The new session could not be saved',
+    }]);
   });
 
   it('tells the other screens about a session created on this one', async function () {

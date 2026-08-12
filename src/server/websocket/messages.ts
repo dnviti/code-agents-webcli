@@ -189,10 +189,10 @@ export interface MessageProcessorDeps {
     name?: string;
     workingDir: string;
     connections?: string[];
-    /** Canonical server-validated folder used for workspace-local persistence. */
+    /** Canonical server-validated folder used for project-artifact persistence. */
     storageRoot?: string;
   }): SessionRecord;
-  /** Load a trusted folder archive before the first save may prune it. */
+  /** Authorise a trusted artifact root before the first project-file access. */
   loadWorkspaceSessions?(ownerUserId: number, storageRoot: string): Promise<void>;
   /** Shared with HTTP tab routes so creation cannot cross a tentative close/reorder. */
   tabCoordinator?: AccountTabCoordinatorLike;
@@ -983,6 +983,17 @@ export class MessageProcessor {
         return;
       }
 
+      try {
+        await this.deps.transcriptStore.ensureTranscript(session);
+      } catch (error) {
+        sendToWebSocket(wsInfo.ws, {
+          type: 'error',
+          message: `Workspace persistence is unavailable: ${
+            error instanceof Error ? error.message : 'unknown storage error'
+          }`,
+        });
+        return;
+      }
       this.deps.claudeSessions.set(sessionId, session);
       let saved = false;
       try {
@@ -992,6 +1003,11 @@ export class MessageProcessor {
       }
       if (!saved) {
         this.deps.claudeSessions.delete(sessionId);
+        try {
+          await this.deps.transcriptStore.deleteTranscript(session);
+        } catch (error) {
+          console.error(`Failed to clean transcript for uncommitted session ${sessionId}:`, error);
+        }
         sendToWebSocket(wsInfo.ws, {
           type: 'error',
           message: 'The new session could not be saved',
@@ -999,7 +1015,6 @@ export class MessageProcessor {
         return;
       }
 
-      void this.deps.transcriptStore.ensureTranscript(session);
       // Persistence itself can be deferred. Recheck once more before attaching:
       // a newer join that won while SQLite was pending must stay the destination.
       const intentStillCurrent =
@@ -1375,7 +1390,7 @@ export class MessageProcessor {
     if (session.persistenceUnavailable) {
       sendToWebSocket(wsInfo.ws, {
         type: 'error',
-        message: `This session is read-only until workspace migration succeeds: ${session.persistenceUnavailable}`,
+        message: `This session is read-only while workspace persistence is unavailable: ${session.persistenceUnavailable}`,
       });
       return;
     }
@@ -2372,7 +2387,7 @@ export class MessageProcessor {
     if (session.persistenceUnavailable) {
       sendToWebSocket(wsInfo.ws, {
         type: 'error',
-        message: `This conversation is read-only until workspace migration succeeds: ${session.persistenceUnavailable}`,
+        message: `This conversation is read-only while workspace persistence is unavailable: ${session.persistenceUnavailable}`,
       });
       return;
     }
@@ -3015,8 +3030,8 @@ export class MessageProcessor {
         // What is in the composer, so a screen that has just opened this
         // conversation opens it at the sentence the other screen is in the
         // middle of. Null means nothing has been typed since the server came
-        // up. Composer contents are persisted in the workspace record; the
-        // browser deliberately keeps no fallback in Electron userData.
+        // up. Composer contents are persisted in shared app SQLite; the browser
+        // deliberately keeps no fallback in Electron userData.
         draft: draftOf(session),
       });
       return true;
@@ -3054,10 +3069,10 @@ export class MessageProcessor {
   }
 
   /**
-   * Refuse every file-backed read while a row is only legacy import authority.
+   * Refuse every file-backed read while workspace persistence is unavailable.
    * Chat/history readers normally repair torn derived indexes; permitting that
    * on `persistenceUnavailable` would make a list, join or page request write
-   * into the installation-global source which migration promised to preserve.
+   * through a storage gate whose archive authority has not been established.
    */
   private rejectUnavailableRead(
     wsInfo: WebSocketInfo,
@@ -3081,8 +3096,8 @@ export class MessageProcessor {
   }
 
   /**
-   * Resolve one state-changing chat request and fail closed for a legacy row
-   * whose workspace archive has not completed migration.
+   * Resolve one state-changing chat request and fail closed while its workspace
+   * archive is unavailable or not authoritative.
    */
   private mutableChatSessionFor(
     wsInfo: WebSocketInfo,

@@ -1046,16 +1046,34 @@ can still do this step**:
 | `high` | Tricky debugging, security-sensitive logic, review |
 | `top` | Hard design and critical review |
 
-Only runtimes that can delegate to sub-agents have somewhere to put these:
+Only runtimes that can delegate to sub-agents have somewhere to put these, and
+each of them expresses the ladder in its own shape:
 
-- **pi** — one agent file per tier in the session's `.pi/agents/`, with a
-  matching reasoning effort. Written when the session starts, not on save,
-  because that is when the directory is known.
-- **Oh My Pi** — a `modelRoles` overlay in the app's data directory, passed with
-  `--config` so your own `~/.omp/agent/config.yml` is left alone.
+| Agent | How the four rungs land | Roles covered |
+| --- | --- | --- |
+| **pi** | One agent file per rung in the session's `.pi/agents/`, with a matching reasoning effort | Delegated subagents named after the rungs |
+| **Oh My Pi** | A `modelRoles` overlay in the app's data directory, passed with `--config` so your own `~/.omp/agent/config.yml` is left alone | All ten of omp's model roles (table below) |
+| **Claude Code** | Session-scoped subagents defined in the launch arguments (`--agents` JSON) | One agent per rung; nothing is written into the project |
+| **Grok** | Project-local role files in the session's `.grok/roles/`, one per rung (`[subagents.roles]` shape: `model`, plus a read-only capability mode for the read-only rungs) | Four rung roles |
+| **Codex** | No stable per-role mechanism yet — the agent-role system exists on codex's main branch but has not shipped in a release, so a ladder would land nowhere | None; the conversation model is chosen by the ordinary model plumbing |
+| **Kimi / Qwen** | Subagents exist, but with no documented per-role model configuration | None; conversation model only |
 
-Every other runtime says so in the UI rather than accepting values that would go
-nowhere.
+A runtime with nowhere to put the ladder says so in the UI rather than
+accepting values that would go nowhere.
+
+Oh My Pi's ten model roles each map onto the rung that fits their job, falling
+back to a neighbouring rung when the preferred one is blank:
+
+| Role | Rung |
+| --- | --- |
+| `tiny`, `smol`, `vision`, `commit` | `floor`, else `mid` |
+| `default`, `task`, `designer` | `mid`, else `high` |
+| `slow` | `high`, else `top` |
+| `plan`, `advisor` | `top`, else `high` |
+
+`vision` reads images, so if the model on `floor` cannot see them, put a
+multimodal model on `mid` and leave `floor` blank — the roles sharing the rung
+then fall back to it.
 
 For pi, the *location* is worth spelling out. The obvious place to write —
 `~/.pi/agent/agents/` — is exactly where a hand-written ladder lives, and there
@@ -1155,12 +1173,14 @@ workspace even when it runs in a subfolder or a container-only path; a child
 shell inherits its owning conversation's scope. Changing cwd later therefore
 does not move a conversation between archives.
 
-Session/tab state, conversation events and indexes, Plan and question state,
-terminal transcript and history, paste metadata, and per-turn usage are kept
-under that scope's `.cc-web/`. The server combines authorised workspace
-databases for account-wide tab, conversation and usage views, and lazy-loads an
-authorised folder when it is opened. See [Where state
-lives](configuration.md#where-state-lives) for the layout, migration and backup
+Session/tab metadata, composer drafts, per-turn usage and the immutable scope
+reference are kept in the shared per-user `app.sqlite`. Conversation events and
+indexes, Plan documents and question state, terminal transcript and history,
+paste data and attachment bodies, and the workspace archive database
+`session-state.sqlite`, are kept under that scope's `.cc-web/`. The
+server queries the shared database for account-wide tab, conversation and usage
+views, and revalidates an authorised artifact root before using it. See [Where state
+lives](configuration.md#where-state-lives) for the layout, discovery and backup
 requirements.
 
 The file browser is bounded by the working directory chosen during

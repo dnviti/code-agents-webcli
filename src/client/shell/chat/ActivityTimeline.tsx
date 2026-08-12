@@ -31,6 +31,8 @@ import { ToolCallCard } from './ToolCallCard.js';
 
 export interface ActivityTimelineProps {
   events: ActivityEvent[];
+  /** Invalidates filtered/windowed views when the stable event array is spliced. */
+  revision?: number;
   filter: ActivityFilterId;
   onFilter(next: ActivityFilterId): void;
   /** Take me to the message this event came from. */
@@ -50,6 +52,7 @@ export interface ActivityTimelineProps {
 
 export function ActivityTimeline({
   events,
+  revision = 0,
   filter,
   onFilter,
   onReveal,
@@ -63,7 +66,10 @@ export function ActivityTimeline({
   const rows = React.useRef(new Map<string, HTMLDivElement>());
   const isPhone = usePhone();
 
-  const filtered = React.useMemo(() => filterActivity(events, filter), [events, filter]);
+  const filtered = React.useMemo(
+    () => filterActivity(events, filter),
+    [events, filter, revision],
+  );
 
   // How far back the rail draws. A long session projects well over a thousand
   // events, and every one of them is a row of a dozen elements: rendering the
@@ -75,7 +81,7 @@ export function ActivityTimeline({
   const hidden = Math.max(0, filtered.length - window);
   const visible = React.useMemo(
     () => (hidden > 0 ? filtered.slice(hidden) : filtered),
-    [filtered, hidden],
+    [filtered, hidden, revision],
   );
 
   // Stable, so a row's props do not change identity on every parent render —
@@ -285,9 +291,9 @@ function FilterChip({
  *
  * The rail redraws on every token of a streaming turn — that is the point of it
  * — so a row that re-renders when nothing about it changed is a row rendered a
- * thousand times for one command. The projection hands back a fresh event
- * object per derivation, so the comparator is explicit: a row is unchanged when
- * the fields it actually paints are unchanged.
+ * thousand times for one command. The projection preserves untouched event
+ * objects and replaces a changed one; the comparator remains explicit because
+ * each event still holds a live block that the reducer mutates in place.
  */
 const ActivityRow = React.memo(function ActivityRow({
   event,

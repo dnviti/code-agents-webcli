@@ -11,7 +11,6 @@ const {
   DATA_DIR_LEASE_LOST_EXIT_CODE,
   DataDirLease,
 } = require('../dist/server/services/data-dir-lease.js');
-const { SessionStore } = require('../dist/server/services/session-store.js');
 
 const CHILD = path.join(__dirname, 'fixtures', 'data-dir-lease-child.js');
 
@@ -72,75 +71,29 @@ function mode(target) {
   return fs.statSync(target).mode & 0o777;
 }
 
-function sessionRecord(id, ownerUserId, workingDir) {
-  const created = new Date('2026-08-05T10:00:00.000Z');
-  return {
-    id,
-    ownerUserId,
-    name: 'Legacy lease fixture',
-    created,
-    lastActivity: created,
-    active: false,
-    agent: null,
-    lastAgent: null,
-    runtimeLabel: null,
-    terminalOptions: null,
-    stopRequested: false,
-    workingDir,
-    connections: new Set(),
-    outputBuffer: [],
-    sessionStartTime: null,
-    sessionUsage: {
-      requests: 0,
-      inputTokens: 0,
-      outputTokens: 0,
-      cacheTokens: 0,
-      totalCost: 0,
-      models: {},
-    },
-    maxBufferSize: 1_000,
-  };
-}
-
 describe('installation data-directory lease', function () {
   this.timeout(20_000);
 
-  it('blocks a real second server before constructor migration or a later EADDRINUSE', async function () {
+  it('blocks a real second server before database construction or a later EADDRINUSE', async function () {
     const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'cc-web-data-lease-'));
     const dataDir = path.join(root, 'data');
-    const workspace = path.join(root, 'workspace');
-    await Promise.all([
-      fs.promises.mkdir(dataDir),
-      fs.promises.mkdir(workspace),
-    ]);
+    const fixtureDatabase = new AppDatabase({ dataDir });
+    fixtureDatabase.setSetting('lease.fixture', 'unchanged');
+    fixtureDatabase.close();
 
-    const legacy = new SessionStore({ dataDir });
-    const owner = legacy.database.upsertGitHubUser({
-      githubId: 'lease-owner-stable',
-      githubLogin: 'lease-owner',
-      githubName: null,
-      email: null,
-    });
-    const sessionId = 'legacy-held-open';
-    await legacy.saveSessions(new Map([
-      [sessionId, sessionRecord(sessionId, owner.id, workspace)],
-    ]));
-    legacy.database.close();
-
-    const source = path.join(dataDir, String(owner.id), `${sessionId}.jsonl`);
-    await fs.promises.mkdir(path.dirname(source), { recursive: true });
-    await fs.promises.writeFile(source, '{"legacy":true}\n', { mode: 0o600 });
+    const databasePath = path.join(dataDir, 'app.sqlite');
+    const source = path.join(dataDir, 'held-open.fixture');
+    await fs.promises.writeFile(source, 'held\n', { mode: 0o600 });
     const holder = spawnChild(['hold', dataDir, source]);
     let contender = null;
     try {
       const ready = await waitForMessage(holder, (message) => message?.type === 'ready');
       const before = await fs.promises.lstat(source);
       const beforeBytes = await fs.promises.readFile(source);
-      assert.strictEqual(fs.existsSync(path.join(workspace, '.cc-web')), false);
+      const beforeDatabase = await fs.promises.readFile(databasePath);
 
       // The holder owns this port too. Without the lease, the contender would
-      // get as far as listen() and fail with EADDRINUSE after touching legacy
-      // session state.
+      // get as far as constructing AppDatabase and then fail with EADDRINUSE.
       contender = spawnChild([
         'start-server',
         dataDir,
@@ -161,16 +114,23 @@ describe('installation data-directory lease', function () {
       assert.strictEqual(after.size, before.size);
       assert.strictEqual(after.mtimeMs, before.mtimeMs);
       assert.deepStrictEqual(await fs.promises.readFile(source), beforeBytes);
-      assert.strictEqual(
-        fs.existsSync(path.join(workspace, '.cc-web')),
-        false,
-        'the rejected process must not create or partially migrate a target archive',
+      assert.deepStrictEqual(
+        await fs.promises.readFile(databasePath),
+        beforeDatabase,
+        'the rejected process must not open or update app.sqlite',
       );
-
       holder.send('release');
       const released = await waitForMessage(holder, (message) => message?.type === 'released');
       assert.strictEqual(released.released, true);
       assert.strictEqual((await waitForExit(holder)).code, 0);
+
+      const verifiedDatabase = new AppDatabase({ dataDir });
+      try {
+        assert.strictEqual(verifiedDatabase.getSetting('lease.fixture'), 'unchanged');
+        assert.deepStrictEqual(verifiedDatabase.listUsers(), []);
+      } finally {
+        verifiedDatabase.close();
+      }
     } finally {
       if (contender && contender.exitCode === null && contender.signalCode === null) {
         contender.kill('SIGKILL');
