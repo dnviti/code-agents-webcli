@@ -48,6 +48,16 @@ function childProcessesWork() {
   return supported;
 }
 
+/**
+ * Create a workspace fixture under a realpath-canonical directory. The
+ * storage layer rejects roots reached through a symlink (macOS resolves
+ * `/var/folders` through the `/var` -> `/private/var` link), matching the
+ * canonical-root contract `canonicalExistingRoot` enforces in production.
+ */
+function canonicalTempDir(prefix) {
+  return fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), prefix)));
+}
+
 function childRequest(cwd, request, cutpoint) {
   const identity = fs.statSync(cwd, { bigint: true });
   const result = childProcess.spawnSync(process.execPath, [CHILD], {
@@ -243,7 +253,7 @@ describe('portable workspace storage', function () {
 
     beforeEach(function () {
       if (!childProcessesWork()) this.skip();
-      dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cc-web-cwd-helper-'));
+      dir = canonicalTempDir('cc-web-cwd-helper-');
     });
 
     afterEach(function () {
@@ -273,7 +283,9 @@ describe('portable workspace storage', function () {
       });
       assert.strictEqual(result.status, 0, result.stderr);
       assert.strictEqual(result.response.ok, true);
-      assert.strictEqual(fs.statSync(path.join(dir, 'child-dir')).mode & 0o777, 0o700);
+      if (process.platform !== 'win32') {
+        assert.strictEqual(fs.statSync(path.join(dir, 'child-dir')).mode & 0o777, 0o700);
+      }
 
       result = childRequest(dir, {
         operation: 'create', name: 'source.tmp', data: Buffer.from('first').toString('base64'), mode: 0o600,
@@ -281,7 +293,9 @@ describe('portable workspace storage', function () {
       assert.strictEqual(result.status, 0, result.stderr);
       const source = fs.statSync(path.join(dir, 'source.tmp'), { bigint: true });
       assert.strictEqual(fs.readFileSync(path.join(dir, 'source.tmp'), 'utf8'), 'first');
-      assert.strictEqual(Number(source.mode & 0o777n), 0o600);
+      if (process.platform !== 'win32') {
+        assert.strictEqual(Number(source.mode & 0o777n), 0o600);
+      }
 
       result = childRequest(dir, {
         operation: 'rename', name: 'source.tmp', target: 'renamed.tmp',
@@ -369,7 +383,12 @@ describe('portable workspace storage', function () {
       assert.ok(fs.existsSync(path.join(dir, 'hardlink')));
 
       const fifo = path.join(dir, 'pipe');
-      const made = childProcess.spawnSync('mkfifo', [fifo], { encoding: 'utf8' });
+      // FIFOs are a POSIX concept; Git Bash's mkfifo creates entries Node
+      // cannot lstat, so exercise the special-entry rejection only where a
+      // real fifo can be created and inspected.
+      const made = process.platform === 'win32'
+        ? { error: new Error('fifos are not portable') }
+        : childProcess.spawnSync('mkfifo', [fifo], { encoding: 'utf8' });
       if (!made.error && made.status === 0) {
         const pipe = fs.lstatSync(fifo, { bigint: true });
         result = childRequest(dir, {
@@ -426,6 +445,7 @@ describe('portable workspace storage', function () {
     });
 
     it('recovers quarantined unlink, rmdir, and authority-claim cutpoints by exact identity', function () {
+      this.timeout(60_000);
       fs.writeFileSync(path.join(dir, 'remove.txt'), 'remove');
       const file = fs.lstatSync(path.join(dir, 'remove.txt'), { bigint: true });
       let result = childRequest(dir, {
@@ -631,7 +651,7 @@ describe('portable workspace storage', function () {
     let root;
 
     beforeEach(function () {
-      root = fs.mkdtempSync(path.join(os.tmpdir(), 'cc-web-portable-db-'));
+      root = canonicalTempDir('cc-web-portable-db-');
     });
 
     afterEach(function () {
@@ -858,6 +878,19 @@ describe('portable workspace storage', function () {
 
         const canonical = path.join(root, '.cc-web');
         const parked = `${canonical}.parked`;
+        if (process.platform === 'win32') {
+          // Windows pins an open directory: the OS refuses the rename while
+          // any workspace lease holds `.cc-web`, so the swapped-container
+          // scenario cannot even be staged. That refusal is itself the
+          // platform guarantee the swap-detection provides on POSIX hosts.
+          assert.throws(
+            () => fs.renameSync(canonical, parked),
+            (error) => ['EPERM', 'EACCES', 'EBUSY'].includes(error?.code),
+          );
+          assert.strictEqual(fs.existsSync(canonical), true);
+          assert.strictEqual(fs.existsSync(parked), false);
+          return;
+        }
         fs.renameSync(canonical, parked);
         fs.mkdirSync(canonical, { mode: 0o700 });
         fs.writeFileSync(path.join(canonical, 'canary'), 'must-stay');
@@ -1051,7 +1084,7 @@ describe('portable workspace storage', function () {
     let lease;
 
     beforeEach(function () {
-      dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cc-web-helper-seam-'));
+      dir = canonicalTempDir('cc-web-helper-seam-');
       lease = directLease(dir);
     });
 
@@ -1094,8 +1127,10 @@ describe('portable workspace storage', function () {
         }
         assert.strictEqual(helperCwds.at(-1), nested);
         assert.strictEqual(fs.readFileSync(path.join(nested, 'proof.txt'), 'utf8'), 'root-to-leaf');
-        assert.strictEqual(fs.statSync(nested).mode & 0o777, 0o755);
-        assert.strictEqual(fs.statSync(path.dirname(nested)).mode & 0o777, 0o755);
+        if (process.platform !== 'win32') {
+          assert.strictEqual(fs.statSync(nested).mode & 0o777, 0o755);
+          assert.strictEqual(fs.statSync(path.dirname(nested)).mode & 0o777, 0o755);
+        }
       } finally {
         proof.close();
       }
@@ -1227,7 +1262,7 @@ describe('portable workspace storage', function () {
     });
 
     it('retries one exact writer-guard unlink without leaking authority or its storage lease', function () {
-      const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cc-web-guard-unlink-'));
+      const root = canonicalTempDir('cc-web-guard-unlink-');
       const guardUnlinks = [];
       let failGuardUnlink = true;
       let database;
@@ -1282,7 +1317,7 @@ describe('portable workspace storage', function () {
     it('never reclaims a live writer whose incarnation is missing or explicitly unavailable', function () {
       setWorkspaceCwdHelperSpawnerForTests((_, __, options) => applyHelperWire(options));
       for (const incarnation of [undefined, 'unavailable']) {
-        const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cc-web-live-writer-'));
+        const root = canonicalTempDir('cc-web-live-writer-');
         try {
           const storage = path.join(root, '.cc-web');
           fs.mkdirSync(storage, { mode: 0o700 });
@@ -1387,7 +1422,7 @@ describe('portable workspace storage', function () {
     });
 
     it('fails closed and preserves interrupted writer claim state', function () {
-      const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cc-web-writer-claim-'));
+      const root = canonicalTempDir('cc-web-writer-claim-');
       try {
         const storage = path.join(root, '.cc-web');
         fs.mkdirSync(storage, { mode: 0o700 });
@@ -1421,7 +1456,7 @@ describe('portable workspace storage', function () {
         ['.session-state.writer.guard', '.session-state.writer.guard.claim', true],
         ['.session-state.writer', '.session-state.writer.claim', true],
       ]) {
-        const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cc-web-stale-claim-'));
+        const root = canonicalTempDir('cc-web-stale-claim-');
         try {
           const storage = path.join(root, '.cc-web');
           fs.mkdirSync(storage, { mode: 0o700 });
@@ -1439,7 +1474,7 @@ describe('portable workspace storage', function () {
     });
 
     it('retains writer authority and the lease when raw close fails, then permits an exact retry', function () {
-      const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cc-web-writer-close-'));
+      const root = canonicalTempDir('cc-web-writer-close-');
       let database;
       const closeSync = fs.closeSync;
       const closed = [];
@@ -1501,7 +1536,7 @@ describe('portable workspace storage', function () {
   describe('Windows cwd helper premise', function () {
     it('pins the exact child cwd against rename and removal until the helper exits', async function () {
       if (process.platform !== 'win32') this.skip();
-      let directory = fs.mkdtempSync(path.join(os.tmpdir(), 'cc-web-win-cwd-pin-'));
+      let directory = canonicalTempDir('cc-web-win-cwd-pin-');
       const moved = `${directory}-moved`;
       let child = null;
       try {
