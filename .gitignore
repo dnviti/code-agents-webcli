@@ -1,6 +1,6 @@
 node_modules/
 dist/
-release/
+/release/
 .DS_Store
 *.log
 .env
@@ -23,7 +23,6 @@ test/browser/workflow-failed-events.json
 test/browser/workflow-quiet-events.json
 test/browser/empty-rows-events.json
 test/browser/omp-turn-events.json
-.work/
 .work/
 
 # The app's own runtime directory: attachments uploaded through a conversation,
