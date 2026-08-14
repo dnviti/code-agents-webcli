@@ -7,5 +7,5 @@
  * is kept as the original path so every existing importer and test keeps working
  * unchanged.
  */
-export * from './messages-types.js';
-export { MessageProcessor } from './messages-concrete.js';
+export * from './messages/messages-types.js';
+export { MessageProcessor } from './messages/messages-concrete.js';

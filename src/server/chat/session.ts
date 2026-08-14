@@ -21,6 +21,6 @@ export type {
   AgentUpdateRestartResult,
   PlanSubmissionResult,
   PlanActionResult,
-} from './session-types.js';
-export { ChatNotRunningError, QueueFullError } from './session-errors.js';
-export { ChatSession } from './session-class.js';
+} from './session/session-types.js';
+export { ChatNotRunningError, QueueFullError } from './session/session-errors.js';
+export { ChatSession } from './session/session-class.js';

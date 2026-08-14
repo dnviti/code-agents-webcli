@@ -11,9 +11,9 @@
  * pure helper functions split into leaf modules: `codex-utils`, `codex-diff`,
  * `codex-mapping`, `codex-subagent`, `codex-context`, `codex-launch`.
  */
-export { CodexAppServerAdapter } from './codex-app-server.js';
-export { CodexExecAdapter } from './codex-exec.js';
-export { CodexChatAdapter } from './codex-chat.js';
-export { default } from './codex-chat.js';
+export { CodexAppServerAdapter } from './codex/codex-app-server.js';
+export { CodexExecAdapter } from './codex/codex-exec.js';
+export { CodexChatAdapter } from './codex/codex-chat.js';
+export { default } from './codex/codex-chat.js';
 
 

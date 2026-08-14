@@ -25,6 +25,6 @@ export type {
   ChatDescription,
   ChatStoreLike,
   ChatStoreAppendOutcome,
-} from './store-types.js';
-export { ChatStoreAppendError, chatStoreAppendOutcome } from './store-types.js';
-export { ChatStore, default } from './store-class.js';
+} from './store/store-types.js';
+export { ChatStoreAppendError, chatStoreAppendOutcome } from './store/store-types.js';
+export { ChatStore, default } from './store/store-class.js';

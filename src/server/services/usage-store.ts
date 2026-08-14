@@ -10,6 +10,6 @@
  *   - `./usage-store-mappers.ts` — the row-mapping and SQL-filter layer;
  *   - `./usage-store-window.ts` — the `rangeFor`/`windowFor` helpers.
  */
-export { UsageStore } from './usage-store-core.js';
-export * from './usage-store-types.js';
-export { rangeFor, windowFor } from './usage-store-window.js';
+export { UsageStore } from './usage-store/usage-store-core.js';
+export * from './usage-store/usage-store-types.js';
+export { rangeFor, windowFor } from './usage-store/usage-store-window.js';

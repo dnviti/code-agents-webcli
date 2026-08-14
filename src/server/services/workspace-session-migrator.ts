@@ -14,6 +14,6 @@ export type {
   LegacySessionMigrationRef,
   WorkspaceSessionArtifactMigratorOptions,
   WorkspaceSessionArtifactMigratorHooks,
-} from './migrator-core.js';
-export { MAX_MIGRATION_MARKER_ARTIFACTS } from './migrator-core.js';
-export { WorkspaceSessionArtifactMigrator, default } from './migrator-class.js';
+} from './workspace-session-migrator/migrator-core.js';
+export { MAX_MIGRATION_MARKER_ARTIFACTS } from './workspace-session-migrator/migrator-core.js';
+export { WorkspaceSessionArtifactMigrator, default } from './workspace-session-migrator/migrator-class.js';

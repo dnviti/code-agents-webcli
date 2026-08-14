@@ -1,4 +1,4 @@
-import { ProjectManagerComposition } from './manager-composition.js';
+import { ProjectManagerComposition } from './manager/manager-composition.js';
 
 /**
  * ProjectManager entry point.
@@ -11,7 +11,7 @@ import { ProjectManagerComposition } from './manager-composition.js';
  */
 export class ProjectManager extends ProjectManagerComposition {}
 
-export * from './manager-types.js';
+export * from './manager/manager-types.js';
 export type {
   ProjectSessionFileCommand,
   ProjectSessionProcessRecovery,

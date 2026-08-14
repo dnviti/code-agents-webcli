@@ -1,6 +1,6 @@
 import { Router } from 'express';
 import { AccountTabCoordinator } from '../services/account-tab-coordinator.js';
-import type { SessionRoutesDeps } from './sessions-common.js';
+import type { SessionRoutesDeps } from './sessions/sessions-common.js';
 import {
   handlePersistence,
   handleResumable,
@@ -11,13 +11,13 @@ import {
   handleTab,
   handleChildren,
   handleGet,
-} from './sessions-handlers-account.js';
-import { handleCreate } from './sessions-handlers-create.js';
-import { handleBranch } from './sessions-handlers-branch.js';
-import { handleDelete, handleExport } from './sessions-handlers-delete.js';
+} from './sessions/sessions-handlers-account.js';
+import { handleCreate } from './sessions/sessions-handlers-create.js';
+import { handleBranch } from './sessions/sessions-handlers-branch.js';
+import { handleDelete, handleExport } from './sessions/sessions-handlers-delete.js';
 
-export type { SessionRoutesDeps } from './sessions-common.js';
-export { suspendProjectSessions, retireProjectSessions } from './sessions-teardown.js';
+export type { SessionRoutesDeps } from './sessions/sessions-common.js';
+export { suspendProjectSessions, retireProjectSessions } from './sessions/sessions-teardown.js';
 
 export function createSessionRoutes(deps: SessionRoutesDeps): Router {
   const router = Router();
