@@ -13,7 +13,7 @@ const {
   isAllowedOAuthNavigation,
   parseSetCookie,
   partitionForServer,
-} = require('../desktop/controller-electron.js');
+} = require('../desktop/controller/electron.js');
 
 const FIRST_FINGERPRINT = Array(32).fill('11').join(':');
 const SECOND_FINGERPRINT = Array(32).fill('22').join(':');

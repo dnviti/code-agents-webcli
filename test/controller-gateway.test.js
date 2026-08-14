@@ -15,7 +15,7 @@ const {
   MAX_ATTACHMENT_BYTES,
   createControllerGateway,
 } = require('../desktop/controller-gateway.js');
-const { createLocalControllerTransport } = require('../desktop/controller-runtime.js');
+const { createLocalControllerTransport } = require('../desktop/controller/runtime.js');
 const { parseQualifiedSessionId, qualifySessionId } = require('../desktop/controller-protocol.js');
 
 class MockSocket extends EventEmitter {

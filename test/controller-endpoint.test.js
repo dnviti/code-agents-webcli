@@ -8,7 +8,7 @@ const path = require('node:path');
 const {
   readControllerPort,
   writeControllerPort,
-} = require('../desktop/controller-endpoint.js');
+} = require('../desktop/controller/endpoint.js');
 
 describe('desktop controller endpoint', function () {
   let directory;

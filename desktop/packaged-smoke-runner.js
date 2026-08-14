@@ -6,7 +6,7 @@ const net = require('node:net');
 const path = require('node:path');
 
 const { app, BrowserWindow, ipcMain, session } = require('electron');
-const { createLocalControllerTransport } = require('./controller-runtime.js');
+const { createLocalControllerTransport } = require('./controller/runtime.js');
 const { createPhoneAccessService } = require('./phone-access-service.js');
 const { installRendererSessionPolicy, protectNavigation } = require('./renderer-session-policy.js');
 const { runPackagedWorkspacePersistenceSmoke } = require('./packaged-smoke.js');

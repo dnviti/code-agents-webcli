@@ -165,7 +165,7 @@ jobs:
             },
           })}\n`);
           NODE
-          node scripts/validate-desktop-updater-qualification.js \
+          node scripts/release/validate-desktop-updater-qualification.js \
             desktop-updater-qualification.json "$TAG" "$COMMIT" qualification-assets qualification-feed
       - name: Verify package-specific installed-trial artifacts
         shell: bash
@@ -200,7 +200,7 @@ jobs:
             gh run download "$run_id" --repo "$GITHUB_REPOSITORY" \
               --name "desktop-updater-evidence-$package" --dir "$directory"
             test "$(find "$directory" -maxdepth 1 -type f -name desktop-updater-evidence.json | wc -l)" = 1
-            node scripts/validate-desktop-updater-trial-evidence.js \
+            node scripts/release/validate-desktop-updater-trial-evidence.js \
               "$directory/desktop-updater-evidence.json" "$package" desktop-updater-qualification.json
           done
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

@@ -131,13 +131,13 @@ jobs:
             exit 0
           fi
           git show "$previous:electron-builder.yml" > "$RUNNER_TEMP/previous-electron-builder.yml"
-          node scripts/validate-flatpak-permissions.js \
+          node scripts/release/validate-flatpak-permissions.js \
             "$RUNNER_TEMP/previous-electron-builder.yml" electron-builder.yml \
             "$GITHUB_REF_NAME" "$UPDATER_BRIDGE_TAG"
       - run: npm ci
       - name: Configure Electron sandbox helper
         shell: bash
-        run: bash scripts/configure-ci-electron-sandbox.sh
+        run: bash scripts/ci/configure-ci-electron-sandbox.sh
       - run: npm run typecheck
       - run: npm run test:strict
 
@@ -386,7 +386,7 @@ jobs:
       - name: Configure Electron sandbox helper
         if: runner.os == 'Linux'
         shell: bash
-        run: bash scripts/configure-ci-electron-sandbox.sh
+        run: bash scripts/ci/configure-ci-electron-sandbox.sh
       - name: Verify native attachment gestures and controller routing
         run: npm run test:desktop-attachments
       - name: Publish signed Flatpak repository artifacts
@@ -401,7 +401,7 @@ jobs:
           input="$(find release -maxdepth 1 -name '*.flatpak' -print -quit)"
           test -n "$input"
           mv "$input" "${input}.electron-builder"
-          bash scripts/release-flatpak-repository.sh \
+          bash scripts/release/release-flatpak-repository.sh \
             --input "${input}.electron-builder" --output release \
             --repository release/flatpak-repository --url '${{ env.FLATPAK_REPOSITORY_URL }}'
           rm "${input}.electron-builder"
@@ -695,7 +695,7 @@ jobs:
             curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
               "${candidate_url}${file}" -o "$RUNNER_TEMP/qualified-feed/$file"
           done
-          node scripts/validate-desktop-updater-qualification.js \
+          node scripts/release/validate-desktop-updater-qualification.js \
             "$qualification" "$EXPECTED_TAG" "$EXPECTED_COMMIT" \
             "$RUNNER_TEMP/qualified-assets" "$RUNNER_TEMP/qualified-feed"
           QUALIFICATION="$qualification" node -e '
@@ -716,7 +716,7 @@ jobs:
             gh run download "$evidence_run_id" --repo "$GH_REPO" \
               --name "desktop-updater-evidence-$package_name" --dir "$evidence_directory"
             test "$(find "$evidence_directory" -maxdepth 1 -type f -name desktop-updater-evidence.json | wc -l)" = 1
-            node scripts/validate-desktop-updater-trial-evidence.js \
+            node scripts/release/validate-desktop-updater-trial-evidence.js \
               "$evidence_directory/desktop-updater-evidence.json" "$package_name" "$qualification"
           done
           echo "attestation_run_id=$QUALIFICATION_RUN_ID" >> "$GITHUB_OUTPUT"
@@ -766,7 +766,7 @@ jobs:
             -name '*.flatpakref' -o -name '*.flatpakrepo' \) -printf '%f\0' | sort -z | xargs -0 sha256sum > SHA256SUMS
           sha256sum -c SHA256SUMS
           cd ../..
-          node scripts/validate-release-assets.js release-assets/published '${{ needs.verify.outputs.version }}'
+          node scripts/release/validate-release-assets.js release-assets/published '${{ needs.verify.outputs.version }}'
       - name: Verify the release staging slot
         shell: bash
         env:
@@ -933,7 +933,7 @@ jobs:
             -o -name '*.blockmap' -o -name 'latest*.yml' \) -printf '%f\0' \
             | sort -z | xargs -0 sha256sum > SHA256SUMS
           sha256sum -c SHA256SUMS
-          node "$GITHUB_WORKSPACE/scripts/validate-release-assets.js" "$PWD" "$VERSION" --unsigned
+          node "$GITHUB_WORKSPACE/scripts/release/validate-release-assets.js" "$PWD" "$VERSION" --unsigned
       - name: Refuse to replace an already published release
         shell: bash
         env:
@@ -1125,7 +1125,7 @@ jobs:
           set -euo pipefail
           mkdir "$RUNNER_TEMP/promotion-assets" "$RUNNER_TEMP/promotion-qualification" "$RUNNER_TEMP/promotion-feed"
           gh release download "$EXPECTED_TAG" --repo "$GH_REPO" --dir "$RUNNER_TEMP/promotion-assets"
-          node scripts/validate-release-assets.js "$RUNNER_TEMP/promotion-assets" "$EXPECTED_VERSION"
+          node scripts/release/validate-release-assets.js "$RUNNER_TEMP/promotion-assets" "$EXPECTED_VERSION"
           gh run download "$QUALIFICATION_RUN_ID" --repo "$GH_REPO" \
             --name desktop-updater-qualification --dir "$RUNNER_TEMP/promotion-qualification"
           qualification="$RUNNER_TEMP/promotion-qualification/desktop-updater-qualification.json"
@@ -1135,7 +1135,7 @@ jobs:
           for file in code-agents-webcli.gpg summary summary.sig update-info.json update-info.json.asc; do
             curl "${curl_args[@]}" "${candidate_url}${file}" -o "$RUNNER_TEMP/promotion-feed/$file"
           done
-          node scripts/validate-desktop-updater-qualification.js \
+          node scripts/release/validate-desktop-updater-qualification.js \
             "$qualification" "$EXPECTED_TAG" "$EXPECTED_COMMIT" \
             "$RUNNER_TEMP/promotion-assets" "$RUNNER_TEMP/promotion-feed"
           candidate_repository="$(find pages-input -type d -name flatpak-repository -print -quit)"

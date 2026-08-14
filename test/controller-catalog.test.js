@@ -11,7 +11,7 @@ const {
   canonicalOrigin,
   sanitizeOfflineMetadataCache,
   sanitizeServerIdentity,
-} = require('../desktop/controller-catalog.js');
+} = require('../desktop/controller/catalog.js');
 
 describe('desktop controller catalog', function () {
   let directory;

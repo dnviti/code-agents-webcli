@@ -6,12 +6,12 @@ const http = require('node:http');
 const os = require('node:os');
 const path = require('node:path');
 
-const { createControllerGateway } = require('../desktop/controller-gateway.js');
-const { readControllerPort } = require('../desktop/controller-endpoint.js');
+const { createControllerGateway } = require('../desktop/controller/gateway.js');
+const { readControllerPort } = require('../desktop/controller/endpoint.js');
 const {
   recoverablePersistedBindError,
   startControllerGateway,
-} = require('../desktop/controller-startup.js');
+} = require('../desktop/controller/startup.js');
 
 function failure(code, message = code) {
   return Object.assign(new Error(message), { code });

@@ -3,7 +3,7 @@
 const {
   validPersistedPort,
   writeControllerPort,
-} = require('./controller-endpoint.js');
+} = require('./endpoint.js');
 
 const RECOVERABLE_PERSISTED_BIND_ERRORS = new Set(['EACCES', 'EADDRINUSE']);
 

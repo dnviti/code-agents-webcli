@@ -4,14 +4,14 @@ const { randomUUID } = require('node:crypto');
 const http = require('node:http');
 const { Readable } = require('node:stream');
 const WebSocket = require('ws');
-const { CONTROLLER_PRODUCT_ID, CONTROLLER_PROTOCOL_VERSION } = require('../dist/sdk/contracts/controller.js');
+const { CONTROLLER_PRODUCT_ID, CONTROLLER_PROTOCOL_VERSION } = require('../../dist/sdk/contracts/controller.js');
 
-const { canonicalOrigin, friendlyName } = require('./controller-catalog.js');
+const { canonicalOrigin, friendlyName } = require('./catalog.js');
 const {
   ControllerTransportError,
   createControllerTransport,
   normalizeFingerprint256,
-} = require('./controller-transport.js');
+} = require('./transport.js');
 
 const LOCAL_ID = 'local';
 const DEFAULT_RECONNECT_MS = 15_000;

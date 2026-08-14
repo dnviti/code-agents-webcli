@@ -570,13 +570,13 @@ async function boot() {
 
   // Controller modules consume compiled SDK contracts. Load them inside the
   // caught startup path so an absent/corrupt build still reaches the dialog.
-  const { ControllerCatalog } = require('./controller-catalog.js');
-  const { readControllerPort } = require('./controller-endpoint.js');
-  const { startControllerGateway } = require('./controller-startup.js');
-  const { findLanServers } = require('./controller-discovery.js');
-  const { createElectronControllerSessions } = require('./controller-electron.js');
+  const { ControllerCatalog } = require('./controller/catalog.js');
+  const { readControllerPort } = require('./controller/endpoint.js');
+  const { startControllerGateway } = require('./controller/startup.js');
+  const { findLanServers } = require('./controller/discovery.js');
+  const { createElectronControllerSessions } = require('./controller/electron.js');
   const { createControllerGateway } = require('./controller-gateway.js');
-  const { createControllerRuntime } = require('./controller-runtime.js');
+  const { createControllerRuntime } = require('./controller/runtime.js');
   const { createPhoneAccessService } = require('./phone-access-service.js');
   const userData = app.getPath('userData');
   const controllerEndpointFile = path.join(userData, 'controller', 'gateway.json');

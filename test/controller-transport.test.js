@@ -19,7 +19,7 @@ const {
   normalizeFingerprint256,
   sanitizeRequestHeaders,
   validateIdentity,
-} = require('../desktop/controller-transport.js');
+} = require('../desktop/controller/transport.js');
 
 function openssl(args, cwd) {
   execFileSync('openssl', args, { cwd, stdio: 'ignore' });

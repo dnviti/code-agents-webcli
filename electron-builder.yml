@@ -188,7 +188,7 @@ mac:
     # so two native jobs cannot publish a conflicting latest-mac.yml.
     - zip
 
-afterSign: scripts/notarize.js
+afterSign: scripts/release/notarize.js
 
 dmg:
   title: Code Agents Web CLI ${version}

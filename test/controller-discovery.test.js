@@ -7,7 +7,7 @@ const {
   broadcastAddresses,
   findLanServers,
   scanTimeout,
-} = require('../desktop/controller-discovery.js');
+} = require('../desktop/controller/discovery.js');
 
 class FakeSocket extends EventEmitter {
   constructor() {

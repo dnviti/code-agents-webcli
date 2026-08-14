@@ -42,7 +42,7 @@ jobs:
       # configuring the helper exactly as Chromium requires.
       - name: Configure Electron sandbox helper
         shell: bash
-        run: bash scripts/configure-ci-electron-sandbox.sh
+        run: bash scripts/ci/configure-ci-electron-sandbox.sh
 
       - name: Typecheck
         run: npm run typecheck
@@ -77,7 +77,7 @@ jobs:
       # to compile, or a `prepare` that only works inside a checkout, fails
       # here and nowhere else.
       - name: Install from a git URL into an empty prefix
-        run: bash scripts/verify-install.sh
+        run: bash scripts/release/verify-install.sh
 
   docker-build:
     name: Validate Docker build

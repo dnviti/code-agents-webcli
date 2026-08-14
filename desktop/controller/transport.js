@@ -5,7 +5,7 @@ const net = require('node:net');
 const tls = require('node:tls');
 const { Readable } = require('node:stream');
 const WebSocket = require('ws');
-const { CONTROLLER_PRODUCT_ID: PRODUCT_ID, CONTROLLER_PROTOCOL_VERSION: PROTOCOL_VERSION } = require('../dist/sdk/contracts/controller.js');
+const { CONTROLLER_PRODUCT_ID: PRODUCT_ID, CONTROLLER_PROTOCOL_VERSION: PROTOCOL_VERSION } = require('../../dist/sdk/contracts/controller.js');
 
 const DEFAULT_TIMEOUT_MS = 10_000;
 const MAX_IDENTITY_BYTES = 64 * 1024;

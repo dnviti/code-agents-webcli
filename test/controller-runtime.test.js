@@ -7,15 +7,15 @@ const os = require('node:os');
 const path = require('node:path');
 const { Readable } = require('node:stream');
 
-const { ControllerCatalog } = require('../desktop/controller-catalog.js');
+const { ControllerCatalog } = require('../desktop/controller/catalog.js');
 const {
   LAN_DISCOVERY_PORT,
   LAN_DISCOVERY_PROBE,
   createControllerRuntime,
   createLocalControllerTransport,
   parseDiscoveryResponse,
-} = require('../desktop/controller-runtime.js');
-const { ControllerTransportError } = require('../desktop/controller-transport.js');
+} = require('../desktop/controller/runtime.js');
+const { ControllerTransportError } = require('../desktop/controller/transport.js');
 
 const FINGERPRINT = Array(32).fill('AB').join(':');
 

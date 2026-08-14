@@ -6,7 +6,7 @@
 const crypto = require('node:crypto');
 const fs = require('node:fs');
 const path = require('node:path');
-const { CONTROLLER_PRODUCT_ID } = require('../dist/sdk/contracts/controller.js');
+const { CONTROLLER_PRODUCT_ID } = require('../../dist/sdk/contracts/controller.js');
 
 const SCHEMA_VERSION = 1;
 const FRIENDLY_NAME_MAX_LENGTH = 120;

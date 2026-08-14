@@ -44,11 +44,11 @@
     "test:strict": "npm run test -- --strict",
     "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.client.json",
     "prepack": "npm run build",
-    "release:pr": "bash scripts/release-pr.sh",
+    "release:pr": "bash scripts/release/release-pr.sh",
     "test:browser": "npm run build && node test/browser/run.js",
     "test:browser:strict": "npm run build && node test/browser/run.js --strict",
     "test:desktop-attachments": "node test/electron-attachment/run.js",
-    "verify:install": "bash scripts/verify-install.sh"
+    "verify:install": "bash scripts/release/verify-install.sh"
   },
   "keywords": [
     "claude",
