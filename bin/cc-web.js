@@ -6,14 +6,7 @@ const packageJson = require('../package.json');
 const MIN_NODE_MAJOR = 24;
 const MIN_NODE_MINOR = 16;
 
-/**
- * Refuse a Node too old for the built-in SQLite serialization APIs, before
- * anything else runs.
- *
- * `engines` in package.json is advisory — npm prints a warning and installs
- * anyway — so without this check the first symptom of an unsupported Node is a
- * bare SQLite serialization failure from three frames deep inside the server.
- */
+/** Enforce the Node version needed by the built-in SQLite APIs. */
 function checkNodeVersion() {
   const [major, minor] = process.versions.node.split('.').map(Number);
   if (major > MIN_NODE_MAJOR || (major === MIN_NODE_MAJOR && minor >= MIN_NODE_MINOR)) {
@@ -27,19 +20,10 @@ function checkNodeVersion() {
   process.exit(1);
 }
 
-/**
- * Load the compiled server.
- *
- * There used to be a whole recovery path here that offered to compile
- * `node-pty` and `better-sqlite3` when they arrived uncompiled from a global
- * install. Neither package is a dependency any more — the pty ships as a
- * prebuilt binary and SQLite comes from Node itself — so nothing in the tree
- * has an install script left to be blocked, and the only remaining way this
- * fails is a package whose build never ran at all.
- */
-function loadServer() {
+/** Load the compiled SDK late so a missing build gets a useful diagnostic. */
+function loadServerFactory() {
   try {
-    return require('../dist/server/index.js').ClaudeCodeWebServer;
+    return require('../dist/sdk/node/index.js').createCodeAgentsServer;
   } catch (error) {
     const message = (error && error.message) || String(error);
     console.error('Cannot start code-agents-webcli because the compiled server bundle is missing.');
@@ -52,6 +36,17 @@ function loadServer() {
 checkNodeVersion();
 
 const program = new Command();
+const AGENT_ALIASES = [
+  ['claude', 'Claude', 'Claude'],
+  ['codex', 'Codex', 'Codex'],
+  ['agent', 'Agent', 'Cursor'],
+  ['pi', 'pi', 'Pi'],
+  ['grok', 'Grok', 'Grok', 'Grok Build'],
+  ['qwen', 'Qwen', 'Qwen', 'Qwen Code'],
+  ['kimi', 'Kimi', 'Kimi', 'Kimi Code'],
+  ['omp', 'Oh My Pi', 'Oh My Pi'],
+  ['antigravity', 'Antigravity', 'Antigravity', 'Antigravity CLI'],
+];
 
 program
   .name('code-agents-webcli')
@@ -74,16 +69,13 @@ program
   .option('--allow-any-github-user', 'allow ANY GitHub account to sign in (dangerous: signed-in users can run commands on this host)')
   .option('--data-dir <path>', 'directory for the SQLite database and local state')
   .option('--dev', 'development mode with additional logging')
-  .option('--plan <type>', 'accepted and ignored: plan limits are no longer guessed')
-  .option('--claude-alias <name>', 'display alias for Claude (default: env CLAUDE_ALIAS or "Claude")')
-  .option('--codex-alias <name>', 'display alias for Codex (default: env CODEX_ALIAS or "Codex")')
-  .option('--agent-alias <name>', 'display alias for Agent (default: env AGENT_ALIAS or "Cursor")')
-  .option('--pi-alias <name>', 'display alias for pi (default: env PI_ALIAS or "Pi")')
-  .option('--grok-alias <name>', 'display alias for Grok Build (default: env GROK_ALIAS or "Grok")')
-  .option('--qwen-alias <name>', 'display alias for Qwen Code (default: env QWEN_ALIAS or "Qwen")')
-  .option('--kimi-alias <name>', 'display alias for Kimi Code (default: env KIMI_ALIAS or "Kimi")')
-  .option('--omp-alias <name>', 'display alias for Oh My Pi (default: env OMP_ALIAS or "Oh My Pi")')
-  .option('--antigravity-alias <name>', 'display alias for Antigravity CLI (default: env ANTIGRAVITY_ALIAS or "Antigravity")')
+  .option('--plan <type>', 'accepted and ignored: plan limits are no longer guessed');
+
+for (const [id, name, fallback, helpName = name] of AGENT_ALIASES) {
+  program.option(`--${id}-alias <name>`, `display alias for ${helpName} (default: env ${id.toUpperCase()}_ALIAS or "${fallback}")`);
+}
+
+program
   .option('--ngrok-auth-token <token>', 'ngrok auth token to open a public tunnel')
   .option('--ngrok-domain <domain>', 'ngrok reserved domain to use for the tunnel')
   .option('--containers', 'give every signed-in user their own isolated container')
@@ -102,13 +94,7 @@ program
   .option('--kube-service-account <name>', 'service account for the environment pods')
   .option('--encryption-key <key>', 'base64 or hex 32-byte key encrypting deploy-target secrets at rest');
 
-/**
- * Operator commands for the per-user environments.
- *
- * Deliberately outside the running server: an operator revoking somebody's
- * access needs to remove their environment whether or not the server is up,
- * and the container engine — not the app — is the authority on what exists.
- */
+/** Manage environments directly through their container-engine authority. */
 function environmentManager() {
   const {
     EnvironmentManager,
@@ -189,7 +175,6 @@ async function openUrl(url) {
 }
 
 async function main() {
-  // Read after parsing, not before: this is the object commander fills in.
   const options = program.opts();
 
   try {
@@ -214,28 +199,15 @@ async function main() {
       githubClientId: options.githubClientId,
       githubClientSecret: options.githubClientSecret,
       githubAppToken: options.githubAppToken,
-      // commander derives the property name mechanically — `--allowed-github-ids`
-      // becomes `allowedGithubIds`, with a lower-case `h`. Reading the
-      // `GitHub`-cased spelling the rest of the codebase uses silently yielded
-      // `undefined`, so both of these flags did nothing at all: the allow-list
-      // fell through to the environment (usually empty, refusing every sign-in)
-      // and the deliberate "let anyone in" opt-in could not be expressed.
+      // Commander spells --allowed-github-ids as allowedGithubIds.
       allowedGitHubIds: options.allowedGithubIds,
       allowAnyGitHubUser: options.allowAnyGithubUser,
       dataDir: options.dataDir,
-      // UI aliases for assistants
-      claudeAlias: options.claudeAlias || process.env.CLAUDE_ALIAS || 'Claude',
-      codexAlias: options.codexAlias || process.env.CODEX_ALIAS || 'Codex',
-      agentAlias: options.agentAlias || process.env.AGENT_ALIAS || 'Cursor',
-      piAlias: options.piAlias || process.env.PI_ALIAS || 'Pi',
-      grokAlias: options.grokAlias || process.env.GROK_ALIAS || 'Grok',
-      qwenAlias: options.qwenAlias || process.env.QWEN_ALIAS || 'Qwen',
-      kimiAlias: options.kimiAlias || process.env.KIMI_ALIAS || 'Kimi',
-      ompAlias: options.ompAlias || process.env.OMP_ALIAS || 'Oh My Pi',
-      antigravityAlias:
-        options.antigravityAlias || process.env.ANTIGRAVITY_ALIAS || 'Antigravity',
-      // Per-user container environments. Absent means the historical
-      // behaviour: everything runs on this host, as this account.
+      ...Object.fromEntries(AGENT_ALIASES.map(([id, _name, fallback]) => {
+        const key = `${id}Alias`;
+        return [key, options[key] || process.env[`${id.toUpperCase()}_ALIAS`] || fallback];
+      })),
+      // Without containers, work runs directly as the host account.
       containers: options.containers === true,
       containerEngine: options.containerEngine,
       containerImage: options.containerImage,
@@ -247,39 +219,24 @@ async function main() {
       containerSetupCommand: options.containerSetup,
       containerTiers: options.containerTiers,
       containerDefaultTier: options.containerDefaultTier,
-      // commander turns `--no-x` into `x: false`, so this is only ever false
-      // when the operator asked for it.
+      // Commander turns --no-x into x: false.
       containerUserTierChoice: options.containerUserTierChoice,
       kubeContext: options.kubeContext,
       kubeNamespace: options.kubeNamespace,
       kubeStorageClaim: options.kubeStorageClaim,
       kubeServiceAccount: options.kubeServiceAccount,
       encryptionKey: options.encryptionKey,
-      folderMode: true // Always use folder mode
+      folderMode: true,
     };
 
-    // Before the banner: announcing "Starting…" only to fail two lines later
-    // reads as a crash rather than as a missing build.
-    const ClaudeCodeWebServer = loadServer();
+    // Fail on a missing build before printing the startup banner.
+    const createCodeAgentsServer = loadServerFactory();
 
     console.log('Starting Code Agents Web CLI...');
     console.log(`Port: ${port}`);
     console.log('Mode: Folder selection mode');
-    // Built from a table rather than one template string: the line grew past
-    // terminal width every time a runtime was added, and each addition meant
-    // editing a 200-character literal.
-    const aliasBanner = [
-      ['Claude', serverOptions.claudeAlias],
-      ['Codex', serverOptions.codexAlias],
-      ['Agent', serverOptions.agentAlias],
-      ['pi', serverOptions.piAlias],
-      ['Grok', serverOptions.grokAlias],
-      ['Qwen', serverOptions.qwenAlias],
-      ['Kimi', serverOptions.kimiAlias],
-      ['Oh My Pi', serverOptions.ompAlias],
-      ['Antigravity', serverOptions.antigravityAlias],
-    ]
-      .map(([name, alias]) => `${name} → "${alias}"`)
+    const aliasBanner = AGENT_ALIASES
+      .map(([id, name]) => `${name} → "${serverOptions[`${id}Alias`]}"`)
       .join(', ');
     console.log(`Aliases: ${aliasBanner}`);
     const deployTargetsEnabled =
@@ -302,23 +259,18 @@ async function main() {
       );
     }
 
-    const appServer = new ClaudeCodeWebServer(serverOptions);
+    const appServer = createCodeAgentsServer(serverOptions);
 
-    // Runs the first-time (or --setup) wizard. Returns false when the user
-    // chose to install a background service, in which case systemd now owns
-    // the port and this process must not bind it too.
+    // A false setup result means a background service now owns startup.
     const shouldRunHere = await appServer.runSetupIfNeeded();
     if (!shouldRunHere) {
-      // The constructor owns the installation data-directory lease before it
-      // opens SQLite. A setup flow which hands execution to systemd must close
-      // those writers and release the lease before the service starts.
+      // Release the database and data-directory lease before that service starts.
       await appServer.shutdown();
       process.exit(0);
     }
 
     await appServer.start();
 
-    // ngrok setup
     const hasNgrokToken = !!options.ngrokAuthToken;
     const hasNgrokDomain = !!options.ngrokDomain;
 
@@ -329,9 +281,7 @@ async function main() {
 
     let ngrokListener = null;
     
-    // Always https: the server refuses to serve content over anything else,
-    // because a plain-http origin off localhost is not a secure context and the
-    // browser then withholds the service worker the app needs.
+    // Remote browsers require an HTTPS secure context for the service worker.
     const url = `https://localhost:${port}`;
 
     console.log(`\n🚀 Code Agents Web CLI is running at: ${url}`);
@@ -340,7 +290,6 @@ async function main() {
       + `${port} and install the local CA once from https://<this-host>:${port}/ca.crt`,
     );
     
-    // Start ngrok tunnel if both flags provided
     let publicUrl = null;
     if (hasNgrokToken && hasNgrokDomain) {
       console.log('\n🌐 Starting ngrok tunnel...');
@@ -358,19 +307,12 @@ async function main() {
           domain: options.ngrokDomain
         });
 
-        if (ngrokListener && typeof ngrokListener.url === 'function') {
-          publicUrl = ngrokListener.url();
-        }
-
-        if (!publicUrl && ngrokListener && ngrokListener.url) {
-          publicUrl = ngrokListener.url; // fallback in case API exposes property
-        }
-
-        if (publicUrl) {
-          console.log(`\n🌍 ngrok tunnel established: ${publicUrl}`);
-        } else {
-          console.log('\n🌍 ngrok tunnel established');
-        }
+        publicUrl = typeof ngrokListener?.url === 'function'
+          ? ngrokListener.url()
+          : ngrokListener?.url || null;
+        console.log(publicUrl
+          ? `\n🌍 ngrok tunnel established: ${publicUrl}`
+          : '\n🌍 ngrok tunnel established');
 
         if (options.open && publicUrl) {
           try {
@@ -384,7 +326,6 @@ async function main() {
         console.error('Failed to start ngrok tunnel:', error.message);
       }
     } else if (options.open) {
-      // Open local URL only when ngrok not used and auto-open enabled
       try {
         await openUrl(url);
       } catch (error) {
@@ -396,12 +337,9 @@ async function main() {
 
     let shuttingDown = false;
     const shutdown = async () => {
-      if (shuttingDown) {
-        return;
-      }
+      if (shuttingDown) return;
       shuttingDown = true;
 
-      // Close ngrok tunnel first if active
       if (ngrokListener && typeof ngrokListener.close === 'function') {
         try { await ngrokListener.close(); } catch (_) {}
       }
@@ -420,15 +358,10 @@ async function main() {
   }
 }
 
-// Starting the server is the root command's own action, not something done
-// after parsing. Once a program has subcommands, commander answers a bare
-// invocation with the help text unless the root has an action of its own — so
-// leaving this out stopped `cc-web` from starting at all, which is the one
-// thing it must always do.
+// Keep the bare invocation as the root action even though env subcommands exist.
 program.action(() => main());
 
-// parseAsync, not parse: the `env` subcommands do real work and their actions
-// are async.
+// Environment subcommands perform asynchronous work.
 program.parseAsync().catch((error) => {
   console.error(error.message);
   process.exit(1);

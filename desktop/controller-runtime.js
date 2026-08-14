@@ -4,6 +4,7 @@ const { randomUUID } = require('node:crypto');
 const http = require('node:http');
 const { Readable } = require('node:stream');
 const WebSocket = require('ws');
+const { CONTROLLER_PRODUCT_ID, CONTROLLER_PROTOCOL_VERSION } = require('../dist/sdk/contracts/controller.js');
 
 const { canonicalOrigin, friendlyName } = require('./controller-catalog.js');
 const {
@@ -45,7 +46,7 @@ function parseDiscoveryResponse(message) {
     const parsed = JSON.parse(message.toString('utf8'));
     const identity = parsed?.type === 'CODE_AGENTS_IDENTITY/1' ? parsed.identity : null;
     if (
-      identity?.product?.id !== 'code-agents-webcli'
+      identity?.product?.id !== CONTROLLER_PRODUCT_ID
       || identity.product.name !== 'CODE AGENTS'
       || typeof identity.version !== 'string'
       || !Number.isInteger(identity.protocolVersion)
@@ -726,8 +727,8 @@ function createControllerRuntime(options = {}) {
       success: true,
       candidates: candidates.map((candidate) => ({
         ...candidate,
-        compatible: candidate.protocolVersion === 1,
-        status: candidate.protocolVersion === 1
+        compatible: candidate.protocolVersion === CONTROLLER_PROTOCOL_VERSION,
+        status: candidate.protocolVersion === CONTROLLER_PROTOCOL_VERSION
           ? 'Compatible controller'
           : `Protocol ${candidate.protocolVersion} requires a server upgrade`,
       })),

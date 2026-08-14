@@ -117,6 +117,18 @@ which GitHub accounts may sign in, then opens
 
 Full detail: **[Installation](docs/installation.md)**.
 
+## Reusable SDK
+
+Web, PWA and Electron hosts share the same supported SDK surface:
+
+- `code-agents-webcli/sdk/contracts` — platform-neutral controller/session codecs
+- `code-agents-webcli/sdk/browser` — browser controller transport and public models
+- `code-agents-webcli/sdk/node` — server setup, start and shutdown lifecycle
+
+The package root remains compatible with existing Node consumers. New hosts
+should use the SDK subpaths; see [Architecture](docs/architecture.md#reusable-sdk-and-host-boundaries)
+for dependency and security boundaries.
+
 ## Docker
 
 ```bash

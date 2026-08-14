@@ -1,8 +1,9 @@
 import type express from 'express';
+import { CONTROLLER_PRODUCT_ID, CONTROLLER_PROTOCOL_VERSION } from '../../sdk/contracts/controller.js';
 
-export const SERVER_PRODUCT_ID = 'code-agents-webcli';
+export const SERVER_PRODUCT_ID = CONTROLLER_PRODUCT_ID;
 export const SERVER_PRODUCT_NAME = 'CODE AGENTS';
-export const SERVER_PROTOCOL_VERSION = 1;
+export const SERVER_PROTOCOL_VERSION = CONTROLLER_PROTOCOL_VERSION;
 /**
  * Public before authentication and repeated in a small UDP datagram. Keeping
  * this bounded leaves ample room beneath the 1024-byte discovery packet cap.

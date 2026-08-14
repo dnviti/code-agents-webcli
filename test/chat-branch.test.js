@@ -825,6 +825,7 @@ describe('branching a conversation from one of its turns', function () {
   it('allocates its append position when the finished branch is inserted', async function () {
     await record('source', conversation({ turns: 2, contextWindow: 200_000 }));
     sessions.get('source').tabOrder = 0;
+    sessions.set('closed', Object.assign(chatRecord('closed'), { tabOpen: false, tabOrder: 99 }));
 
     const originalSetOpeningContext = store.setOpeningContext.bind(store);
     let openingStarted;

@@ -45,6 +45,17 @@ describe('the command line', function () {
     assert.doesNotMatch(result.stdout, /Starting Code Agents Web CLI/);
   });
 
+  it('retains every runtime alias option and default after table-driven registration', function () {
+    const help = run(['--help']).stdout.replace(/\s+/g, ' ');
+    for (const [id, fallback] of [
+      ['claude', 'Claude'], ['codex', 'Codex'], ['agent', 'Cursor'], ['pi', 'Pi'],
+      ['grok', 'Grok'], ['qwen', 'Qwen'], ['kimi', 'Kimi'], ['omp', 'Oh My Pi'],
+      ['antigravity', 'Antigravity'],
+    ]) {
+      assert.match(help, new RegExp(`--${id}-alias <name>.*?${id.toUpperCase()}_ALIAS or "${fallback}"`));
+    }
+  });
+
   it('says which engine is missing rather than reporting a spawn errno', function () {
     // No engine on PATH is the ordinary case for an operator who has not set
     // one up, and `spawn docker ENOENT` tells them nothing about what to do.

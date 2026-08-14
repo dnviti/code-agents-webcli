@@ -1,0 +1,5 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": { "lib": ["ES2020", "DOM", "DOM.Iterable"], "types": [] },
+  "include": ["src/sdk/browser/**/*.ts", "src/sdk/contracts/**/*.ts"]
+}

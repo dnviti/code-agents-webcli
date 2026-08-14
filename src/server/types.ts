@@ -1,5 +1,8 @@
 import { WebSocket } from 'ws';
 import { ChatDraft } from '../shared/chat-events.js';
+import type { DesktopServerOptions, ServerOptions } from '../sdk/node/options.js';
+
+export type { DesktopServerOptions, ServerOptions } from '../sdk/node/options.js';
 
 export type AgentKind =
   | 'claude'
@@ -12,75 +15,6 @@ export type AgentKind =
   | 'omp'
   | 'antigravity'
   | 'terminal';
-
-export interface ServerOptions {
-  port?: number;
-  /** Programmatic bind address. The CLI intentionally has no equivalent flag. */
-  host?: string;
-  /**
-   * Desktop embedding is an API-only mode: it has no CLI flag or environment
-   * variable, so a network deployment cannot accidentally turn its TLS and
-   * OAuth protections off.
-   */
-  desktop?: DesktopServerOptions;
-  dev?: boolean;
-  https?: boolean;
-  cert?: string;
-  key?: string;
-  setup?: boolean;
-  folderMode?: boolean;
-  sessionHours?: number;
-  claudeAlias?: string;
-  codexAlias?: string;
-  agentAlias?: string;
-  piAlias?: string;
-  grokAlias?: string;
-  qwenAlias?: string;
-  kimiAlias?: string;
-  ompAlias?: string;
-  antigravityAlias?: string;
-  publicBaseUrl?: string;
-  /** Human-readable, public metadata; never derived from a machine hostname. */
-  serverName?: string;
-  /** Canonical HTTPS origin published by the unauthenticated identity endpoint. */
-  publicDiscoverableUrl?: string;
-  /** Opt in to answering LAN discovery probes. Disabled by default. */
-  lanDiscoverable?: boolean;
-  githubClientId?: string;
-  githubClientSecret?: string;
-  githubAppToken?: string;
-  allowedGitHubIds?: string;
-  allowAnyGitHubUser?: boolean;
-  dataDir?: string;
-  /** Root exposed by the host-mode workspace and terminal routes. */
-  baseFolder?: string;
-  /** Give every signed-in user their own container. Off unless asked for. */
-  containers?: boolean;
-  containerEngine?: string;
-  containerImage?: string;
-  containerCpus?: string;
-  containerMemory?: string;
-  containerIdleMinutes?: number;
-  containerSetupCommand?: string;
-  containerTiers?: string;
-  containerDefaultTier?: string;
-  containerUserTierChoice?: boolean;
-  kubeContext?: string;
-  kubeNamespace?: string;
-  kubeStorageClaim?: string;
-  kubeServiceAccount?: string;
-  /** Base64/hex 32-byte key encrypting deploy-target secrets at rest. */
-  encryptionKey?: string;
-}
-
-export interface DesktopServerOptions {
-  /** Opaque, high-entropy value owned by the desktop embedder. */
-  authToken: string;
-  /** Stable local account identifier, normally the operating-system username. */
-  username: string;
-  /** Human-facing name for Git identity and the account surface. */
-  name?: string | null;
-}
 
 export interface Aliases {
   claude: string;

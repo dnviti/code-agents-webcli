@@ -1,5 +1,6 @@
 import dgram from 'node:dgram';
 
+import { CONTROLLER_PRODUCT_ID, CONTROLLER_PROTOCOL_VERSION } from '../../sdk/contracts/controller.js';
 import type { ServerIdentity } from './server-identity.js';
 
 export const LAN_DISCOVERY_PORT = 32353;
@@ -82,10 +83,10 @@ function isServerIdentity(value: unknown): value is ServerIdentity {
   if (!value || typeof value !== 'object') return false;
   const identity = value as Record<string, unknown>;
   const product = identity.product as Record<string, unknown> | null;
-  return product?.id === 'code-agents-webcli'
+  return product?.id === CONTROLLER_PRODUCT_ID
     && product.name === 'CODE AGENTS'
     && typeof identity.version === 'string'
-    && identity.protocolVersion === 1
+    && identity.protocolVersion === CONTROLLER_PROTOCOL_VERSION
     && Array.isArray(identity.capabilities) && identity.capabilities.every((capability) => typeof capability === 'string')
     && typeof identity.serverName === 'string'
     && typeof identity.address === 'string';

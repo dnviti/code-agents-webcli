@@ -26,6 +26,73 @@ function resolveTsc() {
   return tscJs;
 }
 
+function compileTypeScript(scope, project) {
+  console.log(`[${scope}] Compiling TypeScript...`);
+  try {
+    execFileSync(process.execPath, [resolveTsc(), '--project', project], {
+      stdio: 'inherit',
+      cwd: path.join(__dirname, '..'),
+    });
+    console.log(`[${scope}] Done.\n`);
+  } catch {
+    console.error(`[${scope}] TypeScript compilation failed`);
+    process.exit(1);
+  }
+}
+
+const PRIVATE_SERVER_SLICES = [
+  'server-core',
+  'server-environment',
+  'server-functions',
+  'server-lifecycle',
+  'server-runtime',
+  'server-workspace',
+];
+
+/**
+ * Keep the source composition root split without publishing new deep imports.
+ * Only the private slices are folded into index.js; every established server
+ * module remains an external require at its existing path.
+ */
+async function bundlePrivateServerSlices() {
+  console.log('[server] Bundling private composition slices...');
+  const privateFiles = new Set(PRIVATE_SERVER_SLICES.map((name) => `${name}.js`));
+  const result = await esbuild.build({
+    entryPoints: ['dist/server/index.js'],
+    outfile: 'dist/server/index.js',
+    bundle: true,
+    write: false,
+    platform: 'node',
+    format: 'cjs',
+    target: 'node24',
+    sourcemap: true,
+    packages: 'external',
+    plugins: [{
+      name: 'private-server-slices',
+      setup(build) {
+        build.onResolve({ filter: /^\.\.?[\\/]/ }, (args) => {
+          if (args.kind === 'entry-point' || privateFiles.has(path.basename(args.path))) {
+            return undefined;
+          }
+          return { path: args.path, external: true };
+        });
+      },
+    }],
+  });
+
+  for (const output of result.outputFiles) {
+    fs.writeFileSync(output.path, output.contents);
+  }
+
+  const serverDir = path.join(__dirname, '..', 'dist', 'server');
+  for (const name of PRIVATE_SERVER_SLICES) {
+    for (const suffix of ['.js', '.js.map', '.d.ts', '.d.ts.map']) {
+      fs.rmSync(path.join(serverDir, `${name}${suffix}`), { force: true });
+    }
+  }
+  console.log('[server] Private slices bundled.\n');
+}
+
 async function build() {
   console.log('Building code-agents-webcli...\n');
 
@@ -48,18 +115,10 @@ async function build() {
     ? buildInfo.sha.slice(0, 12)
     : `${buildInfo.sha ? `${buildInfo.sha.slice(0, 12)}-` : ''}${buildInfo.builtAt.replace(/[^0-9]/g, '')}`;
 
-  // 1. Compile server TypeScript
-  console.log('[server] Compiling TypeScript...');
-  try {
-    execFileSync(process.execPath, [resolveTsc(), '--project', 'tsconfig.json'], {
-      stdio: 'inherit',
-      cwd: path.join(__dirname, '..'),
-    });
-    console.log('[server] Done.\n');
-  } catch (error) {
-    console.error('[server] TypeScript compilation failed');
-    process.exit(1);
-  }
+  // 1. Compile Node/server and browser SDKs with their own platform libraries.
+  compileTypeScript('server', 'tsconfig.json');
+  await bundlePrivateServerSlices();
+  compileTypeScript('sdk/browser', 'tsconfig.sdk-browser.json');
 
   // 2. Bundle client TypeScript with esbuild
   console.log('[client] Bundling with esbuild...');

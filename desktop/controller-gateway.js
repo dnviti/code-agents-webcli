@@ -9,6 +9,7 @@ const { Readable, Transform } = require('node:stream');
 const WebSocket = require('ws');
 
 const {
+  CONTROLLER_PRODUCT_ID,
   parseQualifiedSessionId,
   qualifyAttachmentUrls,
   qualifyOwnedAttachment,
@@ -110,12 +111,8 @@ function publicCandidate(candidate) {
   for (const key of ['id', 'name', 'serverName', 'origin', 'address', 'status', 'version', 'protocolVersion', 'compatible', 'discoveredFrom']) {
     if (['string', 'number', 'boolean'].includes(typeof candidate[key])) safe[key] = candidate[key];
   }
-  if (candidate.product?.id === 'code-agents-webcli' && typeof candidate.product.name === 'string') {
-    safe.product = { id: 'code-agents-webcli', name: candidate.product.name };
-  }
-  if (Array.isArray(candidate.capabilities)) {
-    safe.capabilities = candidate.capabilities.filter((value) => typeof value === 'string');
-  }
+  if (candidate.product?.id === CONTROLLER_PRODUCT_ID && typeof candidate.product.name === 'string') safe.product = { id: CONTROLLER_PRODUCT_ID, name: candidate.product.name };
+  if (Array.isArray(candidate.capabilities)) safe.capabilities = candidate.capabilities.filter((value) => typeof value === 'string');
   return safe;
 }
 

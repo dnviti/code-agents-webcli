@@ -26,18 +26,23 @@ const {
 describe('Electron desktop helpers', function () {
   it('keeps the Electron renderer isolated and packaging targets complete', function () {
     const main = fs.readFileSync(path.join(__dirname, '..', 'desktop', 'main.js'), 'utf8');
+    const navigation = fs.readFileSync(
+      path.join(__dirname, '..', 'desktop', 'renderer-session-policy.js'),
+      'utf8',
+    );
     const builder = fs.readFileSync(path.join(__dirname, '..', 'electron-builder.yml'), 'utf8');
     assert.match(main, /nodeIntegration:\s*false/);
     assert.match(main, /contextIsolation:\s*true/);
     assert.match(main, /sandbox:\s*true/);
     assert.match(main, /webSecurity:\s*true/);
-    assert.match(main, /setWindowOpenHandler/);
+    assert.match(navigation, /setWindowOpenHandler/);
+    assert.match(main, /protectNavigation\(mainWindow, controllerOrigin\)/);
     const rendererPolicy = fs.readFileSync(
       path.join(__dirname, '..', 'desktop', 'renderer-session-policy.js'),
       'utf8',
     );
     assert.match(rendererPolicy, /setPermissionRequestHandler/);
-    assert.match(main, /will-redirect/);
+    assert.match(navigation, /will-redirect/);
     assert.match(
       main,
       /if \(app\.isPackaged && app\.commandLine\.hasSwitch\('no-sandbox'\)\) \{[\s\S]{0,160}throw new Error\([\s\S]{0,160}refuses to run without Chromium sandboxing/,
@@ -231,6 +236,10 @@ describe('Electron desktop helpers', function () {
 
   it('owns phone sharing in the desktop lifecycle without starting it implicitly', function () {
     const main = fs.readFileSync(path.join(__dirname, '..', 'desktop', 'main.js'), 'utf8');
+    const smoke = fs.readFileSync(
+      path.join(__dirname, '..', 'desktop', 'packaged-smoke-runner.js'),
+      'utf8',
+    );
     assert.match(main, /createPhoneAccessService\(\{[\s\S]*localAvailable:\s*false/);
     assert.match(main, /startControllerGateway\(\{[\s\S]*gatewayOptions:\s*\{[\s\S]*phoneAccess:\s*phoneAccessService/);
     const gatewayReady = main.indexOf('await startControllerGateway');
@@ -242,13 +251,13 @@ describe('Electron desktop helpers', function () {
     'auth, runtime, and renderer policy install only after the final gateway binds');
     assert.match(main, /attachLocal\([\s\S]*setLocalAvailable\(true\)/);
     assert.match(main, /reportLocalFailure\([\s\S]*setLocalAvailable\(false/);
-    assert.match(main, /DESKTOP_PHONE_ACCESS_SMOKE_OK off-start-stop-port-released/);
+    assert.match(smoke, /DESKTOP_PHONE_ACCESS_SMOKE_OK off-start-stop-port-released/);
     assert.match(main, /desktopUpdateBusy\(\) && !updateQuitAuthorized/);
     assert.match(main, /beforeInstall: authorizeDesktopUpdateQuit/);
     assert.match(main, /afterInstallFailure: revokeDesktopUpdateQuit/);
     assert.match(main, /nativeAutoUpdater/);
-    assert.match(main, /service\.status\(\)\.state !== 'off'/);
-    assert.match(main, /probe\.listen\(\{ host: '127\.0\.0\.1', port: running\.port/);
+    assert.match(smoke, /service\.status\(\)\.state !== 'off'/);
+    assert.match(smoke, /probe\.listen\(\{ host: '127\.0\.0\.1', port: running\.port/);
     const phoneClose = main.indexOf("attempt('phone access'");
     const serverClose = main.indexOf("attempt('embedded server'", phoneClose);
     const controllerStop = main.indexOf("attempt('controller runtime'", phoneClose);
@@ -261,22 +270,46 @@ describe('Electron desktop helpers', function () {
   it('qualifies workspace-local binary attachments and the renderer in the packaged smoke', function () {
     const main = fs.readFileSync(path.join(__dirname, '..', 'desktop', 'main.js'), 'utf8');
     const smoke = fs.readFileSync(path.join(__dirname, '..', 'desktop', 'packaged-smoke.js'), 'utf8');
-    assert.match(main, /runPackagedWorkspacePersistenceSmoke\(\{/);
+    const runner = fs.readFileSync(
+      path.join(__dirname, '..', 'desktop', 'packaged-smoke-runner.js'),
+      'utf8',
+    );
+    assert.match(runner, /runPackagedWorkspacePersistenceSmoke\(\{/);
     assert.match(main, /baseFolder: path\.resolve\(baseFolder\)/);
-    assert.match(main, /const workingDir = started\.baseFolder/);
+    assert.match(main, /dataDir: path\.resolve\(dataDir\)/);
+    assert.match(runner, /const workingDir = started\.baseFolder/);
     assert.doesNotMatch(main, /path\.dirname\(started\.server\.database\.storageDir\)/);
+    assert.doesNotMatch(runner, /started\.server\.database/);
     assert.match(
       main,
       /fs\.realpathSync\(fs\.mkdtempSync\(path\.join\(os\.homedir\(\), '\.cc-web-electron-smoke-'\)\)\)/,
       'the packaged smoke workspace must be visible to host processes launched through Flatpak',
     );
-    assert.match(main, /runPackagedRendererSmoke\(started/);
-    assert.match(main, /DESKTOP_WORKSPACE_ATTACHMENT_SMOKE_OK/);
-    assert.match(main, /DESKTOP_PACKAGED_RENDERER_SMOKE_OK/);
+    assert.match(runner, /runPackagedRendererSmoke\(started/);
+    assert.match(runner, /protectNavigation\(win, started\.url\)/);
+    assert.match(runner, /DESKTOP_WORKSPACE_ATTACHMENT_SMOKE_OK/);
+    assert.match(runner, /DESKTOP_PACKAGED_RENDERER_SMOKE_OK/);
     assert.ok(
-      main.indexOf('DESKTOP_WORKSPACE_ATTACHMENT_SMOKE_OK') < main.indexOf('DESKTOP_SMOKE_OK'),
+      runner.indexOf('DESKTOP_WORKSPACE_ATTACHMENT_SMOKE_OK') < runner.indexOf('DESKTOP_SMOKE_OK'),
       'the final packaged marker must follow the workspace persistence assertion',
     );
+    assert.match(main, /\.\.\/dist\/sdk\/node\/index\.js/);
+    assert.ok(main.indexOf("require('./controller-protocol.js')") === -1);
+    assert.ok(main.indexOf("require('./controller-catalog.js')") > main.indexOf('async function boot()'));
+    assert.ok(main.indexOf("require('./packaged-smoke-runner.js')") > main.indexOf('async function boot()'));
+    assert.doesNotMatch(main, /server\.runSetupIfNeeded\(\)/);
+    assert.match(main, /const listener = await server\.start\(\)/);
+    assert.match(main, /const url = server\.localUrl/);
+    assert.match(main, /const auth = server\.desktopAuthCookie/);
+    assert.ok(
+      main.indexOf("qualification.js').qualificationTools().ptySource()") < main.indexOf('createCodeAgentsServer({'),
+      'the packaged PTY must be qualified before the embedded server is constructed',
+    );
+    assert.match(runner, /\.\.\/dist\/sdk\/node\/qualification\.js/);
+    assert.match(runner, /implementationForQualification\(started\.server\)/);
+    assert.match(runner, /qualificationTools\(\)/);
+    assert.doesNotMatch(main, /\.\.\/dist\/server\//);
+    assert.doesNotMatch(runner, /\.\.\/dist\/server\//);
     assert.match(smoke, /\/api\/sessions\/create/);
     assert.match(smoke, /chat-attachments\?name=packaged-smoke\.bin/);
     assert.match(smoke, /chatStore\.append\(session/);

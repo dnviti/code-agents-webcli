@@ -2,7 +2,13 @@ const assert = require('assert');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const { ClaudeCodeWebServer } = require('../dist/server/index.js');
+const serverModule = require('../dist/server/index.js');
+const {
+  ClaudeCodeWebServer,
+  applyChatLifecycle,
+  probeLaunchedAgentVersion,
+  startServer,
+} = serverModule;
 
 describe('Server Aliases', function() {
   const fixtures = [];
@@ -16,6 +22,36 @@ describe('Server Aliases', function() {
     for (const fixture of fixtures.splice(0)) {
       await fixture.server.shutdown();
       fs.rmSync(fixture.dataDir, { recursive: true, force: true });
+    }
+  });
+
+  it('keeps the split implementation transparent to the public prototype', function() {
+    assert.deepStrictEqual(Object.keys(serverModule), [
+      'ClaudeCodeWebServer',
+      'probeLaunchedAgentVersion',
+      'applyChatLifecycle',
+      'startServer',
+    ]);
+    assert.strictEqual(ClaudeCodeWebServer.length, 0);
+    assert.strictEqual(probeLaunchedAgentVersion.length, 3);
+    assert.strictEqual(applyChatLifecycle.length, 3);
+    assert.strictEqual(startServer.length, 1);
+    const prototype = ClaudeCodeWebServer.prototype;
+    assert.strictEqual(Object.getPrototypeOf(prototype), Object.prototype);
+    for (const member of ['localUrl', 'desktopAuthCookie', 'shutdown', 'runSetupIfNeeded', 'start', 'close']) {
+      assert.ok(Object.hasOwn(prototype, member), `${member} must remain on the public prototype`);
+    }
+    for (const specifier of [
+      'code-agents-webcli/dist/server/server-core.js',
+      'code-agents-webcli/dist/server/server-core',
+      'code-agents-webcli/dist/server/Server-core.js',
+      'code-agents-webcli/Dist/server/server-core.js',
+      'code-agents-webcli/dist/Server/server-functions',
+    ]) {
+      assert.throws(
+        () => require(specifier),
+        (error) => error?.code === 'MODULE_NOT_FOUND',
+      );
     }
   });
 

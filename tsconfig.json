@@ -15,6 +15,11 @@
     "sourceMap": true,
     "moduleResolution": "node16"
   },
-  "include": ["src/server/**/*.ts", "src/shared/**/*.ts"],
+  "include": [
+    "src/server/**/*.ts",
+    "src/shared/**/*.ts",
+    "src/sdk/contracts/**/*.ts",
+    "src/sdk/node/**/*.ts"
+  ],
   "exclude": ["node_modules", "dist", "src/client", "src/public", "test"]
 }

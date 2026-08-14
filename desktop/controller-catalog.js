@@ -6,6 +6,7 @@
 const crypto = require('node:crypto');
 const fs = require('node:fs');
 const path = require('node:path');
+const { CONTROLLER_PRODUCT_ID } = require('../dist/sdk/contracts/controller.js');
 
 const SCHEMA_VERSION = 1;
 const FRIENDLY_NAME_MAX_LENGTH = 120;
@@ -99,7 +100,7 @@ function sanitizeServerIdentity(identity, origin) {
     return null;
   }
   if (
-    product?.id !== 'code-agents-webcli'
+    product?.id !== CONTROLLER_PRODUCT_ID
     || typeof product.name !== 'string'
     || typeof identity.version !== 'string'
     || !Number.isInteger(identity.protocolVersion)
@@ -111,7 +112,7 @@ function sanitizeServerIdentity(identity, origin) {
     return null;
   }
   return {
-    product: { id: 'code-agents-webcli', name: product.name.slice(0, 80) },
+    product: { id: CONTROLLER_PRODUCT_ID, name: product.name.slice(0, 80) },
     version: identity.version.slice(0, 80),
     protocolVersion: identity.protocolVersion,
     capabilities: [...new Set(identity.capabilities.map((value) => value.slice(0, 80)))],

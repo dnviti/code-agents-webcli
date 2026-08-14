@@ -32,11 +32,45 @@ express ──▶ auth/settings/projects/usage ──▶ global app.sqlite
 | `src/server/bridges/` | One per runtime. Finds the CLI, builds its argv, owns its pseudo-terminal. |
 | `src/server/chat/` | The headless [WebUI](runtimes.md#the-webui-beta) surface: per-CLI protocol adapters, event store, permission broker. |
 | `src/server/services/` | Everything else: auth, database, TLS, scrollback, history, pastes, updates, profiles. |
+| `src/sdk/contracts/` | Platform-neutral wire contracts: qualified session IDs, attachment ownership and controller message rewriting. |
+| `src/sdk/browser/` | Browser controller client and renderer-safe target/status types. |
+| `src/sdk/node/` | Narrow server lifecycle used by Node hosts; stores and databases are absent from its supported surface. |
 | `src/client/` | Browser TypeScript. `shell/` is the React UI, `terminal/` is the xterm layer. |
 | `src/shared/` | Types and logic used by both sides — protocol events, update copy, profile validation. |
 | `src/public/` | Static HTML, CSS, manifest, service worker. |
 | `scripts/build.js` | The whole build. |
 | `test/` | Mocha, no network, no real CLIs. |
+
+## Reusable SDK and host boundaries
+
+The npm package exposes three supported SDK entry points:
+
+| Import | Runtime | Purpose |
+| --- | --- | --- |
+| `code-agents-webcli/sdk/contracts` | Browser or Node | Pure controller/session/attachment codecs. |
+| `code-agents-webcli/sdk/browser` | Browser | Controller state, requests and renderer-safe public models. |
+| `code-agents-webcli/sdk/node` | Node | `createCodeAgentsServer()` and its setup/start/shutdown lifecycle. |
+
+The web CLI and Electron app are hosts built on the Node SDK. Electron serves
+the same compiled React bundle as the web app and places its controller gateway
+under that bundle, so extracting the host lifecycle does not fork or duplicate
+the UI.
+
+```text
+contracts  ◀── browser SDK ◀── React web/desktop bundle
+    ▲
+    └────── Node SDK ◀────── cc-web CLI
+                  └───────── Electron local-server host
+```
+
+Imports are one-way: contracts contain no Node, DOM, React, Express or Electron
+dependency; the browser SDK may use Web APIs but not server or desktop modules;
+the Node SDK may compose server internals but never Electron. OAuth partitions,
+certificate approval, loopback secrets, updater policy and native-window state
+remain desktop adapters rather than portable SDK policy. The package root and
+legacy deep server/shared JavaScript imports remain resolvable for compatibility; they are
+not a security boundary or new supported SDK surface. New applications should
+use the three SDK subpaths above.
 
 ## The two platform bindings
 
@@ -57,7 +91,7 @@ into an empty prefix on a clean runner.
 
 `npm run build` does four things:
 
-1. `tsc` compiles `src/server` and `src/shared` to `dist/`.
+1. `tsc` compiles `src/server`, `src/shared` and the SDK entry points to `dist/`.
 2. esbuild bundles `src/client` into `dist/public/app.bundle.js`.
 3. esbuild bundles Mermaid into its own chunk, loaded only when a message
    actually contains a diagram. It is bundled rather than pulled from a CDN

@@ -4,6 +4,23 @@
   "description": "Multiuser web CLI for Claude Code, Codex, and terminal sessions",
   "desktopName": "io.github.dnviti.code-agents-webcli.desktop",
   "main": "dist/server/index.js",
+  "types": "dist/server/index.d.ts",
+  "exports": {
+    ".": "./dist/server/index.js",
+    "./sdk/contracts": "./dist/sdk/contracts/index.js",
+    "./sdk/contracts/controller": "./dist/sdk/contracts/controller.js",
+    "./sdk/browser": "./dist/sdk/browser/index.js",
+    "./sdk/node": "./dist/sdk/node/index.js",
+    "./dist/server": "./dist/server/index.js",
+    "./dist/server/routes": "./dist/server/routes/index.js",
+    "./dist/server/services/environments": "./dist/server/services/environments/index.js",
+    "./dist/server/*.js": "./dist/server/*.js",
+    "./dist/server/*": "./dist/server/*.js",
+    "./dist/shared/*.js": "./dist/shared/*.js",
+    "./dist/shared/*": "./dist/shared/*.js",
+    "./package.json": "./package.json",
+    "./*": "./*"
+  },
   "bin": {
     "code-agents-webcli": "bin/cc-web.js",
     "cc-web": "bin/cc-web.js"

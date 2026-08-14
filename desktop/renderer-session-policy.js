@@ -1,6 +1,7 @@
 'use strict';
 
-const { desktopPermissionAllowed } = require('./lib.js');
+const { shell } = require('electron');
+const { desktopPermissionAllowed, isSafeExternalUrl } = require('./lib.js');
 
 /**
  * Permissions granted to the desktop renderer.
@@ -23,7 +24,29 @@ function installRendererSessionPolicy(ses, trustedOrigin) {
   });
 }
 
+function protectNavigation(win, origin) {
+  const openExternal = (url) => {
+    if (isSafeExternalUrl(url, origin)) void shell.openExternal(url);
+  };
+  win.webContents.setWindowOpenHandler(({ url }) => {
+    openExternal(url);
+    return { action: 'deny' };
+  });
+  const keepInsideOrigin = (event, url) => {
+    try {
+      if (new URL(url).origin === origin) return;
+    } catch {
+      // Rejected below.
+    }
+    event.preventDefault();
+    openExternal(url);
+  };
+  win.webContents.on('will-navigate', keepInsideOrigin);
+  win.webContents.on('will-redirect', keepInsideOrigin);
+}
+
 module.exports = {
   installRendererSessionPolicy,
+  protectNavigation,
   rendererPermissionAllowed,
 };
