@@ -14,5 +14,7 @@ export class ProjectManager extends ProjectManagerComposition {}
 export * from './manager/manager-types.js';
 export type {
   ProjectSessionFileCommand,
+  ProjectSessionFileProcess,
   ProjectSessionProcessRecovery,
+  UnverifiedProjectFileProcessError,
 } from './working-dir.js';
