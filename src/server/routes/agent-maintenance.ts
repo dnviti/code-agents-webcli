@@ -2,7 +2,7 @@
 import { Request, Response, Router } from 'express';
 import { AGENT_MAINTENANCE_IDS, AgentMaintenanceId } from '../../shared/agent-maintenance.js';
 import { requireUser } from './helpers.js';
-import type { AgentMaintenanceService, AgentMaintenanceTarget } from '../services/agent-maintenance.js';
+import type { AgentMaintenanceService, AgentMaintenanceTarget } from '../services/runtime/agents/agent-maintenance.js';
 
 export interface AgentMaintenanceRoutesDeps {
   maintenance: AgentMaintenanceService;

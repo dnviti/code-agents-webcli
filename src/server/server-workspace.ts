@@ -3,11 +3,11 @@ import path from 'node:path';
 import { createHash } from 'node:crypto';
 
 import { SessionRecord, SessionStorageScope } from './types.js';
-import { canonicalExistingRoot } from './services/workspace-catalog.js';
+import { canonicalExistingRoot } from './services/workspace/catalog/workspace-catalog.js';
 import {
   closeWorkspaceSessionDirectoryLeasesForScope,
   openWorkspaceStorageDirectorySync,
-} from './services/workspace-session-storage.js';
+} from './services/workspace/session/workspace-session-storage.js';
 import { type Project } from './services/projects/store.js';
 import { type ProjectWorkspaceReplacementAuthority } from './services/projects/manager.js';
 import {

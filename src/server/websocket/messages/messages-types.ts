@@ -7,9 +7,9 @@ import {
   SessionStorageScope,
   WebSocketInfo,
 } from '../../types.js';
-import { TranscriptStoreLike } from '../../services/transcript-store.js';
-import { HistoryStoreLike } from '../../services/history-store.js';
-import { AccountTabCoordinatorLike } from '../../services/account-tab-coordinator.js';
+import { TranscriptStoreLike } from '../../services/workspace/artifacts/transcript-store.js';
+import { HistoryStoreLike } from '../../services/workspace/artifacts/history-store.js';
+import { AccountTabCoordinatorLike } from '../../services/identity/account-tab-coordinator.js';
 import { ChatAttachment, BuiltInWorkflowId } from '../../../shared/chat-events.js';
 import { UserPreferences } from '../../../shared/user-preferences.js';
 import { UserEnvironment } from '../../services/environments/types.js';

@@ -1,6 +1,6 @@
 import express, { NextFunction, Request, Response, Router } from 'express';
 import { PathValidation, SessionRecord } from '../types.js';
-import { DEFAULT_MAX_BYTES, PasteStoreLike } from '../services/paste-store.js';
+import { DEFAULT_MAX_BYTES, PasteStoreLike } from '../services/workspace/artifacts/paste-store.js';
 import { getOwnedSession, requireUser } from './helpers.js';
 
 export const PASTE_MAX_BYTES = DEFAULT_MAX_BYTES;

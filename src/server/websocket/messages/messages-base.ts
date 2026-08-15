@@ -1,6 +1,6 @@
 import path from 'node:path';
 import { SessionRecord, AgentKind } from '../../types.js';
-import { ScrollbackRecorder } from '../../services/scrollback.js';
+import { ScrollbackRecorder } from '../../services/runtime/terminal/scrollback.js';
 import { announceSessionActivity } from '../handler.js';
 import { UserEnvironment } from '../../services/environments/types.js';
 import { HostEnvironment } from '../../services/environments/manager.js';

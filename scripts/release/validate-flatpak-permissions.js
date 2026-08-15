@@ -4,7 +4,7 @@ const fs = require('node:fs');
 
 const [previousPath, currentPath, releaseTag, updaterBridgeTag] = process.argv.slice(2);
 if (!previousPath || !currentPath || !releaseTag) {
-  throw new Error('Usage: node scripts/validate-flatpak-permissions.js PREVIOUS CURRENT RELEASE_TAG [UPDATER_BRIDGE_TAG]');
+  throw new Error('Usage: node scripts/release/validate-flatpak-permissions.js PREVIOUS CURRENT RELEASE_TAG [UPDATER_BRIDGE_TAG]');
 }
 
 function finishArgs(filename) {

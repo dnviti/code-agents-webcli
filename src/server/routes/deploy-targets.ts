@@ -23,7 +23,7 @@ import {
   caveatsFor,
   mergeHostSecret,
   mergeKubernetesSecret,
-} from '../services/deploy-targets.js';
+} from '../services/projects/deployment/deploy-targets.js';
 import { ContainerConfig, ContainerEngineKind } from '../services/environments/types.js';
 import { EnvironmentEngine } from '../services/environments/engine.js';
 import { TARGET_LABEL, targetLabelValue } from '../services/environments/naming.js';

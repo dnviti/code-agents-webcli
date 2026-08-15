@@ -73,8 +73,8 @@ So:
   and Mermaid are bundled at build time and never loaded at runtime; shipping
   them as runtime dependencies added ~150 MB to every install for nothing.
   `@xterm/headless` is the exception — the server actually runs it.
-- The two platform bindings are isolated in `src/server/services/pty.ts` and
-  `src/server/services/sqlite.ts`. Change them there, not at the call sites.
+- The two platform bindings are isolated in `src/server/services/runtime/terminal/pty.ts` and
+  `src/server/services/persistence/app/sqlite.ts`. Change them there, not at the call sites.
 
 Run `npm run verify:install` before touching anything in `package.json`,
 `scripts/build.js`, or those two modules.

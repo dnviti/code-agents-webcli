@@ -3,7 +3,7 @@ import path from 'node:path';
 import {
   workspaceSessionAccessDirectory,
   workspaceSessionDirectory,
-} from '../../services/workspace-session-storage.js';
+} from '../../services/workspace/session/workspace-session-storage.js';
 import {
   appendSessionFile,
   openSessionFileForRead,
@@ -12,7 +12,7 @@ import {
   replaceSessionFile,
   statSessionFile,
   truncateSessionFile,
-} from '../../services/safe-session-file.js';
+} from '../../services/workspace/artifacts/safe-session-file.js';
 import {
   AccountLimits,
   ChatCapabilities,

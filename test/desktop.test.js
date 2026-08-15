@@ -70,7 +70,7 @@ describe('Electron desktop helpers', function () {
       'utf8',
     );
     const ciSandbox = fs.readFileSync(
-      path.join(__dirname, '..', 'scripts', 'configure-ci-electron-sandbox.sh'),
+      path.join(__dirname, '..', 'scripts', 'ci', 'configure-ci-electron-sandbox.sh'),
       'utf8',
     );
     const attachmentRunner = fs.readFileSync(
@@ -80,28 +80,28 @@ describe('Electron desktop helpers', function () {
     const browserRunner = fs.readFileSync(path.join(__dirname, 'browser', 'run.js'), 'utf8');
     const pkg = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8'));
     assert.strictEqual(
-      (ci.match(/bash scripts\/configure-ci-electron-sandbox\.sh/g) || []).length,
+      (ci.match(/bash scripts\/ci\/configure-ci-electron-sandbox\.sh/g) || []).length,
       1,
       'ordinary CI configures its Electron helper exactly once',
     );
     assert.strictEqual(
-      (release.match(/bash scripts\/configure-ci-electron-sandbox\.sh/g) || []).length,
+      (release.match(/bash scripts\/ci\/configure-ci-electron-sandbox\.sh/g) || []).length,
       2,
       'tag CI configures both its verify and Linux desktop helpers',
     );
     for (const workflow of [ci, release]) {
-      assert.match(workflow, /bash scripts\/configure-ci-electron-sandbox\.sh/);
+      assert.match(workflow, /bash scripts\/ci\/configure-ci-electron-sandbox\.sh/);
     }
     const ciInstall = ci.indexOf('run: npm ci');
-    const ciConfigure = ci.indexOf('run: bash scripts/configure-ci-electron-sandbox.sh');
+    const ciConfigure = ci.indexOf('run: bash scripts/ci/configure-ci-electron-sandbox.sh');
     const ciTest = ci.indexOf('run: npm run test:strict');
     assert.ok(ciInstall >= 0 && ciInstall < ciConfigure && ciConfigure < ciTest,
       'ordinary CI configures the helper after install and before tests');
 
     const releaseVerify = release.slice(release.indexOf('\n  verify:'), release.indexOf('\n  docker:'));
     assert.ok(
-      releaseVerify.indexOf('run: npm ci') < releaseVerify.indexOf('run: bash scripts/configure-ci-electron-sandbox.sh')
-        && releaseVerify.indexOf('run: bash scripts/configure-ci-electron-sandbox.sh')
+      releaseVerify.indexOf('run: npm ci') < releaseVerify.indexOf('run: bash scripts/ci/configure-ci-electron-sandbox.sh')
+        && releaseVerify.indexOf('run: bash scripts/ci/configure-ci-electron-sandbox.sh')
           < releaseVerify.indexOf('run: npm run test:strict'),
       'tag verification configures the helper after install and before tests',
     );
@@ -295,7 +295,7 @@ describe('Electron desktop helpers', function () {
     );
     assert.match(main, /\.\.\/dist\/sdk\/node\/index\.js/);
     assert.ok(main.indexOf("require('./controller-protocol.js')") === -1);
-    assert.ok(main.indexOf("require('./controller-catalog.js')") > main.indexOf('async function boot()'));
+    assert.ok(main.indexOf("require('./controller/catalog.js')") > main.indexOf('async function boot()'));
     assert.ok(main.indexOf("require('./packaged-smoke-runner.js')") > main.indexOf('async function boot()'));
     assert.doesNotMatch(main, /server\.runSetupIfNeeded\(\)/);
     assert.match(main, /const listener = await server\.start\(\)/);

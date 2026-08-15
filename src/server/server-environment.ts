@@ -7,15 +7,15 @@ import {
   SessionRecord,
 } from './types.js';
 import { ServerCore } from './server-core.js';
-import { DATA_DIR_LEASE_LOST_EXIT_CODE } from './services/data-dir-lease.js';
+import { DATA_DIR_LEASE_LOST_EXIT_CODE } from './services/persistence/app/data-dir-lease.js';
 import {
   ActiveTargetResolution,
   createEngine,
   EnvironmentEngine,
 } from './services/environments/index.js';
 import { ContainerConfig, UserEnvironment } from './services/environments/types.js';
-import { agentMaintenanceExecutionKey, type AgentMaintenanceTarget } from './services/agent-maintenance.js';
-import { childProcessRunner } from './services/agent-maintenance-runtime.js';
+import { agentMaintenanceExecutionKey, type AgentMaintenanceTarget } from './services/runtime/agents/agent-maintenance.js';
+import { childProcessRunner } from './services/runtime/agents/agent-maintenance-runtime.js';
 import {
   AGENT_MAINTENANCE_IDS,
   agentCatalogEntry,

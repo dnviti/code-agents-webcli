@@ -105,7 +105,7 @@ describe('Window Controls Overlay', function () {
   it('covers startup, auth/setup/error, and offline recovery surfaces', function () {
     const index = fs.readFileSync(path.join(ROOT, 'src/public/index.html'), 'utf8');
     const relay = fs.readFileSync(path.join(ROOT, 'src/public/css/relay/relay.css'), 'utf8');
-    const auth = fs.readFileSync(path.join(ROOT, 'src/server/services/auth.ts'), 'utf8');
+    const auth = fs.readFileSync(path.join(ROOT, 'src/server/services/identity/auth.ts'), 'utf8');
     const worker = fs.readFileSync(path.join(ROOT, 'src/public/service-worker.js'), 'utf8');
     assert.match(index, /id="bootTitlebar"[\s\S]*data-window-drag="true"/);
     assert.match(relay, /data-window-controls-overlay="hidden"[^}]*boot-titlebar[^{]*\{[^}]*display: none/);

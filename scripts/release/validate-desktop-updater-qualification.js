@@ -10,7 +10,7 @@ const expectedCommit = process.argv[4];
 const assetDirectory = process.argv[5] || null;
 const feedDirectory = process.argv[6] || null;
 if (!filename || !expectedTag || !expectedCommit) {
-  throw new Error('Usage: validate-desktop-updater-qualification.js FILE TAG COMMIT');
+  throw new Error('Usage: node scripts/release/validate-desktop-updater-qualification.js FILE TAG COMMIT');
 }
 
 const fail = (message) => {

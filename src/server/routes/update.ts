@@ -1,7 +1,7 @@
 import { Router, Request, Response } from 'express';
 import { SessionRecord } from '../types.js';
-import { UpdateStatus } from '../services/update-check.js';
-import { UpdateMode, canTriggerUpdate } from '../services/self-update.js';
+import { UpdateStatus } from '../services/release/update-check.js';
+import { UpdateMode, canTriggerUpdate } from '../services/release/self-update.js';
 import { requireUser } from './helpers.js';
 
 export interface UpdateRoutesDeps {

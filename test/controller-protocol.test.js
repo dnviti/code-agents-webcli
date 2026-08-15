@@ -9,7 +9,7 @@ const {
   qualifySessionList,
   resolveClientMessage,
   splitSessionsByServer,
-} = require('../desktop/controller/protocol.js');
+} = require('../desktop/controller-protocol.js');
 
 describe('desktop controller protocol', function () {
   it('round-trips arbitrary server-local ids without allowing alternate encodings', function () {

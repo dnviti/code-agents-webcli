@@ -1,5 +1,5 @@
 import { Request, Response, Router } from 'express';
-import { UserPreferenceStore } from '../services/user-preferences.js';
+import { UserPreferenceStore } from '../services/identity/user-preferences.js';
 import { requireUser } from './helpers.js';
 
 export interface PreferenceRoutesDeps {

@@ -1,11 +1,11 @@
 import { ChatEvent } from '../../../shared/chat-events.js';
 import { ChatSessionRef, TurnCut } from '../../chat/store.js';
-import { AccountTabCoordinatorLike } from '../../services/account-tab-coordinator.js';
-import { AttachmentSessionRef, AttachmentStoreLike } from '../../services/attachment-store.js';
-import { HistoryStoreLike } from '../../services/history-store.js';
+import { AccountTabCoordinatorLike } from '../../services/identity/account-tab-coordinator.js';
+import { AttachmentSessionRef, AttachmentStoreLike } from '../../services/workspace/artifacts/attachment-store.js';
+import { HistoryStoreLike } from '../../services/workspace/artifacts/history-store.js';
 import { ProjectsSessionApi } from '../../services/projects/working-dir.js';
-import { SessionTeardownLike } from '../../services/session-teardown.js';
-import { TranscriptStoreLike } from '../../services/transcript-store.js';
+import { SessionTeardownLike } from '../../services/workspace/session/session-teardown.js';
+import { TranscriptStoreLike } from '../../services/workspace/artifacts/transcript-store.js';
 import { SessionRecord, AgentKind, BridgeInterface, PathValidation, WebSocketInfo } from '../../types.js';
 
 /** Project-aware attachment seam used only while the route owns its lifecycle gate. */

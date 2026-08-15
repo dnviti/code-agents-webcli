@@ -1,4 +1,4 @@
-import { spawn as spawnPty, IPty } from '../services/pty.js';
+import { spawn as spawnPty, IPty } from '../services/runtime/terminal/pty.js';
 import * as path from 'path';
 import * as fs from 'fs';
 import {

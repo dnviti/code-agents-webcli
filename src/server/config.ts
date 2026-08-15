@@ -1,5 +1,5 @@
 import { ServerOptions, ServerState, Aliases } from './types.js';
-import { normalizeDiscoverableAddress, normalizeServerName } from './services/server-identity.js';
+import { normalizeDiscoverableAddress, normalizeServerName } from './services/network/server-identity.js';
 
 export function createConfig(options: ServerOptions): ServerState {
   const requestedDiscoverableUrl = options.publicDiscoverableUrl

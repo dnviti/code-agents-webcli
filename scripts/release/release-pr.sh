@@ -3,17 +3,18 @@ set -euo pipefail
 
 # Prepare a release branch and open a PR.
 # Usage:
-#   BUMP=patch|minor|major scripts/release-pr.sh
+#   BUMP=patch|minor|major scripts/release/release-pr.sh
 # or:
-#   scripts/release-pr.sh --bump patch
+#   scripts/release/release-pr.sh --bump patch
 
 parse_bump() {
   local val="${BUMP:-}";
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --bump)
-        shift; val="$1";;
-        shift; val="$1"; shift;;
+        [[ $# -ge 2 ]] || { echo 'Error: --bump requires patch, minor, or major.' >&2; return 64; }
+        val="$2"; shift 2;;
+      *) echo "Error: unknown argument: $1" >&2; return 64;;
     esac
   done
   echo "${val:-patch}"

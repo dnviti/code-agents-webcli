@@ -1,6 +1,6 @@
 /** Single-writer transaction helper used by the run-limit and lease paths. */
 
-import type { SqliteDatabase } from '../../sqlite.js';
+import type { SqliteDatabase } from '../../persistence/app/sqlite.js';
 
 /**
  * `BEGIN IMMEDIATE`, commit or rollback as a unit.

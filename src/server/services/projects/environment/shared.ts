@@ -1,5 +1,5 @@
 import type { FileHandle } from 'node:fs/promises';
-import type { WorkspaceStorageIdentity } from '../../workspace-session-storage.js';
+import type { WorkspaceStorageIdentity } from '../../workspace/session/workspace-session-storage.js';
 
 export const WORKSPACE_SESSION_STORAGE = '.cc-web';
 

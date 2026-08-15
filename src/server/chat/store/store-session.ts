@@ -1,6 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { statSessionFile, unlinkSessionEntry } from '../../services/safe-session-file.js';
+import { statSessionFile, unlinkSessionEntry } from '../../services/workspace/artifacts/safe-session-file.js';
 import { CONTEXT_SUFFIX, ChatSessionRef, PLAN_SUFFIX, SESSION_ID_PATTERN } from './store-types.js';
 import { ChatStoreContext } from './store-context.js';
 

@@ -1,4 +1,4 @@
-import { openSessionFileForRead } from '../../services/safe-session-file.js';
+import { openSessionFileForRead } from '../../services/workspace/artifacts/safe-session-file.js';
 import { ChatDescription, ChatSessionRef, HEAD_SCAN_CHUNK, HEAD_SCAN_LIMIT } from './store-types.js';
 import { ChatStoreTurn } from './store-turn.js';
 

@@ -10,5 +10,5 @@ export const qualificationTools = () => ({
     get BaseBridge() { return (require('../../server/bridges/base.js') as typeof import('../../server/bridges/base.js')).BaseBridge; },
     get TerminalBridge() { return (require('../../server/bridges/terminal.js') as typeof import('../../server/bridges/terminal.js')).TerminalBridge; },
     get PermissionBroker() { return (require('../../server/chat/permission-broker.js') as typeof import('../../server/chat/permission-broker.js')).PermissionBroker; },
-    get ptySource() { return (require('../../server/services/pty.js') as typeof import('../../server/services/pty.js')).ptySource; },
+    get ptySource() { return (require('../../server/services/runtime/terminal/pty.js') as typeof import('../../server/services/runtime/terminal/pty.js')).ptySource; },
   });

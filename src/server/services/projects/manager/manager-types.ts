@@ -2,7 +2,7 @@
 
 import type { EnvironmentOwner, UserEnvironment } from '../../environments/types.js';
 import type { EnvironmentManager } from '../../environments/manager.js';
-import type { DeployTargetStore } from '../../deploy-targets.js';
+import type { DeployTargetStore } from '../deployment/deploy-targets.js';
 import type { FetchLike } from '../clone.js';
 import type {
   ProjectContainerAccess,

@@ -12,13 +12,13 @@ import { isChatAttachmentUploadRequest } from './routes/chat-attachments.js';
 import { PromptSession } from './setup/prompts.js';
 import { runRunModeWizard } from './setup/wizard.js';
 import { INSTALL_COMMAND } from '../shared/update.js';
-import { closeWorkspaceSessionDirectoryLeases } from './services/workspace-session-storage.js';
-import { closeWorkspaceCwdHelpers } from './services/workspace-cwd-helper.js';
-import { registerServerIdentityRoute } from './services/server-identity.js';
-import { readCachedClaudeAccount } from './services/claude-account.js';
-import { DESKTOP_AUTH_COOKIE_NAME } from './services/auth.js';
+import { closeWorkspaceSessionDirectoryLeases } from './services/workspace/session/workspace-session-storage.js';
+import { closeWorkspaceCwdHelpers } from './services/workspace/session/io/workspace-cwd-helper.js';
+import { registerServerIdentityRoute } from './services/network/server-identity.js';
+import { readCachedClaudeAccount } from './services/identity/claude-account.js';
+import { DESKTOP_AUTH_COOKIE_NAME } from './services/identity/auth.js';
 import { createEngine } from './services/environments/index.js';
-import { ensureCertificates, createHttpsOnlyPort, caCertificateHandler } from './services/tls.js';
+import { ensureCertificates, createHttpsOnlyPort, caCertificateHandler } from './services/network/tls.js';
 import { ServerRuntime } from './server-runtime.js';
 
 export abstract class ServerLifecycle extends ServerRuntime {

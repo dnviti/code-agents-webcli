@@ -1,10 +1,10 @@
 import { Request, Response, Router } from 'express';
-import { RuntimeProfileStore } from '../services/runtime-profiles.js';
+import { RuntimeProfileStore } from '../services/runtime/profiles/runtime-profiles.js';
 import {
   TierWriterContext,
   applyTiers,
   tierCapableRuntimes,
-} from '../services/tier-writer.js';
+} from '../services/runtime/profiles/tier-writer.js';
 import { requireUser } from './helpers.js';
 
 export interface ProfileRoutesDeps {

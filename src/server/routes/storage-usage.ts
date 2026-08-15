@@ -2,8 +2,8 @@
 
 import { Request, Response, Router } from 'express';
 import type { AuthenticatedUser } from '../types.js';
-import type { StorageCacheAction, StorageUsageReport } from '../services/storage-usage.js';
-import { STORAGE_CACHE_ACTIONS } from '../services/storage-usage.js';
+import type { StorageCacheAction, StorageUsageReport } from '../services/storage/storage-usage.js';
+import { STORAGE_CACHE_ACTIONS } from '../services/storage/storage-usage.js';
 import { requireUser } from './helpers.js';
 
 export interface AdminStorageUsage {

@@ -350,7 +350,7 @@ describe('sqlite adapter', function () {
       // threw `RangeError: Missing named parameter`; the builtin quietly writes
       // NULL. Dropping a field from a row literal is therefore no longer caught
       // at the boundary — see the note at the top of
-      // src/server/services/sqlite.ts.
+      // src/server/services/persistence/app/sqlite.ts.
       db.prepare('INSERT INTO items (id, name) VALUES (@id, @name)').run({ id: 3 });
       assert.strictEqual(db.prepare('SELECT name FROM items WHERE id = 3').get().name, null);
     });

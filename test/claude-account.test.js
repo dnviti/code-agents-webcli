@@ -184,7 +184,7 @@ describe('the Claude CLI config reader', function () {
     assert.ok(!serialised.includes('sekrit'));
 
     const source = fs.readFileSync(
-      path.join(__dirname, '..', 'src', 'server', 'services', 'claude-account.ts'),
+      path.join(__dirname, '..', 'src', 'server', 'services', 'identity', 'claude-account.ts'),
       'utf8',
     );
     // Named only inside the comment that explains why it is never read.

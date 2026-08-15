@@ -113,7 +113,7 @@ describe('Node SDK server facade', function () {
       qualification.qualificationTools();
       if (loaded.length) throw new Error('qualification entry eagerly loaded: ' + loaded.join(','));
       qualification.qualificationTools().ptySource;
-      if (!loaded.includes('../../server/services/pty.js')) throw new Error('PTY was not loaded');
+      if (!loaded.includes('../../server/services/runtime/terminal/pty.js')) throw new Error('PTY was not loaded');
       if (loaded.some((request) => request.includes('server/index'))) throw new Error('server loaded before desktop setup');
     `;
     execFileSync(process.execPath, ['-e', script]);

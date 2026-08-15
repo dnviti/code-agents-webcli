@@ -7,7 +7,7 @@ import { languageForFile } from '../../shared/file-language.js';
 import { rankFilePaths } from '../../shared/file-match.js';
 import { looksLikeSvg, sniffMediaType } from '../../shared/media-sniff.js';
 import { PathValidation, SessionRecord } from '../types.js';
-import { isWorkspacePrivatePath } from '../services/workspace-private-path.js';
+import { isWorkspacePrivatePath } from '../services/workspace/catalog/workspace-private-path.js';
 import { parseGitStatus, parseUnifiedDiff } from '../../shared/git-status.js';
 import {
   crossReferencesOf,
@@ -23,7 +23,7 @@ import { UserEnvironment } from '../services/environments/types.js';
 import { HostEnvironment } from '../services/environments/manager.js';
 import { accountReportingNote } from '../../shared/account-reporting.js';
 import type { UsageBurn } from '../../shared/usage-records.js';
-import type { CachedClaudeAccount } from '../services/claude-account.js';
+import type { CachedClaudeAccount } from '../services/identity/claude-account.js';
 import {
   releaseProjectSessionLease,
   registerUnverifiedProjectProcess,

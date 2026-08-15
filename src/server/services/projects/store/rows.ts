@@ -1,6 +1,6 @@
 /** Row-shape interfaces, row→domain mappers, and small setting/credential helpers. */
 
-import type { AppDatabase } from '../../database.js';
+import type { AppDatabase } from '../../persistence/app/database.js';
 import type {
   BuildEvent,
   CompositionInstallation,

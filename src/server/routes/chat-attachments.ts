@@ -5,7 +5,7 @@ import {
   AttachmentStoreLike,
   DEFAULT_MAX_ATTACHMENT_BYTES,
   attachmentUrlFor,
-} from '../services/attachment-store.js';
+} from '../services/workspace/artifacts/attachment-store.js';
 import { getOwnedSession, requireUser } from './helpers.js';
 
 /**

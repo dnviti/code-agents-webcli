@@ -1,5 +1,5 @@
 import { Router } from 'express';
-import { AccountTabCoordinator } from '../services/account-tab-coordinator.js';
+import { AccountTabCoordinator } from '../services/identity/account-tab-coordinator.js';
 import type { SessionRoutesDeps } from './sessions/sessions-common.js';
 import {
   handlePersistence,

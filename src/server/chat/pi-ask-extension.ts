@@ -36,7 +36,7 @@ import {
   SUBMIT_PLAN_TOOL,
   SUBMIT_PLAN_TOOL_DESCRIPTION,
 } from '../../shared/chat-events.js';
-import { MANAGED_MARKER } from '../services/tier-writer.js';
+import { MANAGED_MARKER } from '../services/runtime/profiles/tier-writer.js';
 import { FILE_CALLBACK_GENERATED_CLIENT_SOURCE } from './file-callback.js';
 
 /** Where the extension is written, relative to the session's working directory. */

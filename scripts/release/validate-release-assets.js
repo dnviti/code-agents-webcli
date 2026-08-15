@@ -9,10 +9,10 @@ const [directory, ...argumentsAfterDirectory] = process.argv.slice(2);
 const unsignedArguments = argumentsAfterDirectory.filter((argument) => argument === '--unsigned');
 const versionArguments = argumentsAfterDirectory.filter((argument) => argument !== '--unsigned');
 if (!directory || unsignedArguments.length > 1 || versionArguments.length > 1) {
-  throw new Error('Usage: node scripts/validate-release-assets.js DIRECTORY [VERSION] [--unsigned]');
+  throw new Error('Usage: node scripts/release/validate-release-assets.js DIRECTORY [VERSION] [--unsigned]');
 }
 const unsigned = unsignedArguments.length === 1;
-const version = versionArguments[0] || require('../package.json').version;
+const version = versionArguments[0] || require('../../package.json').version;
 const fail = (message) => { throw new Error(`Release asset validation failed: ${message}`); };
 const escapedVersion = version.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 

@@ -1,6 +1,6 @@
 import { ChatEvent } from '../../../shared/chat-events.js';
-import { AttachmentSessionRef, AttachmentStoreLike, storedAttachmentNameFromUrl } from '../../services/attachment-store.js';
-import { SessionTeardownContext } from '../../services/session-teardown.js';
+import { AttachmentSessionRef, AttachmentStoreLike, storedAttachmentNameFromUrl } from '../../services/workspace/artifacts/attachment-store.js';
+import { SessionTeardownContext } from '../../services/workspace/session/session-teardown.js';
 import { SessionRecord } from '../../types.js';
 import { announceSessionClosed } from '../../websocket/handler.js';
 import { SessionRoutesDeps, SessionRouteCoordination, coordinationFor, ProjectBranchAttachmentStoreLike } from './sessions-common.js';

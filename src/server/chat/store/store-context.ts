@@ -3,12 +3,12 @@ import path from 'node:path';
 import {
   ensureWorkspaceSessionDirectory,
   workspaceSessionFileParentLease,
-} from '../../services/workspace-session-storage.js';
+} from '../../services/workspace/session/workspace-session-storage.js';
 import {
   openSessionFileForRead,
   replaceSessionFile,
   unlinkSessionEntry,
-} from '../../services/safe-session-file.js';
+} from '../../services/workspace/artifacts/safe-session-file.js';
 import { PlanDocument } from '../../../shared/chat-events.js';
 import { CONTEXT_SUFFIX, ChatSessionRef, PLAN_SUFFIX } from './store-types.js';
 import { ChatStoreDescribe } from './store-describe.js';

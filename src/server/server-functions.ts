@@ -4,7 +4,7 @@ import {
   childProcessRunner,
   safeProcessEnvironment,
   type AgentCommandRunner,
-} from './services/agent-maintenance-runtime.js';
+} from './services/runtime/agents/agent-maintenance-runtime.js';
 import type { UserEnvironment } from './services/environments/types.js';
 
 /** Probe exactly the launch executable without inheriting server/provider secrets. */

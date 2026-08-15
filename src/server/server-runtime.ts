@@ -11,9 +11,9 @@ import {
   applyTiers,
   supportsTiers,
   tierCapableRuntimes,
-} from './services/tier-writer.js';
+} from './services/runtime/profiles/tier-writer.js';
 import { type SessionRoutesDeps } from './routes/sessions.js';
-import { detectUpdateMode, type UpdateModeResult } from './services/self-update.js';
+import { detectUpdateMode, type UpdateModeResult } from './services/release/self-update.js';
 import { sendToUser } from './websocket/handler.js';
 import { ServerWorkspace } from './server-workspace.js';
 

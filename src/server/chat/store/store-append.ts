@@ -3,7 +3,7 @@ import path from 'node:path';
 import {
   ensureWorkspaceSessionDirectory,
   workspaceSessionFileParentLease,
-} from '../../services/workspace-session-storage.js';
+} from '../../services/workspace/session/workspace-session-storage.js';
 import {
   appendSessionFile,
   openSessionFileForRead,
@@ -12,7 +12,7 @@ import {
   statSessionFile,
   truncateSessionFile,
   writePreparedSessionFile,
-} from '../../services/safe-session-file.js';
+} from '../../services/workspace/artifacts/safe-session-file.js';
 import { ChatEvent, ChatCapabilities, ChatUsage } from '../../../shared/chat-events.js';
 import { foldCapabilities, foldSessionUsage } from '../../../shared/chat-reducer.js';
 import { openTurnAfter } from '../../../shared/turn-boundaries.js';

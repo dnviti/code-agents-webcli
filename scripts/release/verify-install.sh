@@ -17,7 +17,7 @@
 #   2. anything in the tree needing to be compiled,
 #   3. the installed package not actually starting.
 #
-# Usage: scripts/verify-install.sh [--keep]
+# Usage: scripts/release/verify-install.sh [--keep]
 set -euo pipefail
 
 # `npm run` exports the caller's npm config as environment variables. Do not
@@ -25,7 +25,7 @@ set -euo pipefail
 # the nested, deliberately unapproved install below.
 unset npm_config_allow_scripts NPM_CONFIG_ALLOW_SCRIPTS npm_config_userconfig NPM_CONFIG_USERCONFIG
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/cawcli-verify-install.XXXXXX")"
 KEEP=0
 [[ "${1:-}" == "--keep" ]] && KEEP=1

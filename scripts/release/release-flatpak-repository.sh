@@ -6,7 +6,7 @@ set -euo pipefail
 
 usage() {
   cat >&2 <<'EOF'
-usage: release-flatpak-repository.sh --input BUNDLE --output DIRECTORY --repository DIRECTORY --url HTTPS_URL
+usage: scripts/release/release-flatpak-repository.sh --input BUNDLE --output DIRECTORY --repository DIRECTORY --url HTTPS_URL
 
 Environment:
   FLATPAK_GPG_PRIVATE_KEY  base64-encoded private OpenPGP key (required)

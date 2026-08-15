@@ -69,7 +69,7 @@ describe('install surface', function () {
       + 'install on npm >= 12:\n  '
       + offenders.join('\n  ')
       + '\nEither replace them with a prebuilt-binary equivalent (see '
-      + 'src/server/services/pty.ts) or update the documented install steps to match.',
+      + 'src/server/services/runtime/terminal/pty.ts) or update the documented install steps to match.',
     );
   });
 

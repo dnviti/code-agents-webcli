@@ -1,5 +1,5 @@
 import { Router, Request, Response } from 'express';
-import { UsageStore, UsageHistoryQuery } from '../services/usage-store.js';
+import { UsageStore, UsageHistoryQuery } from '../services/usage/usage-store.js';
 import { AuthenticatedUser } from '../types.js';
 import { UsageFilters, UsageJobSummary, UsagePeriod, UsageScope } from '../../shared/usage-records.js';
 import { requireUser } from './helpers.js';

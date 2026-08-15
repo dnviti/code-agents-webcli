@@ -80,8 +80,8 @@ single module so the choice is reversible.
 
 | Concern | Module | Backed by |
 | --- | --- | --- |
-| Pseudo-terminals | `src/server/services/pty.ts` | `@lydell/node-pty` — prebuilt per-platform binaries via `optionalDependencies`, never node-gyp. Falls back to upstream `node-pty` if a user installs it, for platforms with no prebuilt binary. |
-| SQLite | `src/server/services/sqlite.ts` | `node:sqlite`, Node's builtin. Adds the two things better-sqlite3 had that the builtin lacks: `pragma()` and `transaction()`. |
+| Pseudo-terminals | `src/server/services/runtime/terminal/pty.ts` | `@lydell/node-pty` — prebuilt per-platform binaries via `optionalDependencies`, never node-gyp. Falls back to upstream `node-pty` if a user installs it, for platforms with no prebuilt binary. |
+| SQLite | `src/server/services/persistence/app/sqlite.ts` | `node:sqlite`, Node's builtin. Adds the two things better-sqlite3 had that the builtin lacks: `pragma()` and `transaction()`. |
 
 This is enforced, not documented: `test/install-surface.test.js` fails if any
 production dependency gains an install script, and CI installs the working tree

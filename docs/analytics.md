@@ -58,8 +58,8 @@ One knob is left, and it is environment-only:
 
 | File | Role |
 | --- | --- |
-| `src/server/services/usage-reader.ts` | Reads and deduplicates the transcripts, computes tokens, cost, windows and burn rate |
-| `src/server/services/usage-analytics.ts` | Rolling windows and a burn rate on top |
+| `src/server/services/usage/usage-reader.ts` | Reads and deduplicates the transcripts, computes tokens, cost, windows and burn rate |
+| `src/server/services/usage/usage-analytics.ts` | Rolling windows and a burn rate on top |
 | `src/server/websocket/messages.ts` | Answers a `get_usage` message with a `usage_update` |
 
 The wire protocol is intact, so a client that sends `get_usage` gets a real

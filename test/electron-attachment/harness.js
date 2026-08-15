@@ -11,13 +11,13 @@ const { app, BrowserWindow, clipboard, nativeImage, session } = require('electro
 const esbuild = require('esbuild');
 const WebSocket = require('ws');
 
-const { ControllerCatalog } = require('../../desktop/controller-catalog.js');
+const { ControllerCatalog } = require('../../desktop/controller/catalog.js');
 const {
   CONTROLLER_AUTH_HEADER,
   createControllerGateway,
 } = require('../../desktop/controller-gateway.js');
 const { qualifySessionId, parseQualifiedSessionId } = require('../../desktop/controller-protocol.js');
-const { createControllerRuntime } = require('../../desktop/controller-runtime.js');
+const { createControllerRuntime } = require('../../desktop/controller/runtime.js');
 const { installRendererSessionPolicy } = require('../../desktop/renderer-session-policy.js');
 
 console.log('ELECTRON_ATTACHMENT_E2E_PHASE electron:loaded');

@@ -1,5 +1,5 @@
 import { ChatAttachment, ChatDraft } from '../../shared/chat-events.js';
-import { storedAttachmentNameFromUrl } from '../services/attachment-store.js';
+import { storedAttachmentNameFromUrl } from '../services/workspace/artifacts/attachment-store.js';
 import { SessionRecord } from '../types.js';
 
 /**

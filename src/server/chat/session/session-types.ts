@@ -5,7 +5,7 @@ import { ModelTier } from '../../../shared/runtime-profiles.js';
 import { PermissionAnswer, QuestionReply } from '../permission-broker.js';
 import { UserEnvironment } from '../../services/environments/types.js';
 import { ChatStoreLike } from '../store.js';
-import { UsageJobInput } from '../../services/usage-store.js';
+import { UsageJobInput } from '../../services/usage/usage-store.js';
 
 export interface ChatSessionDeps {
   store: ChatStoreLike;

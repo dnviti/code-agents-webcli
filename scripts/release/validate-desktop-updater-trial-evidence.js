@@ -7,7 +7,7 @@ const filename = process.argv[2];
 const packageName = process.argv[3];
 const qualificationFilename = process.argv[4];
 if (!filename || !packageName || !qualificationFilename) {
-  throw new Error('Usage: validate-desktop-updater-trial-evidence.js FILE PACKAGE QUALIFICATION');
+  throw new Error('Usage: node scripts/release/validate-desktop-updater-trial-evidence.js FILE PACKAGE QUALIFICATION');
 }
 
 const fail = (message) => {

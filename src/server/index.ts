@@ -5,7 +5,7 @@ import type { AgentKind, ServerOptions, SessionRecord } from './types.js';
 import {
   childProcessRunner,
   type AgentCommandRunner,
-} from './services/agent-maintenance-runtime.js';
+} from './services/runtime/agents/agent-maintenance-runtime.js';
 import type { UserEnvironment } from './services/environments/types.js';
 import {
   applyChatLifecycle as applyChatLifecycleImplementation,

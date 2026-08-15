@@ -1,8 +1,8 @@
 /** Partial class: connected-host tokens, oauth fallbacks, and credential retrieval. */
 
 import { randomUUID } from 'node:crypto';
-import type { AppDatabase } from '../../database.js';
-import type { EncryptionKeyRing } from '../../encryption.js';
+import type { AppDatabase } from '../../persistence/app/database.js';
+import type { EncryptionKeyRing } from '../../persistence/security/encryption.js';
 import type {
   ConnectedCredential,
   ConnectedHost,

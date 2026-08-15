@@ -5,6 +5,7 @@ const { execFileSync } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 const { CLIENT_TARGET } = require('./client-bundle.js');
+const { writeLegacyServiceForwarders } = require('./service-compatibility.js');
 
 const isWatch = process.argv.includes('--watch');
 
@@ -118,6 +119,10 @@ async function build() {
   // 1. Compile Node/server and browser SDKs with their own platform libraries.
   compileTypeScript('server', 'tsconfig.json');
   await bundlePrivateServerSlices();
+  const legacyServices = writeLegacyServiceForwarders(
+    path.join(__dirname, '..', 'dist', 'server', 'services'),
+  );
+  console.log(`[server] Wrote ${legacyServices.length} legacy service forwarders.\n`);
   compileTypeScript('sdk/browser', 'tsconfig.sdk-browser.json');
 
   // 2. Bundle client TypeScript with esbuild

@@ -1,4 +1,4 @@
-import { stripAnsi } from '../../services/ansi.js';
+import { stripAnsi } from '../../services/runtime/terminal/ansi.js';
 import { SessionRecord } from '../../types.js';
 import { Response } from 'express';
 

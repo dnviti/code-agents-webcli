@@ -72,16 +72,21 @@ function createReleaseFixture(version = '6.1.0') {
 describe('desktop release update pipeline', function () {
   it('pins native updates to the project and supports optional release signing', function () {
     const builder = read('electron-builder.yml');
-    const notarize = read('scripts', 'notarize.js');
+    const notarize = read('scripts', 'release', 'notarize.js');
+    const releasePr = read('scripts', 'release', 'release-pr.sh');
+    const verifyInstall = read('scripts', 'release', 'verify-install.sh');
     const pkg = JSON.parse(read('package.json'));
     assert.match(builder, /publish:\s*\n\s*provider: github\s*\n\s*owner: dnviti\s*\n\s*repo: code-agents-webcli/);
     assert.match(builder, /forceCodeSigning: false/);
     assert.match(builder, /hardenedRuntime: true/);
     assert.match(builder, /entitlements: build\/entitlements\.mac\.plist/);
     assert.match(builder, /- zip/);
-    assert.match(builder, /afterSign: scripts\/notarize\.js/);
+    assert.match(builder, /afterSign: scripts\/release\/notarize\.js/);
     assert.match(notarize, /CODE_AGENTS_WEBCLI_SKIP_NOTARIZATION === '1'/);
     assert.match(notarize, /cannot be both required and explicitly disabled/);
+    assert.match(releasePr, /--bump requires patch, minor, or major/);
+    assert.match(releasePr, /unknown argument/);
+    assert.match(verifyInstall, /dirname "\$\{BASH_SOURCE\[0\]\}"\)\/\.\.\/\.\./);
     assert.match(builder, /--talk-name=org\.freedesktop\.portal\.Flatpak/);
     assert.match(builder, /--talk-name=org\.freedesktop\.Flatpak/);
     assert.match(builder, /flatpak-update-public-key\.asc/);
@@ -104,9 +109,9 @@ describe('desktop release update pipeline', function () {
     ]) {
       assert.match(workflow, new RegExp(name));
     }
-    assert.match(workflow, /scripts\/release-flatpak-repository\.sh/);
-    assert.match(workflow, /scripts\/validate-release-assets\.js/);
-    assert.match(workflow, /scripts\/validate-flatpak-permissions\.js/);
+    assert.match(workflow, /scripts\/release\/release-flatpak-repository\.sh/);
+    assert.match(workflow, /scripts\/release\/validate-release-assets\.js/);
+    assert.match(workflow, /scripts\/release\/validate-flatpak-permissions\.js/);
     assert.match(workflow, /actions\/deploy-pages@[0-9a-f]{40}/);
     assert.doesNotMatch(workflow, /uses: [^\s]+@v\d/);
     assert.match(workflow, /draft: true/);
@@ -207,7 +212,7 @@ describe('desktop release update pipeline', function () {
     );
     assert.match(
       unsigned,
-      /node "\$GITHUB_WORKSPACE\/scripts\/validate-release-assets\.js" "\$PWD" "\$VERSION" --unsigned/,
+      /node "\$GITHUB_WORKSPACE\/scripts\/release\/validate-release-assets\.js" "\$PWD" "\$VERSION" --unsigned/,
     );
     const packageLoop = /for name in \\\n([\s\S]*?)\s*; do/.exec(unsigned);
     assert.ok(packageLoop, 'unsigned release must name its complete expected asset set');
@@ -270,7 +275,7 @@ describe('desktop release update pipeline', function () {
   it('validates exact updater assets, hashes, sizes, and embedded AppImage metadata', function () {
     const fixture = createReleaseFixture();
     const validate = () => childProcess.execFileSync('node', [
-      'scripts/validate-release-assets.js', fixture.directory, fixture.version,
+      'scripts/release/validate-release-assets.js', fixture.directory, fixture.version,
     ], { cwd: root, encoding: 'utf8', stdio: 'pipe' });
     try {
       assert.match(validate(), /exact updater metadata/);
@@ -296,9 +301,9 @@ describe('desktop release update pipeline', function () {
   });
 
   it('validates unsigned updater manifests without requiring unavailable Flatpak remote descriptors', function () {
-    const fixture = createReleaseFixture();
+    const fixture = createReleaseFixture(JSON.parse(read('package.json')).version);
     const validateUnsigned = () => childProcess.execFileSync('node', [
-      'scripts/validate-release-assets.js', fixture.directory, fixture.version, '--unsigned',
+      'scripts/release/validate-release-assets.js', fixture.directory, '--unsigned',
     ], { cwd: root, encoding: 'utf8', stdio: 'pipe' });
     try {
       for (const key of ['flatpakRef', 'flatpakRepo']) {
@@ -320,7 +325,7 @@ describe('desktop release update pipeline', function () {
   });
 
   it('makes Flatpak bundles repository-aware and does not accept an unsigned fallback', function () {
-    const script = read('scripts', 'release-flatpak-repository.sh');
+    const script = read('scripts', 'release', 'release-flatpak-repository.sh');
     assert.match(script, /FLATPAK_GPG_PRIVATE_KEY/);
     assert.match(script, /FLATPAK_GPG_PASSPHRASE/);
     assert.match(script, /flatpak build-sign/);
@@ -370,7 +375,7 @@ describe('desktop release update pipeline', function () {
   });
 
   it('rejects a Flatpak permission expansion unless the exact bridge tag is approved', function () {
-    const script = read('scripts', 'validate-flatpak-permissions.js');
+    const script = read('scripts', 'release', 'validate-flatpak-permissions.js');
     assert.match(script, /updaterBridgeTag === releaseTag/);
     assert.match(script, /added\.length === 1/);
     assert.match(script, /org\.freedesktop\.portal\.Flatpak/);
@@ -442,11 +447,11 @@ describe('desktop release update pipeline', function () {
       })),
     };
     const validate = () => childProcess.execFileSync('node', [
-      'scripts/validate-desktop-updater-qualification.js', filename, tag, commit, assets, feed,
+      'scripts/release/validate-desktop-updater-qualification.js', filename, tag, commit, assets, feed,
     ], { cwd: root, encoding: 'utf8', stdio: 'pipe' });
     const evidenceFile = path.join(temporary, 'desktop-updater-evidence.json');
     const validateEvidence = (packageName) => childProcess.execFileSync('node', [
-      'scripts/validate-desktop-updater-trial-evidence.js', evidenceFile, packageName, filename,
+      'scripts/release/validate-desktop-updater-trial-evidence.js', evidenceFile, packageName, filename,
     ], { cwd: root, encoding: 'utf8', stdio: 'pipe' });
     try {
       fs.writeFileSync(filename, JSON.stringify(value));
@@ -498,10 +503,10 @@ describe('desktop release update pipeline', function () {
       fs.writeFileSync(previous, config(['--share=network']));
       fs.writeFileSync(current, config(['--share=network', '--talk-name=org.freedesktop.portal.Flatpak']));
       assert.throws(() => childProcess.execFileSync('node', [
-        'scripts/validate-flatpak-permissions.js', previous, current, 'v6.1.0', '',
+        'scripts/release/validate-flatpak-permissions.js', previous, current, 'v6.1.0', '',
       ], { cwd: root, stdio: 'pipe' }), /Flatpak finish-args expanded/);
       childProcess.execFileSync('node', [
-        'scripts/validate-flatpak-permissions.js', previous, current, 'v6.1.0', 'v6.1.0',
+        'scripts/release/validate-flatpak-permissions.js', previous, current, 'v6.1.0', 'v6.1.0',
       ], { cwd: root, stdio: 'pipe' });
       fs.writeFileSync(previous, config(['--share=network', '--talk-name=org.freedesktop.portal.Flatpak']));
       fs.writeFileSync(current, config([
@@ -510,10 +515,10 @@ describe('desktop release update pipeline', function () {
         '--talk-name=org.freedesktop.Flatpak',
       ]));
       childProcess.execFileSync('node', [
-        'scripts/validate-flatpak-permissions.js', previous, current, 'v6.1.1', 'v6.1.1',
+        'scripts/release/validate-flatpak-permissions.js', previous, current, 'v6.1.1', 'v6.1.1',
       ], { cwd: root, stdio: 'pipe' });
       assert.throws(() => childProcess.execFileSync('node', [
-        'scripts/validate-flatpak-permissions.js', previous, current, 'v6.1.2', 'v6.1.2',
+        'scripts/release/validate-flatpak-permissions.js', previous, current, 'v6.1.2', 'v6.1.2',
       ], { cwd: root, stdio: 'pipe' }), /Flatpak finish-args expanded/);
       fs.writeFileSync(current, config([
         '--share=network',
@@ -521,7 +526,7 @@ describe('desktop release update pipeline', function () {
         '--filesystem=host',
       ]));
       assert.throws(() => childProcess.execFileSync('node', [
-        'scripts/validate-flatpak-permissions.js', previous, current, 'v6.1.0', 'v6.1.0',
+        'scripts/release/validate-flatpak-permissions.js', previous, current, 'v6.1.0', 'v6.1.0',
       ], { cwd: root, stdio: 'pipe' }), /Future permission changes require/);
     } finally {
       fs.rmSync(temporary, { recursive: true, force: true });

@@ -1,6 +1,6 @@
-import { openSessionFileForRead } from '../../services/safe-session-file.js';
+import { openSessionFileForRead } from '../../services/workspace/artifacts/safe-session-file.js';
 import { SessionRecord } from '../../types.js';
-import { WorkspaceSessionStorageRef } from '../../services/workspace-session-storage.js';
+import { WorkspaceSessionStorageRef } from '../../services/workspace/session/workspace-session-storage.js';
 import {
   AccountLimits,
   ChatCapabilities,

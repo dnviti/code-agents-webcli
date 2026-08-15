@@ -1,5 +1,5 @@
 import path from 'node:path';
-import type { WorkspaceStorageIdentity } from '../../workspace-session-storage.js';
+import type { WorkspaceStorageIdentity } from '../../workspace/session/workspace-session-storage.js';
 import { EnvironmentEngine, RunResult } from '../../environments/engine.js';
 import { UserEnvironment, WrappedProcessControl } from '../../environments/types.js';
 import { PROJECT_WORKSPACE } from './constants.js';
