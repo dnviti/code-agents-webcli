@@ -1,5 +1,7 @@
 # Code Agents Web CLI
 
+# SUPERSEEDED BY DeepSeek Harness: https://github.com/deepseek-ai/deepseek-harness
+
 Run Claude Code, Codex, Cursor Agent, pi, Grok, Qwen, Kimi, Oh My Pi,
 Antigravity CLI and plain shells from a browser — on your phone, on a tablet,
 from another machine on your network. One Node process, GitHub sign-in, real
